@@ -44,6 +44,11 @@
                             "title": "Name",
                             "type": "string",
                             "required": false
+                        },
+                        "dimmer": {
+                            "title": "Dimmer",
+                            "type": "boolean",
+                            "required": false
                         }
                     }
                 }
