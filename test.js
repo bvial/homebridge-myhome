@@ -23,17 +23,17 @@ ownClient.on ('packet',function ( data ) {
 });
 ownClient.startMonitor();
 
-ownClient.scanSystem(function ( data ) {
-	console.log ('scanSystem:%s',data.join());
-});
+/* ownClient.scanSystem(function ( data ) {
+ 	console.log ('scanSystem:%s',data.join());
+ });
 
 ownClient.scanUnconfigured(function ( data ) {
-	console.log ('scanUnconfigured:%s',data.join());
+ 	console.log ('scanUnconfigured:%s',data.join());
 });
 
 ownClient.scanConfigured(function ( data ) {
-	console.log ('scanConfigured:%s',data.join());
-});
+ 	console.log ('scanConfigured:%s',data.join());
+ }); */
 
 // Send light probe
 var lights =[];
@@ -44,7 +44,7 @@ var lights =[];
 //	command:'*#4*1##',
 //	command:'*#4*1*14##',
 //	command:'*#4*1*0##',
-   command:'*#4*#0#1*#14*0260*1##',  // -> set headting manual   //*#4*#0#1*14*070*1##
+//   command:'*#4*#0#1*#14*0260*1##',  // -> set headting manual   //*#4*#0#1*14*070*1##
 // command:'*4*103*#0#1##', // set heating off
 // command:'*4*102*#0#1##', // Porctecttion mode
 // command:'*4*304*#0#1##', // Auto mode   NOK
