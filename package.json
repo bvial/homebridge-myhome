@@ -14,13 +14,11 @@
     "url": "http://github.com/bvial/homebridge-myhome/issues"
   },
   "engines": {
-    "node": ">=12.0.0",
-    "homebridge": ">=0.2.0"
+    "node": "^18.20.4 || ^20.15.1 || ^22 || ^24",
+    "homebridge": "^1.6.0 || ^2.0.0"
   },
   "dependencies": {
-    "lodash": "^4.14.1",
-    "request": "^2.65.0",
-    "sprintf-js": "^1.1.2"
+    "lodash": "^4.14.1"
   },
   "devDependencies": {},
   "homepage": "https://github.com/bvial/homebridge-myhome#readme",
