@@ -32,20 +32,30 @@ describe('calcPass', function () {
         var b = calcPass('22222', '12345');
         assert.notEqual(a, b);
     });
+
+    it('throws on non-numeric password', function () {
+        assert.throws(() => calcPass('abc', '12345'), /must be a number/);
+    });
+
+    it('throws on undefined password', function () {
+        assert.throws(() => calcPass(undefined, '12345'), /must be a number/);
+    });
 });
 
 describe('OwnConnection state machine', function () {
-    var conn, written, ended;
+    var conn, written, destroyed;
 
     beforeEach(function () {
         written = [];
-        ended = false;
+        destroyed = false;
         conn = new OwnConnection('127.0.0.1', '20000', '12345', MODE.MONITOR, {
             info: function () {}, debug: function () {}, warn: function () {}, error: function () {},
         });
         conn.conn = {
             write: function (d) { written.push(d); },
-            end: function () { ended = true; },
+            end: function () {},
+            destroy: function () { destroyed = true; },
+            removeAllListeners: function () {},
             setTimeout: function () {},
             on: function () {},
         };
@@ -96,7 +106,32 @@ describe('OwnConnection state machine', function () {
         conn.state = 'LOGGING_IN';
         conn.onData(Buffer.from(PKT.NACK));
         assert.equal(conn.state, 'UNCONNECTED');
-        assert.ok(ended);
+        assert.ok(destroyed);
+    });
+
+    it('emits auth-failed on NACK in LOGGING_IN', function () {
+        conn.state = 'LOGGING_IN';
+        var authFailed = false;
+        conn.on('auth-failed', function () { authFailed = true; });
+        conn.onData(Buffer.from(PKT.NACK));
+        assert.ok(authFailed);
+    });
+
+    it('end() calls destroy and removes listeners', function () {
+        var destroyed = false;
+        var listenersRemoved = false;
+        conn.conn = {
+            write: function () {},
+            end: function () {},
+            destroy: function () { destroyed = true; },
+            removeAllListeners: function () { listenersRemoved = true; },
+            setTimeout: function () {},
+            on: function () {},
+        };
+        conn.end();
+        assert.ok(destroyed);
+        assert.ok(listenersRemoved);
+        assert.equal(conn.conn, null);
     });
 
     it('emits packet in CONNECTED state', function () {
@@ -139,6 +174,13 @@ describe('TCP fragmentation', function () {
         conn.onData(Buffer.from('##*2*1*10##'));
         assert.deepEqual(packets, ['*1*1*42##', '*1*0*43##', '*2*1*10##']);
     });
+
+    it('discards buffer when it overflows with no valid packet', function () {
+        conn.onData(Buffer.from('x'.repeat(5000)));
+        assert.equal(packets.length, 0);
+        conn.onData(Buffer.from('*1*1*42##'));
+        assert.deepEqual(packets, ['*1*1*42##']);
+    });
 });
 
 describe('OwnClient command queue', function () {
@@ -162,5 +204,89 @@ describe('OwnClient command queue', function () {
 
         assert.deepEqual(order, ['A', 'B', 'C']);
         done();
+    });
+
+    it('drops commands when queue is full', function () {
+        var warnings = [];
+        var client = new OwnClient('127.0.0.1', '20000', '12345', {
+            info: function () {}, debug: function () {}, warn: function () { warnings.push(true); }, error: function () {},
+        });
+        client._executeCommand = function () {};
+        client._maxConcurrent = 0;
+        for (var i = 0; i < 50; i++) {
+            client.sendCommand({ command: '*1*1*' + i + '##' });
+        }
+        assert.equal(client._commandQueue.length, 50);
+        client.sendCommand({ command: '*1*1*overflow##' });
+        assert.equal(client._commandQueue.length, 50);
+        assert.ok(warnings.length > 0);
+    });
+});
+
+describe('OwnConnection logPacket masking', function () {
+    it('masks packets during CONNECTING state', function () {
+        var debugCalls = [];
+        var conn = new OwnConnection('127.0.0.1', '20000', '12345', MODE.MONITOR, {
+            info: function () {}, debug: function () { debugCalls.push(Array.from(arguments)); }, warn: function () {}, error: function () {},
+        });
+        conn.state = 'CONNECTING';
+        conn.logPacket('IN', '*#603356072##');
+        assert.ok(debugCalls.length > 0);
+        assert.ok(debugCalls[0].join(' ').includes('[auth]'));
+        assert.ok(!debugCalls[0].join(' ').includes('603356072'));
+    });
+
+    it('masks packets during LOGGING_IN state', function () {
+        var debugCalls = [];
+        var conn = new OwnConnection('127.0.0.1', '20000', '12345', MODE.MONITOR, {
+            info: function () {}, debug: function () { debugCalls.push(Array.from(arguments)); }, warn: function () {}, error: function () {},
+        });
+        conn.state = 'LOGGING_IN';
+        conn.logPacket('OUT', '*#987654##');
+        assert.ok(debugCalls[0].join(' ').includes('[auth]'));
+    });
+
+    it('shows packets in CONNECTED state', function () {
+        var debugCalls = [];
+        var conn = new OwnConnection('127.0.0.1', '20000', '12345', MODE.MONITOR, {
+            info: function () {}, debug: function () { debugCalls.push(Array.from(arguments)); }, warn: function () {}, error: function () {},
+        });
+        conn.state = 'CONNECTED';
+        conn.logPacket('IN', '*1*1*42##');
+        assert.ok(debugCalls[0].join(' ').includes('*1*1*42##'));
+    });
+});
+
+describe('OwnClient command failure callback', function () {
+    it('calls done with null and -1 on connection close without response', function (t, done) {
+        var client = new OwnClient('127.0.0.1', '20000', '12345', {
+            info: function () {}, debug: function () {}, warn: function () {}, error: function () {},
+        });
+        client._maxConcurrent = 1;
+
+        var closeCb;
+        client.newConnection = function () {
+            var fakeConn = {
+                _handlers: {},
+                on: function (ev, cb) { this._handlers[ev] = cb; },
+                emit: function (ev) { if (this._handlers[ev]) this._handlers[ev](); },
+                connect: function () {},
+                setTimeout: function () {},
+                end: function () {},
+            };
+            closeCb = function () { fakeConn._handlers['close'](); };
+            return fakeConn;
+        };
+
+        client.sendCommand({
+            command: '*1*1*42##',
+            done: function (pkt, index) {
+                assert.equal(pkt, null);
+                assert.equal(index, -1);
+                done();
+            },
+        });
+
+        closeCb();
     });
 });

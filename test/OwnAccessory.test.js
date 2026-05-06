@@ -21,6 +21,35 @@ describe('OwnLightAccessory', function () {
         assert.equal(h.name, 'light-7');
     });
 
+    it('throws on non-integer id', function () {
+        var p = makeMockPlatform();
+        var a = makeMockAccessory();
+        a.addService('AccessoryInformation');
+        assert.throws(
+            () => new OwnAccessory.OwnLightAccessory(p, a, { id: 'abc', name: 'bad' }),
+            /invalid accessory id/
+        );
+    });
+
+    it('throws on zero id', function () {
+        var p = makeMockPlatform();
+        var a = makeMockAccessory();
+        a.addService('AccessoryInformation');
+        assert.throws(
+            () => new OwnAccessory.OwnLightAccessory(p, a, { id: 0, name: 'bad' }),
+            /invalid accessory id/
+        );
+    });
+
+    it('throws on negative id', function () {
+        var p = makeMockPlatform();
+        var a = makeMockAccessory();
+        a.addService('AccessoryInformation');
+        assert.throws(
+            () => new OwnAccessory.OwnLightAccessory(p, a, { id: -5, name: 'bad' }),
+            /invalid accessory id/
+        );
+    });
     it('onData light off', function () {
         handler.value = true;
         handler.onData('*1*0*42##');
@@ -85,6 +114,36 @@ describe('OwnBlindAccessory', function () {
         a.addService('AccessoryInformation');
         var h = new OwnAccessory.OwnBlindAccessory(p, a, { id: 5, time: 20 });
         assert.equal(h.name, 'blind-5');
+    });
+
+    it('throws when time is zero', function () {
+        var p = makeMockPlatform();
+        var a = makeMockAccessory();
+        a.addService('AccessoryInformation');
+        assert.throws(
+            () => new OwnAccessory.OwnBlindAccessory(p, a, { id: 5, name: 'bad', time: 0 }),
+            /requires a positive "time" value/
+        );
+    });
+
+    it('throws when time is missing', function () {
+        var p = makeMockPlatform();
+        var a = makeMockAccessory();
+        a.addService('AccessoryInformation');
+        assert.throws(
+            () => new OwnAccessory.OwnBlindAccessory(p, a, { id: 5, name: 'bad' }),
+            /requires a positive "time" value/
+        );
+    });
+
+    it('throws when time is negative', function () {
+        var p = makeMockPlatform();
+        var a = makeMockAccessory();
+        a.addService('AccessoryInformation');
+        assert.throws(
+            () => new OwnAccessory.OwnBlindAccessory(p, a, { id: 5, name: 'bad', time: -10 }),
+            /requires a positive "time" value/
+        );
     });
 
     it('onData stop', function () {
@@ -153,6 +212,26 @@ describe('OwnBlindAccessory', function () {
         handler.destroy();
         // No error thrown = timeouts cleared
     });
+
+    it('startMoveTracking stops scheduling when retry limit exceeded', function () {
+        handler._moveRetries = 30;
+        handler.startMoveTracking();
+        assert.strictEqual(handler.moveTrackingTimeout, undefined);
+        assert.equal(handler._moveRetries || 0, 0);
+    });
+
+    it('stopMoveTracking resets retry counter', function () {
+        handler._moveRetries = 20;
+        handler.stopMoveTracking();
+        assert.equal(handler._moveRetries || 0, 0);
+    });
+
+    it('startMoveTracking schedules normally when under retry limit', function () {
+        handler._moveRetries = 0;
+        handler.startMoveTracking();
+        assert.notEqual(handler.moveTrackingTimeout, undefined);
+        handler.destroy();
+    });
 });
 
 describe('OwnThermostatAccessory', function () {
@@ -170,6 +249,36 @@ describe('OwnThermostatAccessory', function () {
         a.addService('AccessoryInformation');
         var h = new OwnAccessory.OwnThermostatAccessory(p, a, { id: 2, zone: 2 });
         assert.equal(h.name, 'thermostat-2');
+    });
+
+    it('throws when zone is missing', function () {
+        var p = makeMockPlatform();
+        var a = makeMockAccessory();
+        a.addService('AccessoryInformation');
+        assert.throws(
+            () => new OwnAccessory.OwnThermostatAccessory(p, a, { id: 2, name: 'bad' }),
+            /requires a positive integer "zone"/
+        );
+    });
+
+    it('throws when zone is zero', function () {
+        var p = makeMockPlatform();
+        var a = makeMockAccessory();
+        a.addService('AccessoryInformation');
+        assert.throws(
+            () => new OwnAccessory.OwnThermostatAccessory(p, a, { id: 2, name: 'bad', zone: 0 }),
+            /requires a positive integer "zone"/
+        );
+    });
+
+    it('throws when zone is not integer', function () {
+        var p = makeMockPlatform();
+        var a = makeMockAccessory();
+        a.addService('AccessoryInformation');
+        assert.throws(
+            () => new OwnAccessory.OwnThermostatAccessory(p, a, { id: 2, name: 'bad', zone: 1.5 }),
+            /requires a positive integer "zone"/
+        );
     });
 
     it('onData current temperature', function () {

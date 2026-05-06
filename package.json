@@ -17,9 +17,7 @@
     "node": "^18.20.4 || ^20.15.1 || ^22 || ^24",
     "homebridge": "^1.6.0 || ^2.0.0"
   },
-  "dependencies": {
-    "lodash": "^4.14.1"
-  },
+  "dependencies": {},
   "devDependencies": {},
   "homepage": "https://github.com/bvial/homebridge-myhome#readme",
   "main": "index.js",

@@ -63,12 +63,11 @@ function makeMockApi() {
 }
 
 function makePlatformInstance(config, api) {
-    var defaults = require('lodash');
     var PLUGIN_NAME = 'homebridge-myhome';
     var PLATFORM_NAME = 'MyHome';
 
     var defaultConfig = { port: 20000, lights: [], blinds: [], thermostats: [], scenarios: [], contacts: [], energies: [] };
-    var mergedConfig = defaults.defaults(config, defaultConfig);
+    var mergedConfig = { ...defaultConfig, ...config };
 
     var log = { info: function () {}, debug: function () {}, warn: function () {}, error: function () {} };
 
@@ -153,6 +152,35 @@ describe('OwnPlatform.discoverDevices', function () {
         assert.ok(destroyed);
         assert.equal(platform.activeHandlers.length, 0);
     });
+
+    it('catches handler creation errors without stopping discovery', function () {
+        var api = makeMockApi();
+        var errors = [];
+        var platform = makePlatformInstance({
+            host: '127.0.0.1',
+            blinds: [{ id: 1, name: 'bad-blind', time: 0 }],
+            lights: [{ id: 2, name: 'good-light' }],
+        }, api);
+        platform.log.error = function () { errors.push(Array.from(arguments)); };
+        platform.discoverDevices();
+        assert.ok(errors.some(e => e[0].includes('Failed to create handler')));
+        assert.equal(platform.activeHandlers.length, 1);
+        assert.equal(api._registered.length, 1);
+    });
+
+    it('warns and skips duplicate accessory IDs', function () {
+        var api = makeMockApi();
+        var warnings = [];
+        var platform = makePlatformInstance({
+            host: '127.0.0.1',
+            lights: [{ id: 42, name: 'First' }, { id: 42, name: 'Dupe' }],
+        }, api);
+        platform.log.warn = function () { warnings.push(Array.from(arguments)); };
+        platform.discoverDevices();
+        assert.equal(api._registered.length, 1);
+        assert.equal(platform.activeHandlers.length, 1);
+        assert.ok(warnings.some(w => w[0].includes('Duplicate')));
+    });
 });
 
 describe('OwnPlatform.onMonitor', function () {
@@ -184,6 +212,17 @@ describe('OwnPlatform.onMonitor', function () {
         platform.onMonitor('*16*1*0##');
         assert.ok(debugCalls.length > 0);
     });
+
+    it('catches handler errors without crashing', function () {
+        var api = makeMockApi();
+        var platform = makePlatformInstance({ host: '127.0.0.1', lights: [{ id: 42, name: 'L' }] }, api);
+        platform.discoverDevices();
+        platform.activeHandlers[0].onData = function () { throw new Error('handler crash'); };
+        var errors = [];
+        platform.log.error = function () { errors.push(Array.from(arguments)); };
+        platform.onMonitor('*1*1*42##');
+        assert.ok(errors.some(e => e[0].includes('Error processing packet')));
+    });
 });
 
 describe('OwnPlatform.onAccessory', function () {
@@ -204,5 +243,36 @@ describe('OwnPlatform.onAccessory', function () {
         platform.log.debug = function () { debugCalls.push(Array.from(arguments)); };
         platform.onAccessory('99', '*1*1*99##');
         assert.ok(debugCalls.length > 0);
+    });
+});
+
+describe('OwnPlatform config validation', function () {
+    it('logs error and returns when host is missing', function () {
+        var OwnPlatform = require('../lib/OwnPlatform.js').OwnPlatform;
+        var api = makeMockApi();
+        var errors = [];
+        var log = { info: function () {}, debug: function () {}, warn: function () {}, error: function () { errors.push(Array.from(arguments)); } };
+        var platform = new OwnPlatform(log, { lights: [] }, api);
+        assert.ok(errors.length > 0);
+        assert.ok(errors[0][0].includes('host'));
+        assert.equal(platform.controller, undefined);
+    });
+
+    it('configureAccessory is safe when host is missing', function () {
+        var OwnPlatform = require('../lib/OwnPlatform.js').OwnPlatform;
+        var api = makeMockApi();
+        var log = { info: function () {}, debug: function () {}, warn: function () {}, error: function () {} };
+        var platform = new OwnPlatform(log, { lights: [] }, api);
+        // Should not throw even though cachedAccessories is undefined
+        platform.configureAccessory({ displayName: 'test', UUID: 'test-uuid' });
+    });
+
+    it('starts normally when host is present', function () {
+        var OwnPlatform = require('../lib/OwnPlatform.js').OwnPlatform;
+        var api = makeMockApi();
+        api.on = function () {};  // prevent immediate didFinishLaunching (no real network)
+        var log = { info: function () {}, debug: function () {}, warn: function () {}, error: function () {} };
+        var platform = new OwnPlatform(log, { host: '127.0.0.1', password: '12345' }, api);
+        assert.notEqual(platform.controller, undefined);
     });
 });
