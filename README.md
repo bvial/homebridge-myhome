@@ -16,6 +16,30 @@ npm install -g homebridge-myhome-unik
 
 Or install via the Homebridge UI plugin search.
 
+## Device discovery
+
+The plugin includes a discovery tool that connects to the gateway and generates a draft config fragment:
+
+```bash
+npm run scan -- 192.168.1.35
+# With password and custom address range:
+npm run scan -- 192.168.1.35 20000 12345 --max-addr 50
+# Show raw CONFIG-scan packets for debugging:
+npm run scan -- 192.168.1.35 20000 12345 --verbose
+```
+
+The tool runs two phases:
+1. **CONFIG scan** — queries the gateway's internal device list (F454/F455 only)
+2. **STATUS scan** — probes each address (1..N) for all device types; works on all gateways
+
+The output is a JSON fragment you paste into your Homebridge platform config, then adjust:
+- Rename entries to meaningful names
+- Set `time` (travel seconds) for blinds
+- Set `timeSlat` / `slatPercent` for venetian blinds
+- Verify `zone` for thermostats
+- Add `"dimmer": true` for dimmer-capable lights
+- Add scenarios manually (they have no detectable status)
+
 ## Configuration
 
 Add a platform block to your Homebridge `config.json`:
