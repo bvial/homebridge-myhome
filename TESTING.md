@@ -1,6 +1,49 @@
 # Tester le plugin en local avec Homebridge
 
-## Prérequis
+## 1. Mettre en place l'environnement de développement
+
+### Prérequis système
+
+- [Node.js](https://nodejs.org) ≥ 18 (`node --version`)
+- npm ≥ 9 (inclus avec Node.js)
+- Git
+
+### Cloner le dépôt et installer les dépendances
+
+```bash
+git clone https://github.com/bvial/homebridge-myhome.git
+cd homebridge-myhome
+npm install
+```
+
+### Compiler et lancer les tests
+
+```bash
+npm run build   # compile TypeScript → dist/
+npm test        # compile + suite de tests automatisés
+```
+
+Les tests ne nécessitent pas de passerelle réelle — tout est simulé.
+
+### Structure du projet
+
+```
+lib/            Sources TypeScript du plugin
+test/           Tests automatisés (node:test)
+dist/           Fichiers compilés (généré par npm run build, ignoré par git)
+scan.ts         Outil de découverte des appareils (compile → dist/scan.js)
+test.ts         Test d'intégration manuel contre une vraie passerelle (hors build)
+config.schema.json  Schéma de configuration pour l'UI Homebridge
+```
+
+### Éditeur recommandé
+
+VS Code avec l'extension **ESLint**. Le projet est configuré avec TypeScript strict —
+les erreurs de type apparaissent en temps réel dans l'éditeur.
+
+---
+
+## 2. Prérequis Homebridge
 
 Homebridge doit être installé sur ta machine (pas seulement sur le serveur de prod) :
 
@@ -10,7 +53,7 @@ npm install -g homebridge homebridge-config-ui-x
 
 ---
 
-## Méthode 1 — `npm link` (recommandée pour le développement)
+## 3. Méthode 1 — `npm link` (recommandée pour le développement)
 
 Crée un lien symbolique entre le dossier du plugin et les modules globaux npm,
 sans avoir à publier ni copier de fichiers à chaque modification.
@@ -45,7 +88,7 @@ npx tsc --watch
 
 ---
 
-## Méthode 2 — Installation directe depuis le dossier local
+## 4. Méthode 2 — Installation directe depuis le dossier local
 
 Plus simple, mais il faut relancer à chaque modification importante.
 
@@ -61,7 +104,7 @@ homebridge -D -U ~/.homebridge
 
 ---
 
-## Configuration minimale de test
+## 5. Configuration minimale de test
 
 Éditer `~/.homebridge/config.json` et ajouter la section `platforms` :
 
@@ -90,7 +133,7 @@ homebridge -D -U ~/.homebridge
 
 ---
 
-## Lecture des logs
+## 6. Lecture des logs
 
 Le mode `-D` (debug) affiche tous les logs du plugin, y compris les paquets OWN
 reçus et envoyés.
@@ -105,7 +148,7 @@ homebridge -D -U ~/.homebridge 2>&1 | grep -i myhome
 
 ---
 
-## Vérifier que le plugin est bien chargé
+## 7. Vérifier que le plugin est bien chargé
 
 Au démarrage, Homebridge doit afficher une ligne comme :
 
@@ -124,7 +167,7 @@ npm list -g --depth=0 | grep homebridge
 
 ---
 
-## Désactiver le lien après les tests
+## 8. Désactiver le lien après les tests
 
 ```bash
 cd ~/.homebridge
