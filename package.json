@@ -1,6 +1,6 @@
 {
   "name": "homebridge-myhome-unik",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "description": "MyHome Legrand plugin for homebridge",
   "license": "ISC",
   "keywords": [
