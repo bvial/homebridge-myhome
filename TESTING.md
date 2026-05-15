@@ -16,6 +16,15 @@ cd homebridge-myhome
 npm install
 ```
 
+`npm install` installe TypeScript localement dans `node_modules/.bin/tsc` — pas besoin de l'installer globalement. Les scripts `npm run build` et `npm test` utilisent automatiquement cette version locale.
+
+Si tu veux aussi utiliser `tsc` directement dans ton terminal :
+
+```bash
+npm install -g typescript
+tsc --version
+```
+
 ### Compiler et lancer les tests
 
 ```bash
