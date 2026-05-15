@@ -319,7 +319,7 @@ export class OwnBlindAccessory extends OwnAccessory {
                 return;
             }
             this.windowCoveringService.getCharacteristic(this.Characteristic.PositionState).updateValue(this.state);
-            this.log.info(`[${this.id}] received state dir:${direction} position:${this.position} target:${this.target}`);
+            this.log.debug(`[${this.id}] received state dir:${direction} position:${this.position} target:${this.target}`);
 
             if (this.commandIsPending() && this.expectedState === this.state) {
                 this.log.info(`[${this.id}] expected state ${this.expectedState} reached`);
@@ -340,7 +340,8 @@ export class OwnBlindAccessory extends OwnAccessory {
             this.log.info(`[${this.id}] Blind is STOPPED pos:${this.position} target:${this.target}`);
         } else if (this.state === this.Characteristic.PositionState.INCREASING) {
             if (this.position < 100) this.position++;
-            this.log.info(`[${this.id}] Blind is moving UP pos:${this.position} target:${this.target}`);
+            if (this.position % 10 === 0 || this.position >= this.target)
+                this.log.info(`[${this.id}] Blind moving UP pos:${this.position} target:${this.target}`);
             if (this.position >= this.target) {
                 this.moveStop();
             } else {
@@ -348,7 +349,8 @@ export class OwnBlindAccessory extends OwnAccessory {
             }
         } else if (this.state === this.Characteristic.PositionState.DECREASING) {
             if (this.position > 0) this.position--;
-            this.log.info(`[${this.id}] Blind is moving DOWN pos:${this.position} target:${this.target}`);
+            if (this.position % 10 === 0 || this.position <= this.target)
+                this.log.info(`[${this.id}] Blind moving DOWN pos:${this.position} target:${this.target}`);
             if (!this.initPhase && this.position <= this.target) {
                 this.moveStop();
             } else if (this.initPhase && this.position === 0) {
