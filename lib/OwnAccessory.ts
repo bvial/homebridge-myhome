@@ -302,8 +302,11 @@ export class OwnBlindAccessory extends OwnAccessory {
             this.log.debug('id:%s onBlind(%s)', this.id, packet);
             const direction = extract[1];
             if (direction === '0') {
+                const wasDecreasing = this.state === this.Characteristic.PositionState.DECREASING;
                 this.state = this.Characteristic.PositionState.STOPPED;
-                this.initPhase = false;
+                if (!this.initPhase || wasDecreasing) {
+                    this.initPhase = false;
+                }
                 if (Math.abs(this.position - this.target) <= 3) {
                     this.position = this.target;
                 }

@@ -288,11 +288,18 @@ describe('OwnBlindAccessory', () => {
         handler.destroy();
     });
 
-    it('onData STOP clears _initPhase', () => {
+    it('onData STOP clears _initPhase when was DECREASING', () => {
         handler.initPhase = true;
         handler.state = POSITION_STATE.DECREASING;
         handler.onData('*2*0*23##');
         assert.equal(handler.initPhase, false);
+    });
+
+    it('onData STOP does not clear _initPhase when state was STOPPED (gateway state broadcast)', () => {
+        handler.initPhase = true;
+        handler.state = POSITION_STATE.STOPPED;
+        handler.onData('*2*0*23##');
+        assert.equal(handler.initPhase, true, 'initPhase must survive a state broadcast before DECREASING echo');
     });
 
     it('evaluatePosition during init stops rescheduling when position reaches 0', () => {
