@@ -194,6 +194,17 @@ describe('OwnBlindAccessory', () => {
         assert.ok(debugs.length > 0);
     });
 
+    it('onData extended 1000#2 treated as DECREASING', () => {
+        handler.onData('*2*1000#2*23##');
+        assert.equal(handler.state, POSITION_STATE.DECREASING);
+    });
+
+    it('onData extended 1000#0 treated as STOPPED', () => {
+        handler.state = POSITION_STATE.DECREASING;
+        handler.onData('*2*1000#0*23##');
+        assert.equal(handler.state, POSITION_STATE.STOPPED);
+    });
+
     it('msPerPercent without slat', () => {
         assert.equal(handler.msPerPercent(50), (30 / 100) * 1000);
     });

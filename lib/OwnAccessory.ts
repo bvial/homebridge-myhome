@@ -297,7 +297,8 @@ export class OwnBlindAccessory extends OwnAccessory {
     }
 
     onData(packet: string): void {
-        const extract = packet.match(/^\*2\*(\d+)\*\d+##$/);
+        // Match standard *2*<dir>*<id>## OR extended *2*1000#<dir>*<id>## (same direction codes)
+        const extract = packet.match(/^\*2\*(?:1000#)?(\d+)\*\d+##$/);
         if (extract) {
             this.log.debug('id:%s onBlind(%s)', this.id, packet);
             const direction = extract[1];
