@@ -105,20 +105,23 @@ async function statusScan(client: OwnClient): Promise<Found[]> {
         jobs.push({ who: 4, where: String(w), command: `*#4*${w}##` });  // thermostat zone probe
     }
 
-    await Promise.all(jobs.map(({ who, where, command }) =>
-        new Promise<void>(resolve => {
-            const pkts: string[] = [];
-            client.sendCommand({
-                command,
-                stopon: [PKT.ACK, PKT.NACK],
-                packet: p => pkts.push(p),
-                done: pkt => {
-                    if (pkt === PKT.ACK && pkts.length > 0) found.push({ who, where, packets: pkts });
-                    resolve();
-                },
-            });
-        }),
-    ));
+    const BATCH = 40; // stay safely under the 50-item queue limit
+    for (let i = 0; i < jobs.length; i += BATCH) {
+        await Promise.all(jobs.slice(i, i + BATCH).map(({ who, where, command }) =>
+            new Promise<void>(resolve => {
+                const pkts: string[] = [];
+                client.sendCommand({
+                    command,
+                    stopon: [PKT.ACK, PKT.NACK],
+                    packet: p => pkts.push(p),
+                    done: pkt => {
+                        if (pkt === PKT.ACK && pkts.length > 0) found.push({ who, where, packets: pkts });
+                        resolve();
+                    },
+                });
+            }),
+        ));
+    }
 
     return found;
 }
