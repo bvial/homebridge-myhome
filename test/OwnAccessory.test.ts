@@ -123,6 +123,7 @@ describe('OwnBlindAccessory', () => {
         accessory.addService('AccessoryInformation');
         handler = new OwnBlindAccessory(platform as unknown as P, accessory as unknown as A, { id: 23, name: 'test-blind', time: 30, timeSlat: 0, slatPercent: 0 });
     });
+    afterEach(() => { handler.destroy(); });
 
     it('default name when none provided', () => {
         const p = makeMockPlatform();
@@ -265,6 +266,7 @@ describe('OwnBlindAccessory', () => {
         spy.calls.length = 0;
         handler.state = POSITION_STATE.INCREASING;
         handler.expectedState = POSITION_STATE.INCREASING;
+        handler.homeKitMovement = true;
         handler.target = 50;
         handler.position = 49;
         handler.evaluatePosition();
@@ -311,6 +313,69 @@ describe('OwnBlindAccessory', () => {
         handler.state = POSITION_STATE.STOPPED;
         handler.onData('*2*0*23##');
         assert.equal(handler.initPhase, true, 'initPhase must survive a state broadcast before DECREASING echo');
+    });
+
+    it('onData duplicate STOP does not call evaluatePosition when already STOPPED', () => {
+        handler.state = POSITION_STATE.STOPPED;
+        let evalCalled = 0;
+        const orig = handler.evaluatePosition.bind(handler);
+        handler.evaluatePosition = () => { evalCalled++; orig(); };
+        handler.onData('*2*0*23##');
+        assert.equal(evalCalled, 0, 'evaluatePosition must not be called for duplicate STOP');
+    });
+
+    it('onData duplicate DECREASING does not call evaluatePosition when already DECREASING', () => {
+        handler.state = POSITION_STATE.DECREASING;
+        let evalCalled = 0;
+        const orig = handler.evaluatePosition.bind(handler);
+        handler.evaluatePosition = () => { evalCalled++; orig(); };
+        handler.onData('*2*2*23##');
+        assert.equal(evalCalled, 0, 'evaluatePosition must not be called for duplicate DECREASING');
+        handler.destroy();
+    });
+
+    it('evaluatePosition physical UP (homeKitMovement=false) does not send stop even at target', () => {
+        const spy = platform.sendCommandSpy;
+        spy.calls.length = 0;
+        handler.homeKitMovement = false;
+        handler.state = POSITION_STATE.INCREASING;
+        handler.position = 0;
+        handler.target = 0;
+        handler.evaluatePosition();
+        const cmds = spy.calls.map((c: unknown[]) => (c[0] as { command: string }).command);
+        assert.ok(!cmds.some((c: string) => c.startsWith('*2*0*')), 'physical UP must not trigger stop');
+        assert.notEqual(handler.positionTimeout, undefined, 'position tracking must continue');
+        handler.destroy();
+    });
+
+    it('evaluatePosition physical DOWN (homeKitMovement=false) does not send stop even at target', () => {
+        const spy = platform.sendCommandSpy;
+        spy.calls.length = 0;
+        handler.homeKitMovement = false;
+        handler.state = POSITION_STATE.DECREASING;
+        handler.position = 5;
+        handler.target = 5;
+        handler.evaluatePosition();
+        const cmds = spy.calls.map((c: unknown[]) => (c[0] as { command: string }).command);
+        assert.ok(!cmds.some((c: string) => c.startsWith('*2*0*')), 'physical DOWN must not trigger stop');
+        assert.notEqual(handler.positionTimeout, undefined, 'position tracking must continue');
+        handler.destroy();
+    });
+
+    it('physical override cancels HomeKit movement when direction changes unexpectedly', () => {
+        // HomeKit movement going UP, physical DOWN button pressed
+        handler.homeKitMovement = true;
+        handler.state = POSITION_STATE.INCREASING;
+        handler.position = 50;
+        handler.target = 80;
+        handler.positionTimeout = setTimeout(() => {}, 100000);  // timer running
+
+        handler.onData('*2*2*23##');  // physical DOWN
+
+        assert.equal(handler.homeKitMovement, false, 'homeKitMovement must be cleared on physical override');
+        // positionTimeout is re-set by evaluatePosition() for physical tracking — not undefined
+        assert.equal(handler.state, POSITION_STATE.DECREASING, 'state must reflect physical direction');
+        handler.destroy();
     });
 
     it('evaluatePosition during init stops rescheduling when position reaches 0', () => {

@@ -181,6 +181,7 @@ export class OwnBlindAccessory extends OwnAccessory {
     positionTimeout: ReturnType<typeof setTimeout> | undefined;
     moveRetries: number;
     initPhase: boolean;
+    homeKitMovement: boolean;
     private windowCoveringService: InstanceType<typeof Service>;
 
     constructor(platform: OwnPlatformLike, accessory: PlatformAccessory, config: BlindConfig) {
@@ -205,6 +206,7 @@ export class OwnBlindAccessory extends OwnAccessory {
         this.positionTimeout = undefined;
         this.moveRetries = 0;
         this.initPhase = false;
+        this.homeKitMovement = false;
 
         this.accessory.getService(this.Service.AccessoryInformation)!
             .setCharacteristic(this.Characteristic.Model, 'WindowCovering');
@@ -277,6 +279,7 @@ export class OwnBlindAccessory extends OwnAccessory {
 
     moveStop(): void {
         this.log.info(`[${this.id}] Blind sending stop`);
+        this.homeKitMovement = false;
         this.expectedState = this.Characteristic.PositionState.STOPPED;
         this.controller.sendCommand({ command: `*2*0*${this.id}##`, log: this.log });
         this.startTimerCommand();
@@ -284,6 +287,7 @@ export class OwnBlindAccessory extends OwnAccessory {
 
     moveUp(): void {
         this.log.info(`[${this.id}] Blind sending move up`);
+        this.homeKitMovement = true;
         this.expectedState = this.Characteristic.PositionState.INCREASING;
         this.controller.sendCommand({ command: `*2*1*${this.id}##`, log: this.log });
         this.startTimerCommand();
@@ -291,6 +295,7 @@ export class OwnBlindAccessory extends OwnAccessory {
 
     moveDown(): void {
         this.log.info(`[${this.id}] Blind sending move down`);
+        this.homeKitMovement = true;
         this.expectedState = this.Characteristic.PositionState.DECREASING;
         this.controller.sendCommand({ command: `*2*2*${this.id}##`, log: this.log });
         this.startTimerCommand();
@@ -302,6 +307,7 @@ export class OwnBlindAccessory extends OwnAccessory {
         if (extract) {
             this.log.debug('id:%s onBlind(%s)', this.id, packet);
             const direction = extract[1];
+            const prevState = this.state;
             if (direction === '0') {
                 const wasDecreasing = this.state === this.Characteristic.PositionState.DECREASING;
                 this.state = this.Characteristic.PositionState.STOPPED;
@@ -320,14 +326,19 @@ export class OwnBlindAccessory extends OwnAccessory {
                 return;
             }
             this.windowCoveringService.getCharacteristic(this.Characteristic.PositionState).updateValue(this.state);
-            this.log.debug(`[${this.id}] received state dir:${direction} position:${this.position} target:${this.target}`);
+            this.log.info(`[${this.id}] received state dir:${direction} position:${this.position} target:${this.target}`);
 
             if (this.commandIsPending() && this.expectedState === this.state) {
                 this.log.info(`[${this.id}] expected state ${this.expectedState} reached`);
                 this.endTimerCommand();
+            } else if (this.homeKitMovement && this.state !== prevState) {
+                // Physical button pressed while HomeKit movement was in progress — yield immediately
+                this.log.info(`[${this.id}] Physical override detected, cancelling HomeKit movement`);
+                this.stopMoveTracking();
             }
 
-            if (!this.commandIsPending() && !this.positionTimeout) {
+            // Skip evaluatePosition for duplicate packets that don't change state
+            if (!this.commandIsPending() && !this.positionTimeout && this.state !== prevState) {
                 this.evaluatePosition();
             }
         } else {
@@ -343,7 +354,7 @@ export class OwnBlindAccessory extends OwnAccessory {
             if (this.position < 100) this.position++;
             if (this.position % 10 === 0 || this.position >= this.target)
                 this.log.info(`[${this.id}] Blind moving UP pos:${this.position} target:${this.target}`);
-            if (this.position >= this.target) {
+            if (this.homeKitMovement && this.position >= this.target) {
                 this.moveStop();
             } else {
                 this.startPositionTracking();
@@ -352,7 +363,7 @@ export class OwnBlindAccessory extends OwnAccessory {
             if (this.position > 0) this.position--;
             if (this.position % 10 === 0 || this.position <= this.target)
                 this.log.info(`[${this.id}] Blind moving DOWN pos:${this.position} target:${this.target}`);
-            if (!this.initPhase && this.position <= this.target) {
+            if (!this.initPhase && this.homeKitMovement && this.position <= this.target) {
                 this.moveStop();
             } else if (this.initPhase && this.position === 0) {
                 // at physical end-stop during init — wait for gateway STOP packet, do not reschedule
@@ -431,6 +442,7 @@ export class OwnBlindAccessory extends OwnAccessory {
         clearTimeout(this.packetTimeout);
         this.packetTimeout = undefined;
         this.commandSent = false;
+        this.homeKitMovement = false;
         this.moveRetries = 0;
     }
 
