@@ -17,15 +17,26 @@
     "node": "^18.20.4 || ^20.15.1 || ^22 || ^24",
     "homebridge": "^1.6.0 || ^2.0.0"
   },
-  "dependencies": {},
-  "devDependencies": {},
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/node": "^25.8.0",
+    "eslint": "^10.3.0",
+    "homebridge": "^1.6.1",
+    "typescript": "^6.0.3"
+  },
   "homepage": "https://github.com/bvial/homebridge-myhome#readme",
-  "main": "index.js",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
   "directories": {
     "lib": "lib"
   },
   "scripts": {
-    "test": "node --test 'test/*.test.js'"
+    "build": "tsc",
+    "test": "npm run build && node --test 'dist/test/*.test.js'",
+    "prepare": "npm run build"
+  },
+  "peerDependencies": {
+    "homebridge": "^1.6.0 || ^2.0.0"
   },
   "author": "Bertrand Vial <bvial@github.com> (https://www.npmjs.com/~bvial)"
 }

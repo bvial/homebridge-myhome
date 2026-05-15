@@ -4,22 +4,22 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Homebridge platform plugin (`homebridge-myhome-unik`) that bridges **Legrand MyHome** (BTicino) home automation gateways with Apple HomeKit via Homebridge. Uses the **Dynamic Platform API** (Homebridge >=1.6). Plain JavaScript (Node.js >=18), no TypeScript, no build step.
+Homebridge platform plugin (`homebridge-myhome-unik`) that bridges **Legrand MyHome** (BTicino) home automation gateways with Apple HomeKit via Homebridge. Uses the **Dynamic Platform API** (Homebridge >=1.6). **TypeScript with strict mode** (Node.js >=18). Requires a build step: `npm run build` compiles `*.ts` → `dist/`.
 
 ## Commands
 
 ```bash
 npm install          # Install dependencies
-node test.js         # Manual integration test against a real gateway (not a test suite)
+npm run build        # Compile TypeScript → dist/
+npm test             # Build + run automated test suite (node --test)
+node test.ts         # Manual integration test against a real gateway (compile first)
 ```
-
-There are no lint, build, or automated test commands. The plugin runs directly from source.
 
 ## Architecture
 
 ### Entry Point & Registration
 
-[index.js](index.js) registers `OwnPlatform` as a Dynamic Platform using the 2-argument `api.registerPlatform(PLATFORM_NAME, OwnPlatform)`. Exports `PLUGIN_NAME` and `PLATFORM_NAME` constants used by the platform for register/unregister calls. Note: `OwnPlatform.js` imports these constants back from `index.js` — this circular require is safe because the constants are assigned synchronously.
+[index.ts](index.ts) registers `OwnPlatform` as a Dynamic Platform using the 2-argument `api.registerPlatform(PLATFORM_NAME, OwnPlatform)`. Re-exports `PLUGIN_NAME` and `PLATFORM_NAME` from [lib/constants.ts](lib/constants.ts). Previously `index.js` imported these back from itself (circular require); the `constants.ts` module breaks that cycle.
 
 ### Dynamic Platform Lifecycle
 
@@ -32,10 +32,10 @@ There are no lint, build, or automated test commands. The plugin runs directly f
 
 | File | Class(es) | Role |
 |------|-----------|------|
-| [lib/OwnPlatform.js](lib/OwnPlatform.js) | `OwnPlatform` | Dynamic Platform; owns `OwnClient` (as `controller`), dispatches packets via `activeHandlers`, runs keep-alive watchdog |
-| [lib/OwnNet.js](lib/OwnNet.js) | `OwnConnection`, `OwnMonitor`, `OwnClient` | TCP networking, OpenWebNet auth handshake, command queue (max 2 concurrent) |
-| [lib/OwnAccessory.js](lib/OwnAccessory.js) | `OwnLightAccessory`, `OwnBlindAccessory`, `OwnThermostatAccessory`, `OwnScenarioAccessory`, `OwnContactAccessory`, `OwnEnergyAccessory` | HomeKit accessory implementations using `onGet`/`onSet` API |
-| [lib/OwnProtcol.js](lib/OwnProtcol.js) | `OwnProtcol` | Stateless packet parsing/encoding utilities and WHO constants |
+| [lib/OwnPlatform.ts](lib/OwnPlatform.ts) | `OwnPlatform` | Dynamic Platform; owns `OwnClient` (as `controller`), dispatches packets via `activeHandlers`, runs keep-alive watchdog |
+| [lib/OwnNet.ts](lib/OwnNet.ts) | `OwnConnection`, `OwnMonitor`, `OwnClient` | TCP networking, OpenWebNet auth handshake, command queue (max 2 concurrent) |
+| [lib/OwnAccessory.ts](lib/OwnAccessory.ts) | `OwnLightAccessory`, `OwnBlindAccessory`, `OwnThermostatAccessory`, `OwnScenarioAccessory`, `OwnContactAccessory`, `OwnEnergyAccessory` | HomeKit accessory implementations using `onGet`/`onSet` API |
+| [lib/OwnProtcol.ts](lib/OwnProtcol.ts) | `OwnProtcol` | Stateless packet parsing/encoding utilities and WHO constants |
 
 ### Communication Model
 
@@ -44,7 +44,7 @@ The plugin connects to a Legrand gateway over **raw TCP on port 20000** using th
 - **MONITOR connection** (`*99*1##`): persistent; receives all state-change events pushed by the gateway.
 - **COMMAND connections** (`*99*9##`): short-lived, queued (max 2 concurrent); opened, command sent, response read, then closed.
 
-**Authentication**: The gateway either accepts the connection immediately (`*#*1##`) or sends a nonce. The client responds using `calcPass()` in `OwnNet.js` — a bit-rotation/XOR chain applied to the configured password integer.
+**Authentication**: The gateway either accepts the connection immediately (`*#*1##`) or sends a nonce. The client responds using `calcPass()` in `OwnNet.ts` — a bit-rotation/XOR chain applied to the configured password integer.
 
 **Packet format**: `*WHO*WHAT*WHERE##` for commands, `*#WHO*WHERE*DIM*VAL##` for dimension reads. Multiple packets can arrive concatenated in one TCP data event; `OwnConnection` handles this with a while-loop regex scan.
 
@@ -60,7 +60,7 @@ The plugin connects to a Legrand gateway over **raw TCP on port 20000** using th
 ### Reconnect Logic
 
 There are two independent reconnect mechanisms:
-1. `OwnMonitor` (in `OwnNet.js`): checks after 20 s, retries 3x, then reconnects.
+1. `OwnMonitor` (in `OwnNet.ts`): checks after 20 s, retries 3x, then reconnects.
 2. `OwnPlatform.resetAutoConnectMonitor`: sends a keep-alive probe (`*#13**15##`) every 2 minutes; restarts the monitor connection after 3 missed replies.
 
 ### WHO Codes in Use
@@ -81,5 +81,5 @@ See [config.json](config.json) and [config.schema.json](config.schema.json). The
 
 ## Known Issues / Quirks
 
-- `lib/OwnProtcol.js` is intentionally misspelled ("Protcol") throughout the codebase — do not rename.
-- `test.js` is a manual live-gateway test script, not an automated test suite.
+- `lib/OwnProtcol.ts` is intentionally misspelled ("Protcol") throughout the codebase — do not rename.
+- `test.ts` is a manual live-gateway test script, not an automated test suite. It is excluded from the TypeScript build (`tsconfig.json` `exclude`) and must be run via `ts-node` or compiled separately.

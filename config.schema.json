@@ -28,6 +28,15 @@
                 "required": false,
                 "default": ""
             },
+            "maxConcurrent": {
+                "title": "Max concurrent commands",
+                "description": "Maximum number of simultaneous TCP command connections to the gateway (default: 2, increase to 3-4 if your gateway supports it)",
+                "type": "integer",
+                "required": false,
+                "default": 2,
+                "minimum": 1,
+                "maximum": 10
+            },
             "lights": {
                 "title": "Lights",
                 "buttonText": "Add Light",
