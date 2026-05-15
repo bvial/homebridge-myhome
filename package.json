@@ -1,6 +1,6 @@
 {
   "name": "homebridge-myhome-unik",
-  "version": "0.1.7",
+  "version": "0.2.0",
   "description": "MyHome Legrand plugin for homebridge",
   "license": "ISC",
   "keywords": [
@@ -27,6 +27,16 @@
   "homepage": "https://github.com/bvial/homebridge-myhome#readme",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
+  "files": [
+    "dist/index.js",
+    "dist/index.js.map",
+    "dist/index.d.ts",
+    "dist/lib/",
+    "dist/scan.js",
+    "dist/scan.js.map",
+    "dist/scan.d.ts",
+    "config.schema.json"
+  ],
   "directories": {
     "lib": "lib"
   },
