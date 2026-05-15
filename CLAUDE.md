@@ -24,7 +24,7 @@ node test.ts         # Manual integration test against a real gateway (compile f
 ### Dynamic Platform Lifecycle
 
 1. **Startup**: Homebridge creates the platform, then calls `configureAccessory()` once per cached accessory (persisted from previous runs).
-2. **`didFinishLaunching`**: The platform calls `discoverDevices()` to reconcile config against cached accessories — creating new ones, updating existing, and removing stale.
+2. **`didFinishLaunching`**: The platform queries the gateway model (`detectGatewayModel`), sets `maxConcurrent` (from config or auto-detected), then calls `discoverDevices()` to reconcile config against cached accessories — creating new ones, updating existing, and removing stale.
 3. **UUID generation**: `api.hap.uuid.generate('myhome-' + type + '-' + id)` ensures stable identifiers across restarts.
 4. **Handler pattern**: Each accessory gets an `OwnXxxAccessory` handler (stored in `activeHandlers[]`) that attaches HomeKit services and characteristic handlers to the `platformAccessory`.
 
@@ -33,7 +33,7 @@ node test.ts         # Manual integration test against a real gateway (compile f
 | File | Class(es) | Role |
 |------|-----------|------|
 | [lib/OwnPlatform.ts](lib/OwnPlatform.ts) | `OwnPlatform` | Dynamic Platform; owns `OwnClient` (as `controller`), dispatches packets via `activeHandlers`, runs keep-alive watchdog |
-| [lib/OwnNet.ts](lib/OwnNet.ts) | `OwnConnection`, `OwnMonitor`, `OwnClient` | TCP networking, OpenWebNet auth handshake, command queue (max 2 concurrent) |
+| [lib/OwnNet.ts](lib/OwnNet.ts) | `OwnConnection`, `OwnMonitor`, `OwnClient` | TCP networking, OpenWebNet auth handshake, command queue (concurrency auto-detected or config-driven) |
 | [lib/OwnAccessory.ts](lib/OwnAccessory.ts) | `OwnLightAccessory`, `OwnBlindAccessory`, `OwnThermostatAccessory`, `OwnScenarioAccessory`, `OwnContactAccessory`, `OwnEnergyAccessory` | HomeKit accessory implementations using `onGet`/`onSet` API |
 | [lib/OwnProtcol.ts](lib/OwnProtcol.ts) | `OwnProtcol` | Stateless packet parsing/encoding utilities and WHO constants |
 
@@ -42,7 +42,7 @@ node test.ts         # Manual integration test against a real gateway (compile f
 The plugin connects to a Legrand gateway over **raw TCP on port 20000** using the **OpenWebNet (OWN) protocol**:
 
 - **MONITOR connection** (`*99*1##`): persistent; receives all state-change events pushed by the gateway.
-- **COMMAND connections** (`*99*9##`): short-lived, queued (max 2 concurrent); opened, command sent, response read, then closed.
+- **COMMAND connections** (`*99*9##`): short-lived, queued; concurrency limit auto-detected from gateway model at startup (see `maxConcurrent` below) or overridden via config.
 
 **Authentication**: The gateway either accepts the connection immediately (`*#*1##`) or sends a nonce. The client responds using `calcPass()` in `OwnNet.ts` — a bit-rotation/XOR chain applied to the configured password integer.
 
@@ -59,9 +59,11 @@ The plugin connects to a Legrand gateway over **raw TCP on port 20000** using th
 
 ### Reconnect Logic
 
-There are two independent reconnect mechanisms:
-1. `OwnMonitor` (in `OwnNet.ts`): checks after 20 s, retries 3x, then reconnects.
-2. `OwnPlatform.resetAutoConnectMonitor`: sends a keep-alive probe (`*#13**15##`) every 2 minutes; restarts the monitor connection after 3 missed replies.
+`OwnMonitor` (in `OwnNet.ts`) is the single reconnect mechanism:
+- After 30 s without a packet, sends a keep-alive probe (`*#13**15##` via WHO=13).
+- Retries up to 3 times; on the 3rd failure triggers a full reconnect.
+- Reconnect delay grows with each failed attempt (`reconnectSeconds × reconnectAttempts`, capped at 300 s).
+- If authentication fails (`auth-failed`), reconnection is permanently disabled until Homebridge restarts.
 
 ### WHO Codes in Use
 
@@ -72,12 +74,12 @@ There are two independent reconnect mechanisms:
 | 2 | Automation (blinds) |
 | 4 | Thermostat/Temperature |
 | 9 | Auxiliary (dry contacts) |
-| 13 | Gateway (keep-alive) |
+| 13 | Gateway (keep-alive probe, model query) |
 | 18 | Energy management |
 
 ## Configuration
 
-See [config.json](config.json) and [config.schema.json](config.schema.json). The platform config block requires `host`, `port` (default 20000), and `password` (integer). Accessories are declared under `lights[]`, `blinds[]`, `thermostats[]`, `scenarios[]`, `contacts[]`, and `energies[]` arrays, each with a numeric `id` (OWN `WHERE` address).
+See [config.schema.json](config.schema.json). The platform config block requires `host`. Optional: `port` (default 20000), `password` (numeric string), `maxConcurrent` (integer 1–10, default auto-detected). If `maxConcurrent` is omitted the plugin sends `*#13**0##` at startup to identify the gateway model and sets the limit accordingly (F454/F455 → 4, F452/MH200 → 3, unknown → 2). Accessories are declared under `lights[]`, `blinds[]`, `thermostats[]`, `scenarios[]`, `contacts[]`, and `energies[]` arrays, each with a numeric `id` (OWN `WHERE` address).
 
 ## Known Issues / Quirks
 
