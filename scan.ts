@@ -85,8 +85,12 @@ function configScan(): Promise<ConfigDevice[]> {
 
 // ─── Phase 2 : STATUS scan ────────────────────────────────────────────────────
 // Queries each address individually in COMMAND mode.
-// A device is detected when the gateway replies with at least one data packet
-// before the final ACK.
+// Detection rules per WHO type:
+//   WHO=1,4,9,18 — device exists when the gateway sends at least one data packet
+//                  before ACK (stopped blind sends just ACK on some firmware).
+//   WHO=2        — device exists when gateway responds ACK (data or not); NACK
+//                  means the address is not configured. A stopped blind typically
+//                  replies ACK without a data packet on F454/F455 firmware.
 
 interface Found { who: number; where: string; packets: string[] }
 
@@ -96,10 +100,10 @@ async function statusScan(client: OwnClient): Promise<Found[]> {
     const jobs: Array<{ who: number; where: string; command: string }> = [];
 
     for (let w = 1; w <= maxAddr; w++) {
-        jobs.push({ who: 1,  where: String(w), command: `*#1*${w}##`       });  // light
-        jobs.push({ who: 2,  where: String(w), command: `*#2*${w}##`       });  // blind
-        jobs.push({ who: 9,  where: String(w), command: `*#9*${w}##`       });  // dry contact
-        jobs.push({ who: 18, where: String(w), command: `*#18*${w}*113##`  });  // energy (active power)
+        jobs.push({ who: 1,  where: String(w), command: `*#1*${w}##`      });  // light
+        jobs.push({ who: 2,  where: String(w), command: `*#2*${w}##`      });  // blind
+        jobs.push({ who: 9,  where: String(w), command: `*#9*${w}##`      });  // dry contact
+        jobs.push({ who: 18, where: String(w), command: `*#18*${w}*113##` });  // energy (active power)
     }
     for (let w = 1; w <= 9; w++) {
         jobs.push({ who: 4, where: String(w), command: `*#4*${w}##` });  // thermostat zone probe
@@ -115,7 +119,11 @@ async function statusScan(client: OwnClient): Promise<Found[]> {
                     stopon: [PKT.ACK, PKT.NACK],
                     packet: p => pkts.push(p),
                     done: pkt => {
-                        if (pkt === PKT.ACK && pkts.length > 0) found.push({ who, where, packets: pkts });
+                        if (pkt === PKT.NACK) { resolve(); return; }  // address not configured
+                        // WHO=2: ACK alone means the blind exists (stopped blinds send no data)
+                        if (pkt === PKT.ACK && (who === 2 || pkts.length > 0)) {
+                            found.push({ who, where, packets: pkts });
+                        }
                         resolve();
                     },
                 });
