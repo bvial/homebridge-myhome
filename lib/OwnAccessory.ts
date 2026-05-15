@@ -330,7 +330,7 @@ export class OwnBlindAccessory extends OwnAccessory {
                 this.evaluatePosition();
             }
         } else {
-            this.log.error('[%s] Blind unknown packet:%s', this.id, packet);
+            this.log.debug('[%s] Blind ignoring extended packet:%s', this.id, packet);
         }
     }
 

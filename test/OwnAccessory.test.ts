@@ -187,11 +187,11 @@ describe('OwnBlindAccessory', () => {
         assert.equal(handler.state, POSITION_STATE.DECREASING);
     });
 
-    it('unknown packet logs error', () => {
-        const errors: unknown[] = [];
-        platform.log.error = ((...args: unknown[]) => { errors.push(args); }) as typeof platform.log.error;
+    it('unknown packet logs at debug level', () => {
+        const debugs: unknown[] = [];
+        platform.log.debug = ((...args: unknown[]) => { debugs.push(args); }) as typeof platform.log.debug;
         handler.onData('*99*0*23##');
-        assert.ok(errors.length > 0);
+        assert.ok(debugs.length > 0);
     });
 
     it('msPerPercent without slat', () => {
