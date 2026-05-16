@@ -94,6 +94,18 @@ describe('OwnLightAccessory', () => {
         assert.equal(h.value, false);
     });
 
+    it('onData extended off packet (1000#0) turns light off', () => {
+        handler.value = true;
+        handler.onData('*1*1000#0*42##');
+        assert.equal(handler.value, false);
+    });
+
+    it('onData extended on packet (1000#1) turns light on', () => {
+        handler.value = false;
+        handler.onData('*1*1000#1*42##');
+        assert.equal(handler.value, true);
+    });
+
     it('onData unknown packet logs error', () => {
         const errors: unknown[] = [];
         platform.log.error = ((...args: unknown[]) => { errors.push(args); }) as typeof platform.log.error;

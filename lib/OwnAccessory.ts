@@ -144,7 +144,9 @@ export class OwnLightAccessory extends OwnAccessory {
     }
 
     onData(packet: string): void {
-        const extract = packet.match(/^\*1\*(\d+)\*\d+##$/);
+        // Extended scenario/automation format *1*1000#<level>*<id>## — treat sub-level as the effective level
+        const ext = packet.match(/^\*1\*1000#(\d+)\*\d+##$/);
+        const extract = ext ?? packet.match(/^\*1\*(\d+)\*\d+##$/);
         if (extract) {
             this.log.debug('id:%s onLight(%s)', this.id, packet);
             const level = parseInt(extract[1], 10);
