@@ -182,6 +182,7 @@ export class OwnBlindAccessory extends OwnAccessory {
     moveRetries: number;
     initPhase: boolean;
     homeKitMovement: boolean;
+    private inStatusQuery: boolean;
     private windowCoveringService: InstanceType<typeof Service>;
 
     constructor(platform: OwnPlatformLike, accessory: PlatformAccessory, config: BlindConfig) {
@@ -207,6 +208,7 @@ export class OwnBlindAccessory extends OwnAccessory {
         this.moveRetries = 0;
         this.initPhase = false;
         this.homeKitMovement = false;
+        this.inStatusQuery = false;
 
         this.accessory.getService(this.Service.AccessoryInformation)!
             .setCharacteristic(this.Characteristic.Model, 'WindowCovering');
@@ -252,7 +254,11 @@ export class OwnBlindAccessory extends OwnAccessory {
             this.controller.sendCommand({
                 command: `*#2*${this.id}##`,
                 log: this.log,
-                packet: (pkt: string) => { this.onData(pkt); },
+                packet: (pkt: string) => {
+                    this.inStatusQuery = true;
+                    this.onData(pkt);
+                    this.inStatusQuery = false;
+                },
             });
         }
     }
@@ -331,7 +337,9 @@ export class OwnBlindAccessory extends OwnAccessory {
             if (this.commandIsPending() && this.expectedState === this.state) {
                 this.log.info(`[${this.id}] expected state ${this.expectedState} reached`);
                 this.endTimerCommand();
-            } else if (this.homeKitMovement && this.state !== prevState) {
+            } else if (this.homeKitMovement && this.state !== prevState
+                    && this.state !== this.expectedState
+                    && !this.inStatusQuery) {
                 // Physical button pressed while HomeKit movement was in progress — yield immediately
                 this.log.info(`[${this.id}] Physical override detected, cancelling HomeKit movement`);
                 this.stopMoveTracking();
@@ -356,6 +364,8 @@ export class OwnBlindAccessory extends OwnAccessory {
                 this.log.info(`[${this.id}] Blind moving UP pos:${this.position} target:${this.target}`);
             if (this.homeKitMovement && this.position >= this.target) {
                 this.moveStop();
+            } else if (!this.homeKitMovement && this.position >= 100) {
+                // physical movement reached upper end-stop — wait for gateway STOP packet
             } else {
                 this.startPositionTracking();
             }
@@ -367,6 +377,8 @@ export class OwnBlindAccessory extends OwnAccessory {
                 this.moveStop();
             } else if (this.initPhase && this.position === 0) {
                 // at physical end-stop during init — wait for gateway STOP packet, do not reschedule
+            } else if (!this.homeKitMovement && this.position <= 0) {
+                // physical movement reached lower end-stop — wait for gateway STOP packet
             } else {
                 this.startPositionTracking();
             }
