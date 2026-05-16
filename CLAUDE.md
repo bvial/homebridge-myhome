@@ -50,7 +50,7 @@ The plugin connects to a Legrand gateway over **raw TCP on port 20000** using th
 
 ### Accessory Behavior Notes
 
-- **`OwnLightAccessory`**: Supports dimmer mode (config `dimmer: true`). Brightness maps to OWN levels 2-10; brightness=0 sends an off command.
+- **`OwnLightAccessory`**: Supports dimmer mode (config `dimmer: true`). Brightness maps to OWN levels 2-10; brightness=0 sends an off command. Also handles extended packets `*1*1000#X*WHERE##` (sent by the gateway when a light is triggered by a scenario or automation rule): `X=0` → off, `X>0` → on.
 - **`OwnBlindAccessory`**: Position modeled by timing movement against configured `time` (seconds for full travel). Supports venetian blinds with `timeSlat`/`slatPercent`. On first `updateStatus()` resets to known state by issuing a full down command.
 - **`OwnThermostatAccessory`**: Uses two addresses — `id` for the zone probe and `#0#<zone>` for central unit commands. Error on set when not in HEAT mode throws `HapStatusError`.
 - **`OwnScenarioAccessory`**: Momentary switch — triggers scenario then resets to off after 500ms.
@@ -75,11 +75,23 @@ The plugin connects to a Legrand gateway over **raw TCP on port 20000** using th
 | 4 | Thermostat/Temperature |
 | 9 | Auxiliary (dry contacts) |
 | 13 | Gateway (keep-alive probe, model query) |
+| 15/25 | CEN / CEN PLUS (physical button press events — received on monitor, silently ignored at debug level) |
 | 18 | Energy management |
+| 1001 | Auto-diagnostic (SCS bus device presence/serial scan — received on monitor, silently ignored at debug level) |
 
 ## Configuration
 
-See [config.schema.json](config.schema.json). The platform config block requires `host`. Optional: `port` (default 20000), `password` (numeric string), `maxConcurrent` (integer 1–10, default auto-detected). If `maxConcurrent` is omitted the plugin sends `*#13**0##` at startup to identify the gateway model and sets the limit accordingly (F454/F455 → 4, F452/MH200 → 3, unknown → 2). Accessories are declared under `lights[]`, `blinds[]`, `thermostats[]`, `scenarios[]`, `contacts[]`, and `energies[]` arrays, each with a numeric `id` (OWN `WHERE` address).
+See [config.schema.json](config.schema.json). The platform config block requires `host`. Optional: `port` (default 20000), `password` (numeric string), `maxConcurrent` (integer 1–10, default auto-detected). If `maxConcurrent` is omitted the plugin sends `*#13**15##` (DIM 15 = Device Type) at startup to identify the gateway model and sets the limit accordingly:
+
+| Model code (DIM 15) | Gateway | `maxConcurrent` |
+|---------------------|---------|-----------------|
+| 200 | F454 | 4 |
+| 6, 7 | F452, F452V | 3 |
+| 4 | MH200 | 3 |
+| 2, 11, 13 | MHServer, MHServer2, H4684 | 2 |
+| unknown / no response | — | 2 |
+
+The gateway responds with `*#13**15*<code>##`; if no data packet is received before ACK, model is treated as unknown. Startup log: `maxConcurrent auto-set to N (gateway: <Name> (code <N>))`. Accessories are declared under `lights[]`, `blinds[]`, `thermostats[]`, `scenarios[]`, `contacts[]`, and `energies[]` arrays, each with a numeric `id` (OWN `WHERE` address).
 
 ## Known Issues / Quirks
 

@@ -67,7 +67,7 @@ Add a platform block to your Homebridge `config.json`:
 | `host` | string | — | **Required.** IP address or hostname of the gateway |
 | `port` | integer | `20000` | TCP port |
 | `password` | string | `""` | Numeric password (leave empty if none) |
-| `maxConcurrent` | integer | auto | Max simultaneous TCP command connections (1–10). If omitted the plugin queries the gateway model and sets an appropriate value automatically (F454/F455 → 4, F452/MH200 → 3, unknown → 2) |
+| `maxConcurrent` | integer | auto | Max simultaneous TCP command connections (1–10). If omitted the plugin queries the gateway model (`*#13**15##`) at startup and sets the limit automatically: F454 → 4, F452/F452V/MH200 → 3, others/unknown → 2 |
 
 ### Accessory arrays
 
@@ -77,7 +77,7 @@ Add a platform block to your Homebridge `config.json`:
 |-----|------|----------|-------------|
 | `id` | integer | yes | OWN `WHERE` address |
 | `name` | string | no | Display name in HomeKit |
-| `dimmer` | boolean | no | Enable brightness control (levels 2–10) |
+| `dimmer` | boolean | no | Enable brightness control (levels 2–10). When a light is triggered by a gateway scenario or automation rule, the gateway sends an extended packet (`*1*1000#X*WHERE##`) that is handled transparently. |
 
 #### `blinds`
 
