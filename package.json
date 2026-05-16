@@ -1,6 +1,6 @@
 {
   "name": "homebridge-myhome-unik",
-  "version": "0.1.6",
+  "version": "0.3.4",
   "description": "MyHome Legrand plugin for homebridge",
   "license": "ISC",
   "keywords": [
@@ -14,22 +14,40 @@
     "url": "http://github.com/bvial/homebridge-myhome/issues"
   },
   "engines": {
-    "node": ">=12.0.0",
-    "homebridge": ">=0.2.0"
+    "node": "^18.20.4 || ^20.15.1 || ^22 || ^24",
+    "homebridge": "^1.6.0 || ^2.0.0"
   },
-  "dependencies": {
-    "lodash": "^4.14.1",
-    "request": "^2.65.0",
-    "sprintf-js": "^1.1.2"
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/node": "^25.8.0",
+    "eslint": "^10.3.0",
+    "homebridge": "^1.6.1",
+    "typescript": "^6.0.3"
   },
-  "devDependencies": {},
   "homepage": "https://github.com/bvial/homebridge-myhome#readme",
-  "main": "index.js",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist/index.js",
+    "dist/index.js.map",
+    "dist/index.d.ts",
+    "dist/lib/",
+    "dist/scan.js",
+    "dist/scan.js.map",
+    "dist/scan.d.ts",
+    "config.schema.json"
+  ],
   "directories": {
     "lib": "lib"
   },
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "build": "tsc",
+    "scan": "npm run build && node dist/scan.js",
+    "test": "npm run build && node --test 'dist/test/*.test.js'",
+    "prepare": "npm run build"
+  },
+  "peerDependencies": {
+    "homebridge": "^1.6.0 || ^2.0.0"
   },
   "author": "Bertrand Vial <bvial@github.com> (https://www.npmjs.com/~bvial)"
 }

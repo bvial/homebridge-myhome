@@ -1,6 +1,6 @@
 //@ts-check
-var OwnNet = require('./lib/OwnNet.js');
-var OwnProtcol = require('./lib/OwnProtcol.js');
+let OwnNet = require('./lib/OwnNet.js');
+let OwnProtcol = require('./lib/OwnProtcol.js');
 //const sprintf = require("sprintf-js").sprintf;
 
 const host = '192.168.1.35';
@@ -10,10 +10,10 @@ const port = 20000;
 //const host = '10.0.0.178';
 
 // Status
-const start = Date.now();
+const _start = Date.now();
 
 
-var ownClient = new OwnNet.OwnClient(host, port,pass, console);
+let ownClient = new OwnNet.OwnClient(host, port,pass, console);
 ownClient.on ('monitoring', function () {
 	console.log ('started monitoring');
 });
@@ -23,20 +23,20 @@ ownClient.on ('packet',function ( data ) {
 });
 ownClient.startMonitor();
 
-ownClient.scanSystem(function ( data ) {
-	console.log ('scanSystem:%s',data.join());
-});
+/* ownClient.scanSystem(function ( data ) {
+ 	console.log ('scanSystem:%s',data.join());
+ });
 
 ownClient.scanUnconfigured(function ( data ) {
-	console.log ('scanUnconfigured:%s',data.join());
+ 	console.log ('scanUnconfigured:%s',data.join());
 });
 
 ownClient.scanConfigured(function ( data ) {
-	console.log ('scanConfigured:%s',data.join());
-});
+ 	console.log ('scanConfigured:%s',data.join());
+ }); */
 
 // Send light probe
-var lights =[];
+let _lights =[];
 //ownClient.sendCommand({
 //	command:'*#4*#0#1##',
 //	command:'*#1*0##',
@@ -44,7 +44,7 @@ var lights =[];
 //	command:'*#4*1##',
 //	command:'*#4*1*14##',
 //	command:'*#4*1*0##',
-   command:'*#4*#0#1*#14*0260*1##',  // -> set headting manual   //*#4*#0#1*14*070*1##
+//   command:'*#4*#0#1*#14*0260*1##',  // -> set headting manual   //*#4*#0#1*14*070*1##
 // command:'*4*103*#0#1##', // set heating off
 // command:'*4*102*#0#1##', // Porctecttion mode
 // command:'*4*304*#0#1##', // Auto mode   NOK
@@ -95,7 +95,7 @@ var lights =[];
 
 
 
-function setSetPoint(_address,_temperature) {
+function _setSetPoint(_address,_temperature) {
 	// Standard thermostat *4*40*%02d##*#4*#%02d*#14*%04d*3
 	//var cmd = sprintf("*4*40*%02d##*#4*#%02d*#14*%04d*3##*#4*%02d*14##",_address,_address,_temperature * 10,_address);
 	//ownClient.sendCommand({command: cmd});

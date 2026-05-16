@@ -11,22 +11,38 @@
                 "default": "MyHome"
             },
             "host": {
-                "title": "Myhome server adress",
+                "title": "MyHome server address",
                 "type": "string",
                 "required": true,
                 "default": "192.168.1.35"
             },
             "port": {
-                "title": "Myhome server port",
+                "title": "MyHome server port",
                 "type": "string",
                 "required": false,
                 "default": "20000"
             },
             "password": {
-                "title": "Myhome server password",
+                "title": "MyHome server password",
                 "type": "string",
                 "required": false,
                 "default": ""
+            },
+            "maxConcurrent": {
+                "title": "Max concurrent commands",
+                "description": "Maximum number of simultaneous TCP command connections to the gateway (default: 2, increase to 3-4 if your gateway supports it)",
+                "type": "integer",
+                "required": false,
+                "default": 2,
+                "minimum": 1,
+                "maximum": 10
+            },
+            "debug": {
+                "title": "Enable debug logging",
+                "description": "Enable verbose debug logging for this plugin without requiring the Homebridge -D flag",
+                "type": "boolean",
+                "required": false,
+                "default": false
             },
             "lights": {
                 "title": "Lights",
@@ -47,8 +63,10 @@
                         },
                         "dimmer": {
                             "title": "Dimmer",
+                            "description": "Enable dimmer support (brightness levels 2-10)",
                             "type": "boolean",
-                            "required": false
+                            "required": false,
+                            "default": false
                         }
                     }
                 }
@@ -71,9 +89,24 @@
                             "required": false
                         },
                         "time": {
-                            "title": "time",
+                            "title": "Travel time (s)",
+                            "description": "Time in seconds for full linear travel (up or down)",
                             "type": "integer",
                             "required": true
+                        },
+                        "timeSlat": {
+                            "title": "Slat rotation time (s)",
+                            "description": "Additional time in seconds for slat rotation (venetian blinds only, leave 0 for roller blinds)",
+                            "type": "integer",
+                            "required": false,
+                            "default": 0
+                        },
+                        "slatPercent": {
+                            "title": "Slat threshold (%)",
+                            "description": "Position (%) below which slat rotation occurs. E.g. 10 means: 10%=blind down slats open, 0%=fully closed. Leave 0 for roller blinds.",
+                            "type": "integer",
+                            "required": false,
+                            "default": 0
                         }
                     }
                 }
@@ -92,6 +125,69 @@
                         },
                         "zone": {
                             "title": "zone",
+                            "type": "integer",
+                            "required": true
+                        },
+                        "name": {
+                            "title": "Name",
+                            "type": "string",
+                            "required": false
+                        }
+                    }
+                }
+            },
+            "scenarios": {
+                "title": "Scenarios",
+                "buttonText": "Add Scenario",
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "id": {
+                            "title": "id",
+                            "description": "Scenario number (WHO=0)",
+                            "type": "integer",
+                            "required": true
+                        },
+                        "name": {
+                            "title": "Name",
+                            "type": "string",
+                            "required": false
+                        }
+                    }
+                }
+            },
+            "contacts": {
+                "title": "Dry Contacts",
+                "buttonText": "Add Contact",
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "id": {
+                            "title": "id",
+                            "description": "Auxiliary/dry contact address (WHO=9)",
+                            "type": "integer",
+                            "required": true
+                        },
+                        "name": {
+                            "title": "Name",
+                            "type": "string",
+                            "required": false
+                        }
+                    }
+                }
+            },
+            "energies": {
+                "title": "Energy Monitors",
+                "buttonText": "Add Energy Monitor",
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "id": {
+                            "title": "id",
+                            "description": "Energy meter address (WHO=18)",
                             "type": "integer",
                             "required": true
                         },
