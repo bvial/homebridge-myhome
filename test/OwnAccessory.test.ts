@@ -379,25 +379,59 @@ describe('OwnBlindAccessory', () => {
         assert.equal(handler.positionTimeout, undefined, 'must not reschedule at lower end-stop');
     });
 
-    it('status query response does not trigger physical override', () => {
-        // Simulate: HomeKit moveUp sent, endTimerCommand timeout forces state=INCREASING,
-        // then updateStatus returns STOPPED via packet callback (inStatusQuery path)
+    it('status query response does not trigger physical override on monitor path', () => {
+        // Bug: inStatusQuery was only set inside packet callback (command path).
+        // Monitor receives echoed status packets WITHOUT the flag → false physical override.
+        // Fix: inStatusQuery is now set BEFORE sendCommand and cleared in done callback.
         handler.homeKitMovement = true;
         handler.expectedState = POSITION_STATE.INCREASING;
-        handler.state = POSITION_STATE.INCREASING;  // forced by endTimerCommand
-        // Simulate the updateStatus packet callback wrapping (sets inStatusQuery=true internally)
-        // We call onData directly as updateStatus would, verifying no override fires
-        // To test the flag: we need to set it manually since it's private
-        // Instead, test via updateStatus() after initStartPosition=true
+        handler.state = POSITION_STATE.INCREASING;  // forced by endTimerCommand timeout
         handler.initStartPosition = true;  // skip init path
-        handler.updateStatus();            // will call sendCommand with inStatusQuery wrapping
-        // The spy captures the command; we simulate a STOPPED response coming back
-        // by calling onData directly (without the flag) to prove override IS triggered without the fix
-        // and then via the callback (with flag) to prove it's NOT triggered
-        // Direct call (no flag) — would be override if state changed from non-STOPPED
-        // Here state is already INCREASING, no change → no override regardless
-        // Just verify homeKitMovement unchanged after status query sends command
-        assert.equal(handler.homeKitMovement, true, 'homeKitMovement must survive updateStatus dispatch');
+
+        handler.updateStatus();  // sets inStatusQuery=true, then calls sendCommand
+
+        // Flag must be true while the query is in flight (monitor path protection)
+        assert.equal((handler as unknown as Record<string, unknown>)['inStatusQuery'], true,
+            'inStatusQuery must be true from the moment updateStatus sends the query');
+
+        // Simulate monitor receiving STOPPED echo (the bug scenario)
+        handler.onData('*2*0*23##');
+
+        // homeKitMovement must survive — no physical override during query window
+        assert.equal(handler.homeKitMovement, true,
+            'homeKitMovement must survive status query STOP echo on monitor path');
+
+        // Simulate done callback (command connection closes)
+        const lastCall = platform.sendCommandSpy.calls[platform.sendCommandSpy.calls.length - 1];
+        const params = lastCall[0] as Record<string, unknown>;
+        if (typeof params['done'] === 'function') {
+            (params['done'] as (p: null, i: number) => void)(null, -1);
+        }
+        assert.equal((handler as unknown as Record<string, unknown>)['inStatusQuery'], false,
+            'inStatusQuery must be cleared after done callback');
+    });
+
+    it('endTimerCommand confirmation sets grace window to absorb gateway echo STOP packets', () => {
+        // Bug: after UP confirmed (*2*1000#1*id##), the old-format *2*0*id## arrives late.
+        // With commandSent=false but homeKitMovement=true, this STOP triggers false physical override.
+        // Fix: endTimerCommand success path sets inStatusQuery=true for 300ms grace window.
+        handler.homeKitMovement = true;
+        handler.expectedState = POSITION_STATE.INCREASING;
+        handler.state = POSITION_STATE.INCREASING;  // command just confirmed
+        handler.commandSent = true;
+
+        handler.endTimerCommand();  // success path: state === expectedState
+
+        // Grace window must be active immediately
+        assert.equal((handler as unknown as Record<string, unknown>)['inStatusQuery'], true,
+            'inStatusQuery must be true in grace window after confirmation');
+
+        // Simulate gateway echo STOP packet (old-format, arrives late)
+        handler.onData('*2*0*23##');
+
+        // homeKitMovement must survive — no physical override during grace window
+        assert.equal(handler.homeKitMovement, true,
+            'homeKitMovement must survive echo STOP during grace window after confirmation');
     });
 
     it('physical override fires for genuine direction reversal (INCREASING→DECREASING)', () => {

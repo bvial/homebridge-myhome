@@ -251,12 +251,14 @@ export class OwnBlindAccessory extends OwnAccessory {
             this.initStartPosition = true;
         } else {
             this.log.info(`[${this.id}] Blind fetching State :${this.state}`);
+            this.inStatusQuery = true;
             this.controller.sendCommand({
                 command: `*#2*${this.id}##`,
                 log: this.log,
                 packet: (pkt: string) => {
-                    this.inStatusQuery = true;
                     this.onData(pkt);
+                },
+                done: (_pkt: string | null, _idx: number) => {
                     this.inStatusQuery = false;
                 },
             });
@@ -274,6 +276,10 @@ export class OwnBlindAccessory extends OwnAccessory {
             this.state = this.expectedState;
             this.log.warn(`[${this.id}] Blind command confirmation not received, forcing state to: ${this.expectedState}`);
             this.updateStatus();
+        } else if (this.homeKitMovement) {
+            // Absorb gateway echo packets (old-format STOP arriving after UP/DOWN confirmation)
+            this.inStatusQuery = true;
+            setTimeout(() => { this.inStatusQuery = false; }, 300);
         }
         this.commandSent = false;
         clearTimeout(this.packetTimeout);
