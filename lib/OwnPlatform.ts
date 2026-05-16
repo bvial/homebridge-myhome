@@ -35,12 +35,27 @@ interface MyHomeConfig extends PlatformConfig {
 type AnyAccessory = OwnLightAccessory | OwnBlindAccessory | OwnThermostatAccessory
     | OwnScenarioAccessory | OwnContactAccessory | OwnEnergyAccessory;
 
+// Model codes from *#13**15## (DIM 15 = Device Type). Codes 2–13 per OWN spec; 200 = F454 (post-2006).
+const MODEL_NAMES: Record<number, string> = {
+    2: 'MHServer', 4: 'MH200', 6: 'F452', 7: 'F452V',
+    11: 'MHServer2', 13: 'H4684', 200: 'F454',
+};
+
 function recommendedConcurrency(model: string | null): number {
     if (model === null) return 2;
-    const upper = model.toUpperCase();
-    if (upper.includes('F454') || upper.includes('F455') || upper.includes('454') || upper.includes('455')) return 4;
-    if (upper.includes('F452') || upper.includes('MH200') || upper.includes('452')) return 3;
-    return 2;
+    const code = parseInt(model, 10);
+    if (isNaN(code)) return 2;
+    if (code === 200) return 4;              // F454
+    if (code === 6 || code === 7) return 3;  // F452, F452V
+    if (code === 4) return 3;                // MH200
+    return 2;                                // MHServer, MHServer2, H4684, unknown
+}
+
+function modelLabel(code: string | null): string {
+    if (code === null) return 'unknown';
+    const n = parseInt(code, 10);
+    const name = MODEL_NAMES[n];
+    return name ? `${name} (code ${code})` : `unknown (code ${code})`;
 }
 
 export class OwnPlatform implements DynamicPlatformPlugin {
@@ -103,7 +118,7 @@ export class OwnPlatform implements DynamicPlatformPlugin {
                     this.log.info(`maxConcurrent set to ${ctrl.maxConcurrent} (from config)`);
                 } else {
                     ctrl.maxConcurrent = recommendedConcurrency(model);
-                    this.log.info(`maxConcurrent auto-set to ${ctrl.maxConcurrent}${model ? ` (gateway: ${model})` : ' (gateway unknown)'}`);
+                    this.log.info(`maxConcurrent auto-set to ${ctrl.maxConcurrent} (gateway: ${modelLabel(model)})`);
                 }
                 this.discoverDevices();
                 ctrl.on('packet', this.onMonitor.bind(this));

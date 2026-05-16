@@ -517,7 +517,7 @@ export class OwnClient extends EventEmitter {
     detectGatewayModel(callback: (model: string | null) => void): void {
         const collected: string[] = [];
         this.sendCommand({
-            command: '*#13**0##',
+            command: '*#13**15##',  // DIM 15 = Device Type (numeric model code)
             stopon: [PKT.ACK, PKT.NACK],
             packet: (pkt) => { collected.push(pkt); },
             done: (pkt) => {
@@ -528,14 +528,14 @@ export class OwnClient extends EventEmitter {
                 }
                 this.log.debug('detectGatewayModel: collected packets: %s', JSON.stringify(collected));
                 for (const p of collected) {
-                    const m = p.match(/^\*#13\*\*0\*(.+?)##$/);
+                    const m = p.match(/^\*#13\*\*15\*(\d+)##$/);
                     if (m) {
-                        this.log.info('detectGatewayModel: gateway model string: "%s"', m[1].trim());
-                        callback(m[1].trim());
+                        this.log.info('detectGatewayModel: gateway model code: %s', m[1]);
+                        callback(m[1]);
                         return;
                     }
                 }
-                this.log.warn('detectGatewayModel: gateway did not return a model string (got ACK with no data packets)');
+                this.log.warn('detectGatewayModel: gateway did not return a model code (got ACK with no data packets)');
                 callback(null);
             },
         });
