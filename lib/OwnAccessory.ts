@@ -267,7 +267,13 @@ export class OwnBlindAccessory extends OwnAccessory {
 
     startTimerCommand(): void {
         clearTimeout(this.packetTimeout);
+        this.packetTimeout = undefined;
         this.commandSent = true;
+    }
+
+    private startConfirmationTimer(): void {
+        if (!this.commandSent) return;
+        clearTimeout(this.packetTimeout);
         this.packetTimeout = setTimeout(this.endTimerCommand.bind(this), 1000);
     }
 
@@ -293,24 +299,36 @@ export class OwnBlindAccessory extends OwnAccessory {
         this.log.info(`[${this.id}] Blind sending stop`);
         this.homeKitMovement = false;
         this.expectedState = this.Characteristic.PositionState.STOPPED;
-        this.controller.sendCommand({ command: `*2*0*${this.id}##`, log: this.log });
         this.startTimerCommand();
+        this.controller.sendCommand({
+            command: `*2*0*${this.id}##`,
+            log: this.log,
+            started: () => this.startConfirmationTimer(),
+        });
     }
 
     moveUp(): void {
         this.log.info(`[${this.id}] Blind sending move up`);
         this.homeKitMovement = true;
         this.expectedState = this.Characteristic.PositionState.INCREASING;
-        this.controller.sendCommand({ command: `*2*1*${this.id}##`, log: this.log });
         this.startTimerCommand();
+        this.controller.sendCommand({
+            command: `*2*1*${this.id}##`,
+            log: this.log,
+            started: () => this.startConfirmationTimer(),
+        });
     }
 
     moveDown(): void {
         this.log.info(`[${this.id}] Blind sending move down`);
         this.homeKitMovement = true;
         this.expectedState = this.Characteristic.PositionState.DECREASING;
-        this.controller.sendCommand({ command: `*2*2*${this.id}##`, log: this.log });
         this.startTimerCommand();
+        this.controller.sendCommand({
+            command: `*2*2*${this.id}##`,
+            log: this.log,
+            started: () => this.startConfirmationTimer(),
+        });
     }
 
     onData(packet: string): void {

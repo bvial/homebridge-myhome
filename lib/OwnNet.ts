@@ -42,6 +42,7 @@ export interface CommandParams {
     stopon?: string | string[];
     packet?: (pkt: string) => void;
     done?: (pkt: string | null, index: number) => void;
+    started?: () => void;
     log?: Logging;
     id?: string;
 }
@@ -410,6 +411,7 @@ export class OwnClient extends EventEmitter {
         const commandconn = this.newConnection(MODE.COMMAND, params.log);
         commandconn.on('connected', () => {
             commandconn.sendPacket(params.command);
+            if (params.started) params.started();
             cmdTimeout = setTimeout(() => {
                 commandconn.log.debug('conn:%s command timeout', commandconn.id);
                 commandconn.end();
