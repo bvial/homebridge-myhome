@@ -521,11 +521,21 @@ export class OwnClient extends EventEmitter {
             stopon: [PKT.ACK, PKT.NACK],
             packet: (pkt) => { collected.push(pkt); },
             done: (pkt) => {
-                if (pkt === null || pkt === PKT.NACK) { callback(null); return; }
+                if (pkt === null || pkt === PKT.NACK) {
+                    this.log.warn('detectGatewayModel: command failed or timed out (model unknown)');
+                    callback(null);
+                    return;
+                }
+                this.log.debug('detectGatewayModel: collected packets: %s', JSON.stringify(collected));
                 for (const p of collected) {
                     const m = p.match(/^\*#13\*\*0\*(.+?)##$/);
-                    if (m) { callback(m[1].trim()); return; }
+                    if (m) {
+                        this.log.info('detectGatewayModel: gateway model string: "%s"', m[1].trim());
+                        callback(m[1].trim());
+                        return;
+                    }
                 }
+                this.log.warn('detectGatewayModel: gateway did not return a model string (got ACK with no data packets)');
                 callback(null);
             },
         });

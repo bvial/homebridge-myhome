@@ -38,8 +38,8 @@ type AnyAccessory = OwnLightAccessory | OwnBlindAccessory | OwnThermostatAccesso
 function recommendedConcurrency(model: string | null): number {
     if (model === null) return 2;
     const upper = model.toUpperCase();
-    if (upper.includes('F454') || upper.includes('F455')) return 4;
-    if (upper.includes('F452') || upper.includes('MH200')) return 3;
+    if (upper.includes('F454') || upper.includes('F455') || upper.includes('454') || upper.includes('455')) return 4;
+    if (upper.includes('F452') || upper.includes('MH200') || upper.includes('452')) return 3;
     return 2;
 }
 
