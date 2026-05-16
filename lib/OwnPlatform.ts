@@ -23,6 +23,7 @@ interface MyHomeConfig extends PlatformConfig {
     port?: number;
     password?: string;
     maxConcurrent?: number;
+    debug?: boolean;
     lights?: LightConfig[];
     blinds?: BlindConfig[];
     thermostats?: ThermostatConfig[];
@@ -68,6 +69,12 @@ export class OwnPlatform implements DynamicPlatformPlugin {
         };
 
         this.config = { ...defaultConfig, ...config } as Required<Omit<MyHomeConfig, 'host'>> & { host?: string };
+
+        if (this.config.debug) {
+            (this.log as unknown as Record<string, unknown>)['debug'] = this.log.info.bind(this.log);
+            this.log.info('homebridge-myhome: debug logging enabled');
+        }
+
         this.Service = api.hap.Service as typeof Service;
         this.Characteristic = api.hap.Characteristic as typeof Characteristic;
         this.HapStatusError = (api.hap as unknown as { HapStatusError: new (status: number) => Error }).HapStatusError;

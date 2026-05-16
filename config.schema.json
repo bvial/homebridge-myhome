@@ -37,6 +37,13 @@
                 "minimum": 1,
                 "maximum": 10
             },
+            "debug": {
+                "title": "Enable debug logging",
+                "description": "Enable verbose debug logging for this plugin without requiring the Homebridge -D flag",
+                "type": "boolean",
+                "required": false,
+                "default": false
+            },
             "lights": {
                 "title": "Lights",
                 "buttonText": "Add Light",
