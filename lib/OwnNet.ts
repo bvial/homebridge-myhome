@@ -100,13 +100,19 @@ export class OwnConnection extends EventEmitter {
         this.log = log;
     }
 
-    connect(): void {
+    private destroyConn(): void {
         if (this.conn) {
-            this.log.debug('conn:%s destroy old socket', this.id);
             this.conn.removeAllListeners();
             this.conn.on('error', () => {});
             this.conn.destroy();
             this.conn = null;
+        }
+    }
+
+    connect(): void {
+        if (this.conn) {
+            this.log.debug('conn:%s destroy old socket', this.id);
+            this.destroyConn();
         }
         this.buf = '';
         this.log.debug('conn:%s open socket host: %s, port:%s ', this.id, this.host, this.port);
@@ -143,10 +149,7 @@ export class OwnConnection extends EventEmitter {
     end(): void {
         if (this.conn) {
             this.log.debug('conn:%s end', this.id);
-            this.conn.removeAllListeners();
-            this.conn.on('error', () => {});
-            this.conn.destroy();
-            this.conn = null;
+            this.destroyConn();
         }
     }
 
@@ -263,16 +266,20 @@ export class OwnMonitor extends EventEmitter {
         this.authFailed = false;
     }
 
-    connect(): void {
-        this.nbCheck = 0;
-        clearTimeout(this.reconnectTimeout);
-        this.reconnectTimeout = undefined;
-        this.client.log.info('Start monitoring MyHome server');
+    private closeConnection(): void {
         if (this.connection !== null) {
             this.connection.removeAllListeners();
             this.connection.end();
             this.connection = null;
         }
+    }
+
+    connect(): void {
+        this.nbCheck = 0;
+        clearTimeout(this.reconnectTimeout);
+        this.reconnectTimeout = undefined;
+        this.client.log.success('Start monitoring MyHome server');
+        this.closeConnection();
         this.connection = this.client.newConnection(MODE.MONITOR);
         this.connection.on('connected', () => {
             this.reconnectAttempts = 0;
@@ -327,6 +334,7 @@ export class OwnMonitor extends EventEmitter {
     restartConnection(): void {
         if (this.authFailed) {
             this.client.log.error('Monitor: authentication failed, not reconnecting (check password)');
+            this.emit('auth-failed');
             return;
         }
         if (this.nbCheck < 3) {
@@ -341,6 +349,15 @@ export class OwnMonitor extends EventEmitter {
             this.client.log.error('Monitor connection is dead, reconnecting in %ds (attempt #%d)', delaySec, this.reconnectAttempts);
             this.reconnectTimeout = setTimeout(() => this.connect(), delaySec * 1000);
         }
+    }
+
+    stop(): void {
+        clearTimeout(this.checkTimeout);
+        clearTimeout(this.reconnectTimeout);
+        this.checkTimeout = undefined;
+        this.reconnectTimeout = undefined;
+        this.closeConnection();
+        this.removeAllListeners();
     }
 }
 
@@ -374,13 +391,14 @@ export class OwnClient extends EventEmitter {
         return this.commandQueue.length;
     }
 
-    sendCommand(params: CommandParams): void {
+    sendCommand(params: CommandParams): boolean {
         if (this.commandQueue.length >= 50) {
             this.log.warn('Command queue full (%d), dropping: %s', this.commandQueue.length, params.command);
-            return;
+            return false;
         }
         this.commandQueue.push(params);
         this.processQueue();
+        return true;
     }
 
     processQueue(): void {
@@ -450,6 +468,9 @@ export class OwnClient extends EventEmitter {
         this.monitor.on('connected', () => {
             this.emit('monitoring');
         });
+        this.monitor.on('auth-failed', () => {
+            this.emit('auth-failed');
+        });
         this.monitor.on('packet', (data: string) => {
             this.emit('packet', data);
         });
@@ -457,6 +478,14 @@ export class OwnClient extends EventEmitter {
             this.emit('unmonitoring');
         });
         this.monitor.connect();
+    }
+
+    stopMonitor(): void {
+        if (this.monitor) {
+            this.monitor.stop();
+            this.monitor = null;
+        }
+        this.removeAllListeners();
     }
 
     private runScan(cmd: string, callback?: (macs: number[]) => void): void {

@@ -18,31 +18,15 @@
             },
             "port": {
                 "title": "MyHome server port",
-                "type": "string",
+                "type": "integer",
                 "required": false,
-                "default": "20000"
+                "default": 20000
             },
             "password": {
                 "title": "MyHome server password",
                 "type": "string",
                 "required": false,
                 "default": ""
-            },
-            "maxConcurrent": {
-                "title": "Max concurrent commands",
-                "description": "Maximum number of simultaneous TCP command connections to the gateway (default: 2, increase to 3-4 if your gateway supports it)",
-                "type": "integer",
-                "required": false,
-                "default": 2,
-                "minimum": 1,
-                "maximum": 10
-            },
-            "debug": {
-                "title": "Enable debug logging",
-                "description": "Enable verbose debug logging for this plugin without requiring the Homebridge -D flag",
-                "type": "boolean",
-                "required": false,
-                "default": false
             },
             "lights": {
                 "title": "Lights",

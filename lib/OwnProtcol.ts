@@ -95,25 +95,11 @@ export class OwnProtcol {
     }
 
     static parseWHO(packet: string): WhoValue | null {
-        let extract: RegExpMatchArray | null;
-        if ((extract = packet.match(/^\*(\d*)\*.+##$/))) {
-            return OwnProtcol.getWhoType(extract[1]);
-        }
-        if ((extract = packet.match(/^\*#(\d*)\*.+##$/))) {
-            return OwnProtcol.getWhoType(extract[1]);
-        }
-        return null;
+        return OwnProtcol.extractPacketInfo(packet).who;
     }
 
     static parseWhere(packet: string): string | null {
-        let extract: RegExpMatchArray | null;
-        if ((extract = packet.match(/^\*\d*\*.+\*([\d#]+)##$/))) {
-            return extract[1];
-        }
-        if ((extract = packet.match(/^\*#\d*\*([\d#]*)\*.+##$/))) {
-            return extract[1];
-        }
-        return null;
+        return OwnProtcol.extractPacketInfo(packet).where;
     }
 
     static extractPacketInfo(packet: string): PacketInfo {

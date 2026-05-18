@@ -123,6 +123,19 @@ describe('OwnLightAccessory', () => {
         assert.ok(platform.sendCommandSpy.calls.length > 0);
         assert.ok((platform.sendCommandSpy.calls[0][0] as { command: string }).command.includes('*#1*42'));
     });
+
+    it('setOnline false sets StatusFault to GENERAL_FAULT', () => {
+        const svc = accessory.services['Lightbulb'];
+        handler.setOnline(false);
+        assert.equal(svc.characteristics['StatusFault'].value, 1);
+    });
+
+    it('setOnline true clears StatusFault to NO_FAULT', () => {
+        const svc = accessory.services['Lightbulb'];
+        handler.setOnline(false);
+        handler.setOnline(true);
+        assert.equal(svc.characteristics['StatusFault'].value, 0);
+    });
 });
 
 describe('OwnBlindAccessory', () => {
@@ -502,6 +515,20 @@ describe('OwnBlindAccessory', () => {
         assert.ok(cmds.some((c: string) => c === '*2*2*23##'));
         handler.destroy();
     });
+
+    it('setOnline false sets StatusFault to GENERAL_FAULT', () => {
+        const svc = accessory.services['WindowCovering'];
+        handler.setOnline(false);
+        assert.equal(svc.characteristics['StatusFault'].value, 1);
+    });
+
+    it('setOnline true clears StatusFault to NO_FAULT', () => {
+        const svc = accessory.services['WindowCovering'];
+        handler.setOnline(false);
+        handler.setOnline(true);
+        assert.equal(svc.characteristics['StatusFault'].value, 0);
+        handler.destroy();
+    });
 });
 
 describe('OwnThermostatAccessory', () => {
@@ -662,6 +689,19 @@ describe('OwnThermostatAccessory', () => {
             (err: unknown) => (err as { code: number }).code === -70412,
         );
     });
+
+    it('setOnline false sets StatusFault to GENERAL_FAULT', () => {
+        const svc = accessory.services['Thermostat'];
+        handler.setOnline(false);
+        assert.equal(svc.characteristics['StatusFault'].value, 1);
+    });
+
+    it('setOnline true clears StatusFault to NO_FAULT', () => {
+        const svc = accessory.services['Thermostat'];
+        handler.setOnline(false);
+        handler.setOnline(true);
+        assert.equal(svc.characteristics['StatusFault'].value, 0);
+    });
 });
 
 describe('OwnScenarioAccessory', () => {
@@ -739,6 +779,21 @@ describe('OwnContactAccessory', () => {
         assert.ok(platform.sendCommandSpy.calls.length > 0);
         assert.ok((platform.sendCommandSpy.calls[0][0] as { command: string }).command.includes('*#9*55'));
     });
+
+    it('setOnline false sets StatusActive false and StatusFault to GENERAL_FAULT', () => {
+        const svc = accessory.services['ContactSensor'];
+        handler.setOnline(false);
+        assert.equal(svc.characteristics['StatusActive'].value, false);
+        assert.equal(svc.characteristics['StatusFault'].value, 1);
+    });
+
+    it('setOnline true clears StatusFault to NO_FAULT', () => {
+        const svc = accessory.services['ContactSensor'];
+        handler.setOnline(false);
+        handler.setOnline(true);
+        assert.equal(svc.characteristics['StatusActive'].value, true);
+        assert.equal(svc.characteristics['StatusFault'].value, 0);
+    });
 });
 
 describe('OwnEnergyAccessory', () => {
@@ -793,5 +848,20 @@ describe('OwnEnergyAccessory', () => {
     it('checkWhere matches', () => {
         assert.ok(handler.checkWhere('71'));
         assert.ok(!handler.checkWhere('99'));
+    });
+
+    it('setOnline false sets StatusActive false and StatusFault to GENERAL_FAULT', () => {
+        const svc = accessory.services['LightSensor'];
+        handler.setOnline(false);
+        assert.equal(svc.characteristics['StatusActive'].value, false);
+        assert.equal(svc.characteristics['StatusFault'].value, 1);
+    });
+
+    it('setOnline true clears StatusFault to NO_FAULT', () => {
+        const svc = accessory.services['LightSensor'];
+        handler.setOnline(false);
+        handler.setOnline(true);
+        assert.equal(svc.characteristics['StatusActive'].value, true);
+        assert.equal(svc.characteristics['StatusFault'].value, 0);
     });
 });

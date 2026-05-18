@@ -1,4 +1,4 @@
-import type { API, DynamicPlatformPlugin, Logging, PlatformAccessory, PlatformConfig, Service, Characteristic } from 'homebridge';
+import type { API, DynamicPlatformPlugin, HapStatusError, Logging, PlatformAccessory, PlatformConfig, Service, Characteristic } from 'homebridge';
 import { PLUGIN_NAME, PLATFORM_NAME } from './constants';
 import { OwnClient } from './OwnNet';
 import { OwnProtcol, WHO } from './OwnProtcol';
@@ -22,8 +22,6 @@ interface MyHomeConfig extends PlatformConfig {
     host?: string;
     port?: number;
     password?: string;
-    maxConcurrent?: number;
-    debug?: boolean;
     lights?: LightConfig[];
     blinds?: BlindConfig[];
     thermostats?: ThermostatConfig[];
@@ -61,7 +59,8 @@ function modelLabel(code: string | null): string {
 export class OwnPlatform implements DynamicPlatformPlugin {
     readonly Service: typeof Service;
     readonly Characteristic: typeof Characteristic;
-    readonly HapStatusError: new (status: number) => Error;
+    readonly HapStatusError: new (status: number) => HapStatusError;
+    readonly HAPStatus: Record<string, number>;
     cachedAccessories: PlatformAccessory[];
     activeHandlers: AnyAccessory[];
     controller: OwnClient | undefined;
@@ -85,20 +84,23 @@ export class OwnPlatform implements DynamicPlatformPlugin {
 
         this.config = { ...defaultConfig, ...config } as Required<Omit<MyHomeConfig, 'host'>> & { host?: string };
 
-        if (this.config.debug) {
-            (this.log as unknown as Record<string, unknown>)['debug'] = this.log.info.bind(this.log);
-            this.log.info('homebridge-myhome: debug logging enabled');
-        }
-
         this.Service = api.hap.Service as typeof Service;
         this.Characteristic = api.hap.Characteristic as typeof Characteristic;
-        this.HapStatusError = (api.hap as unknown as { HapStatusError: new (status: number) => Error }).HapStatusError;
+        this.HapStatusError = api.hap.HapStatusError as unknown as new (status: number) => HapStatusError;
+        this.HAPStatus = { NOT_ALLOWED_IN_CURRENT_STATE: -70412, SERVICE_COMMUNICATION_FAILURE: -70402 };
         this.cachedAccessories = [];
         this.activeHandlers = [];
         this.staggerTimers = [];
 
         if (!this.config.host) {
-            log.error('homebridge-myhome: missing required config "host" — plugin will not start');
+            this.log.error('homebridge-myhome: missing required config "host" — plugin will not start');
+            api.on('didFinishLaunching', () => {
+                if (this.cachedAccessories.length > 0) {
+                    this.log.warn('Removing %d stale accessories (no host configured)', this.cachedAccessories.length);
+                    this.api.unregisterPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, this.cachedAccessories);
+                    this.cachedAccessories = [];
+                }
+            });
             return;
         }
 
@@ -112,17 +114,21 @@ export class OwnPlatform implements DynamicPlatformPlugin {
         api.on('didFinishLaunching', () => {
             const ctrl = this.controller;
             if (!ctrl) return;
+            this.discoverDevices();
+            ctrl.on('packet', this.onMonitor.bind(this));
+            ctrl.on('monitoring', () => {
+                this.log.success('Gateway connected — monitoring active');
+                this.setAllOnline(true);
+                this.updateAccessoriesStatus();
+            });
+            ctrl.on('unmonitoring', () => { this.setAllOnline(false); });
+            ctrl.on('auth-failed', () => {
+                this.log.error('Gateway authentication failed — check password. Plugin will not reconnect until Homebridge restarts.');
+                this.setAllOnline(false);
+            });
             ctrl.detectGatewayModel((model) => {
-                if (this.config.maxConcurrent !== undefined) {
-                    ctrl.maxConcurrent = this.config.maxConcurrent;
-                    this.log.info(`maxConcurrent set to ${ctrl.maxConcurrent} (from config)`);
-                } else {
-                    ctrl.maxConcurrent = recommendedConcurrency(model);
-                    this.log.info(`maxConcurrent auto-set to ${ctrl.maxConcurrent} (gateway: ${modelLabel(model)})`);
-                }
-                this.discoverDevices();
-                ctrl.on('packet', this.onMonitor.bind(this));
-                ctrl.on('monitoring', this.updateAccessoriesStatus.bind(this));
+                ctrl.maxConcurrent = recommendedConcurrency(model);
+                this.log.info(`maxConcurrent auto-set to ${ctrl.maxConcurrent} (gateway: ${modelLabel(model)})`);
                 ctrl.startMonitor();
             });
         });
@@ -132,17 +138,34 @@ export class OwnPlatform implements DynamicPlatformPlugin {
             this.staggerTimers = [];
             for (const handler of this.activeHandlers) handler.destroy();
             this.activeHandlers = [];
+            this.controller?.stopMonitor();
         });
     }
 
     configureAccessory(accessory: PlatformAccessory): void {
-        if (this.controller === undefined) return;
         this.log.info('Restoring cached accessory:', accessory.displayName);
         this.cachedAccessories.push(accessory);
+        if (this.controller && accessory.context.type && accessory.context.device) {
+            try {
+                this.createHandler(
+                    accessory.context.type as string,
+                    accessory,
+                    accessory.context.device as Record<string, unknown>,
+                );
+            } catch (err) {
+                this.log.error('Failed to restore handler for %s: %s', accessory.displayName, (err as Error).message);
+            }
+        }
     }
 
     discoverDevices(): void {
         this.log.info('Discovering OpenWebNet devices from config');
+
+        // HAP category codes hardcoded (Categories is a const enum — no runtime object):
+        // 5=Lightbulb, 8=Switch, 9=Thermostat, 10=Sensor, 14=WindowCovering
+        const CATEGORY: Record<string, number> = {
+            light: 5, blind: 14, thermostat: 9, scenario: 8, contact: 10, energy: 10,
+        };
 
         const allDevices = [
             ...(this.config.lights ?? []).map((d: LightConfig) => ({ ...d, type: 'light' as const })),
@@ -168,17 +191,22 @@ export class OwnPlatform implements DynamicPlatformPlugin {
             if (existingAccessory) {
                 this.log.info('Restoring accessory from cache:', existingAccessory.displayName);
                 existingAccessory.context.device = device;
+                existingAccessory.context.type = device.type;
                 this.api.updatePlatformAccessories([existingAccessory]);
-                try {
-                    this.createHandler(device.type, existingAccessory, device);
-                } catch (err) {
-                    this.log.error('Failed to create handler for %s id=%s: %s', device.type, device.id, (err as Error).message);
+                if (!this.activeHandlers.find(h => h.accessory === existingAccessory)) {
+                    try {
+                        this.createHandler(device.type, existingAccessory, device);
+                    } catch (err) {
+                        this.log.error('Failed to create handler for %s id=%s: %s', device.type, device.id, (err as Error).message);
+                    }
                 }
             } else {
                 const name = device.name ?? `${device.type}-${device.id}`;
                 this.log.info('Adding new accessory:', name);
                 const accessory = new this.api.platformAccessory(name, uuid);
+                accessory.category = (CATEGORY[device.type] ?? 1) as unknown as typeof accessory.category;
                 accessory.context.device = device;
+                accessory.context.type = device.type;
                 try {
                     this.createHandler(device.type, accessory, device);
                     this.api.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
@@ -231,6 +259,19 @@ export class OwnPlatform implements DynamicPlatformPlugin {
                 case WHO.gateway:
                     this.log.debug('Gateway packet', packet);
                     break;
+                case WHO.scenario:
+                case WHO.CEN:
+                case WHO.load:
+                case WHO.alarm:
+                case WHO.videoDoor:
+                case WHO.scene:
+                case WHO.soundSystem:
+                case WHO.soundDiffusion:
+                case WHO.diagnostic:
+                case WHO.heatingDiagnostic:
+                case WHO.deviceDiagnostic:
+                case WHO.autoDiagnostic:
+                    break;   // no accessory routing needed — silently ignored
                 default:
                     this.log.debug('Unsupported packet', packet);
             }
@@ -258,5 +299,9 @@ export class OwnPlatform implements DynamicPlatformPlugin {
             this.staggerTimers.push(setTimeout((h: AnyAccessory) => h.updateStatus(), delay, handler));
             delay += 200;
         }
+    }
+
+    setAllOnline(online: boolean): void {
+        for (const handler of this.activeHandlers) handler.setOnline(online);
     }
 }

@@ -9,13 +9,13 @@ const TEMP_UNITS = { CELSIUS: 0 } as const;
 function noop(): void {}
 
 export interface Spy {
-    (...args: unknown[]): void;
+    (...args: unknown[]): unknown;
     calls: unknown[][];
 }
 
-export function makeSpy(): Spy {
+export function makeSpy(returnValue?: unknown): Spy {
     const calls: unknown[][] = [];
-    const fn = function (...args: unknown[]) { calls.push(args); } as Spy;
+    const fn = function (...args: unknown[]) { calls.push(args); return returnValue; } as Spy;
     fn.calls = calls;
     return fn;
 }
@@ -47,11 +47,17 @@ function makeServiceStub(name: string) {
     const characteristics: Record<string, ReturnType<typeof makeCharacteristicStub>> = {};
     const svc = {
         name: name,
+        setPrimaryService: (_primary: boolean) => svc,
         getCharacteristic: (c: string) => {
             if (!characteristics[c]) characteristics[c] = makeCharacteristicStub();
             return characteristics[c];
         },
         setCharacteristic: (c: string, v: unknown) => {
+            if (!characteristics[c]) characteristics[c] = makeCharacteristicStub();
+            characteristics[c].value = v;
+            return svc;
+        },
+        updateCharacteristic: (c: string, v: unknown) => {
             if (!characteristics[c]) characteristics[c] = makeCharacteristicStub();
             characteristics[c].value = v;
             return svc;
@@ -63,6 +69,7 @@ function makeServiceStub(name: string) {
 
 export function makeMockAccessory() {
     const services: Record<string, ReturnType<typeof makeServiceStub>> = {};
+    const listeners: Record<string, ((...args: unknown[]) => void)[]> = {};
     return {
         context: {} as Record<string, unknown>,
         getService: (svc: string) => services[svc] ?? null,
@@ -70,7 +77,16 @@ export function makeMockAccessory() {
             services[svc] = makeServiceStub(svc);
             return services[svc];
         },
+        on: (event: string, cb: (...args: unknown[]) => void) => {
+            if (!listeners[event]) listeners[event] = [];
+            listeners[event].push(cb);
+        },
+        removeAllListeners: (event?: string) => {
+            if (event) delete listeners[event]; else Object.keys(listeners).forEach(k => delete listeners[k]);
+        },
+        emit: (event: string, ...args: unknown[]) => { (listeners[event] ?? []).forEach(cb => cb(...args)); },
         services: services,
+        listeners: listeners,
     };
 }
 
@@ -88,6 +104,7 @@ export function makeMockPlatform() {
     const Characteristic = {
         Manufacturer: 'Manufacturer',
         Model: 'Model',
+        Name: 'Name',
         SerialNumber: 'SerialNumber',
         On: 'On',
         Brightness: 'Brightness',
@@ -102,16 +119,19 @@ export function makeMockPlatform() {
         TemperatureDisplayUnits: Object.assign('TemperatureDisplayUnits', TEMP_UNITS),
         ContactSensorState: Object.assign('ContactSensorState', CONTACT_STATE),
         CurrentAmbientLightLevel: 'CurrentAmbientLightLevel',
+        StatusActive: 'StatusActive',
+        StatusFault: Object.assign('StatusFault', { NO_FAULT: 0, GENERAL_FAULT: 1 }),
     };
 
-    const sendCommandSpy = makeSpy();
+    const sendCommandSpy = makeSpy(true);
 
     return {
-        log: { info: noop, debug: noop, warn: noop, error: noop } as unknown as import('homebridge').Logging,
+        log: { info: noop, debug: noop, warn: noop, error: noop, success: noop } as unknown as import('homebridge').Logging,
         controller: { sendCommand: sendCommandSpy, commandQueue: [] as unknown[], queueSize: () => 0 },
         Service: Service as unknown as OwnPlatformLike['Service'],
         Characteristic: Characteristic as unknown as OwnPlatformLike['Characteristic'],
         HapStatusError: function (this: { code: number }, code: number) { this.code = code; } as unknown as new (status: number) => Error,
+        HAPStatus: { NOT_ALLOWED_IN_CURRENT_STATE: -70412, SERVICE_COMMUNICATION_FAILURE: -70402 } as unknown as OwnPlatformLike['HAPStatus'],
         sendCommandSpy: sendCommandSpy,
     };
 }

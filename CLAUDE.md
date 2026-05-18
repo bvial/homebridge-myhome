@@ -75,9 +75,16 @@ The plugin connects to a Legrand gateway over **raw TCP on port 20000** using th
 | 4 | Thermostat/Temperature |
 | 9 | Auxiliary (dry contacts) |
 | 13 | Gateway (keep-alive probe, model query) |
-| 15/25 | CEN / CEN PLUS (physical button press events — received on monitor, silently ignored at debug level) |
+| 15/25 | CEN / CEN PLUS (physical button press events — received on monitor, silently ignored) |
 | 18 | Energy management |
-| 1001 | Auto-diagnostic (SCS bus device presence/serial scan — received on monitor, silently ignored at debug level) |
+| 3 | Load control — received on monitor, silently ignored |
+| 5 | Alarm — received on monitor, silently ignored |
+| 7 | Video door entry — received on monitor, silently ignored |
+| 16 | Sound system — received on monitor, silently ignored |
+| 17 | Scenario/scene activation — received on monitor, silently ignored |
+| 22 | Sound diffusion — received on monitor, silently ignored |
+| 1001 | Auto-diagnostic (SCS bus device presence/serial scan) — silently ignored |
+| 1000/1004/1013 | Diagnostic / heating diagnostic / device diagnostic — silently ignored |
 
 ## Configuration
 
@@ -97,3 +104,4 @@ The gateway responds with `*#13**15*<code>##`; if no data packet is received bef
 
 - `lib/OwnProtcol.ts` is intentionally misspelled ("Protcol") throughout the codebase — do not rename.
 - `test.ts` is a manual live-gateway test script, not an automated test suite. It is excluded from the TypeScript build (`tsconfig.json` `exclude`) and must be run via `ts-node` or compiled separately.
+- `tsconfig.json` keeps `"ignoreDeprecations": "6.0"` intentionally: `moduleResolution: "node10"` is deprecated in TypeScript 6 but migrating to `node16` requires either switching the project to ESM or adding `resolution-mode` attributes to all `homebridge` type imports (Homebridge 2 ships as ESM). Until the project migrates to ESM output, this suppression is load-bearing.

@@ -1,13 +1,15 @@
-import type { Characteristic, CharacteristicValue, Logging, PlatformAccessory, Service } from 'homebridge';
+import type { Characteristic, CharacteristicValue, HapStatusError, Logging, PlatformAccessory, Service } from 'homebridge';
 import type { OwnClient } from './OwnNet';
 import { OwnProtcol } from './OwnProtcol';
+import { PLUGIN_VERSION } from './constants';
 
 export interface OwnPlatformLike {
     log: Logging;
     controller: OwnClient;
     Service: typeof Service;
     Characteristic: typeof Characteristic;
-    HapStatusError: new (status: number) => Error;
+    HapStatusError: new (status: number) => HapStatusError;
+    HAPStatus: Record<string, number>;
 }
 
 export interface BaseConfig {
@@ -38,10 +40,12 @@ class OwnAccessory {
     protected controller: OwnClient;
     protected Service: typeof Service;
     protected Characteristic: typeof Characteristic;
-    protected HapStatusError: new (status: number) => Error;
+    protected HapStatusError: new (status: number) => HapStatusError;
+    protected HAPStatus: Record<string, number>;
     accessory: PlatformAccessory;
     name: string;
     protected id: number;
+    protected fault = false;
 
     constructor(platform: OwnPlatformLike, accessory: PlatformAccessory, config: BaseConfig) {
         this.log = platform.log;
@@ -49,6 +53,7 @@ class OwnAccessory {
         this.Service = platform.Service;
         this.Characteristic = platform.Characteristic;
         this.HapStatusError = platform.HapStatusError;
+        this.HAPStatus = platform.HAPStatus;
         this.accessory = accessory;
 
         this.name = config.name ?? '';
@@ -61,7 +66,51 @@ class OwnAccessory {
         this.accessory.getService(this.Service.AccessoryInformation)!
             .setCharacteristic(this.Characteristic.Manufacturer, 'MyHome Assistant')
             .setCharacteristic(this.Characteristic.Model, 'Accessory')
-            .setCharacteristic(this.Characteristic.SerialNumber, `MyHome-${this.id}`);
+            .setCharacteristic(this.Characteristic.SerialNumber, `MyHome-${this.id}`)
+            .setCharacteristic(this.Characteristic.FirmwareRevision, PLUGIN_VERSION);
+
+        this.accessory.on('identify', () => { this.log.info(`[${this.id}] Identify`); });
+    }
+
+    protected initPrimaryService(
+        serviceType: typeof Service,
+        modelName: string,
+        withFault = false,
+        withStatusActive = false,
+    ): InstanceType<typeof Service> {
+        this.accessory.getService(this.Service.AccessoryInformation)!
+            .setCharacteristic(this.Characteristic.Model, modelName);
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const svc = this.accessory.getService(serviceType as any) ?? this.accessory.addService(serviceType as any);
+        svc.setPrimaryService(true);
+        svc.setCharacteristic(this.Characteristic.Name, this.name);
+        svc.setCharacteristic(this.Characteristic.ConfiguredName, this.name);
+        if (withStatusActive) {
+            svc.getCharacteristic(this.Characteristic.StatusActive)
+                .onGet(() => !this.fault);
+        }
+        if (withFault) {
+            svc.getCharacteristic(this.Characteristic.StatusFault)
+                .onGet(() => this.fault
+                    ? this.Characteristic.StatusFault.GENERAL_FAULT
+                    : this.Characteristic.StatusFault.NO_FAULT);
+        }
+        return svc;
+    }
+
+    protected setFaultOnline(svc: InstanceType<typeof Service>, online: boolean, withStatusActive = false): void {
+        this.fault = !online;
+        if (withStatusActive) svc.updateCharacteristic(this.Characteristic.StatusActive, online);
+        svc.updateCharacteristic(
+            this.Characteristic.StatusFault,
+            online ? this.Characteristic.StatusFault.NO_FAULT : this.Characteristic.StatusFault.GENERAL_FAULT,
+        );
+    }
+
+    protected sendOrThrow(command: string): void {
+        if (!this.controller.sendCommand({ command, log: this.log })) {
+            throw new this.HapStatusError(this.HAPStatus.SERVICE_COMMUNICATION_FAILURE);
+        }
     }
 
     updateStatus(): void {
@@ -76,6 +125,8 @@ class OwnAccessory {
         const id = parseInt(where, 10);
         return this.id === id;
     }
+
+    setOnline(_online: boolean): void {}
 
     destroy(): void {}
 }
@@ -94,23 +145,29 @@ export class OwnLightAccessory extends OwnAccessory {
         this.dimmer = config.dimmer ?? false;
         this.brightness = 100;
 
-        this.accessory.getService(this.Service.AccessoryInformation)!
-            .setCharacteristic(this.Characteristic.Model, 'Light');
+        this.accessory.removeAllListeners('identify');
+        this.accessory.on('identify', () => {
+            this.log.info(`[${this.id}] Identify — blink`);
+            const wasOn = this.value;
+            this.controller.sendCommand({ command: `*1*0*${this.id}##`, log: this.log });
+            setTimeout(() => {
+                if (wasOn) this.controller.sendCommand({ command: `*1*1*${this.id}##`, log: this.log });
+            }, 500);
+        });
 
-        this.lightbulbService = this.accessory.getService(this.Service.Lightbulb)
-            ?? this.accessory.addService(this.Service.Lightbulb);
+        this.lightbulbService = this.initPrimaryService(this.Service.Lightbulb, 'Light', true);
 
         this.lightbulbService.getCharacteristic(this.Characteristic.On)
             .onGet(() => this.value)
             .onSet((value: CharacteristicValue) => {
                 this.log.info(`[${this.id}] Setting power state to ${value ? 'on' : 'off'}`);
-                this.value = value as boolean;
                 if (value && this.dimmer) {
                     const level = Math.min(10, Math.max(2, Math.round(this.brightness / 100 * 8) + 2));
-                    this.controller.sendCommand({ command: `*1*${level}*${this.id}##`, log: this.log });
+                    this.sendOrThrow(`*1*${level}*${this.id}##`);
                 } else {
-                    this.controller.sendCommand({ command: `*1*${value ? '1' : '0'}*${this.id}##`, log: this.log });
+                    this.sendOrThrow(`*1*${value ? '1' : '0'}*${this.id}##`);
                 }
+                this.value = value as boolean;
             });
 
         if (this.dimmer) {
@@ -118,17 +175,22 @@ export class OwnLightAccessory extends OwnAccessory {
                 .onGet(() => this.brightness)
                 .onSet((value: CharacteristicValue) => {
                     this.log.info(`[${this.id}] Setting brightness to ${value}`);
-                    this.brightness = value as number;
                     if (value === 0) {
+                        this.sendOrThrow(`*1*0*${this.id}##`);
+                        this.brightness = 0;
                         this.value = false;
-                        this.lightbulbService.getCharacteristic(this.Characteristic.On).updateValue(false);
-                        this.controller.sendCommand({ command: `*1*0*${this.id}##`, log: this.log });
+                        this.lightbulbService.updateCharacteristic(this.Characteristic.On, false);
                     } else {
                         const level = Math.min(10, Math.max(2, Math.round((value as number) / 100 * 8) + 2));
-                        this.controller.sendCommand({ command: `*1*${level}*${this.id}##`, log: this.log });
+                        this.sendOrThrow(`*1*${level}*${this.id}##`);
+                        this.brightness = value as number;
                     }
                 });
         }
+    }
+
+    setOnline(online: boolean): void {
+        this.setFaultOnline(this.lightbulbService, online);
     }
 
     updateStatus(): void {
@@ -158,10 +220,10 @@ export class OwnLightAccessory extends OwnAccessory {
                 this.value = true;
                 if (this.dimmer && level >= 2) {
                     this.brightness = Math.max(1, Math.round((level - 2) / 8 * 100));
-                    this.lightbulbService.getCharacteristic(this.Characteristic.Brightness).updateValue(this.brightness);
+                    this.lightbulbService.updateCharacteristic(this.Characteristic.Brightness, this.brightness);
                 }
             }
-            this.lightbulbService.getCharacteristic(this.Characteristic.On).updateValue(this.value);
+            this.lightbulbService.updateCharacteristic(this.Characteristic.On, this.value);
         } else {
             this.log.error('[%s] Light unknown packet:%s', this.id, packet);
         }
@@ -185,6 +247,7 @@ export class OwnBlindAccessory extends OwnAccessory {
     initPhase: boolean;
     homeKitMovement: boolean;
     private inStatusQuery: boolean;
+    private statusQueryTimeout: ReturnType<typeof setTimeout> | undefined;
     private windowCoveringService: InstanceType<typeof Service>;
 
     constructor(platform: OwnPlatformLike, accessory: PlatformAccessory, config: BlindConfig) {
@@ -211,12 +274,9 @@ export class OwnBlindAccessory extends OwnAccessory {
         this.initPhase = false;
         this.homeKitMovement = false;
         this.inStatusQuery = false;
+        this.statusQueryTimeout = undefined;
 
-        this.accessory.getService(this.Service.AccessoryInformation)!
-            .setCharacteristic(this.Characteristic.Model, 'WindowCovering');
-
-        this.windowCoveringService = this.accessory.getService(this.Service.WindowCovering)
-            ?? this.accessory.addService(this.Service.WindowCovering);
+        this.windowCoveringService = this.initPrimaryService(this.Service.WindowCovering, 'WindowCovering', true);
 
         this.windowCoveringService.getCharacteristic(this.Characteristic.CurrentPosition)
             .onGet(() => this.position);
@@ -224,6 +284,9 @@ export class OwnBlindAccessory extends OwnAccessory {
         this.windowCoveringService.getCharacteristic(this.Characteristic.TargetPosition)
             .onGet(() => this.target)
             .onSet((target: CharacteristicValue) => {
+                if (this.controller.queueSize() >= 50) {
+                    throw new this.HapStatusError(this.HAPStatus.SERVICE_COMMUNICATION_FAILURE);
+                }
                 this.log.info(`[${this.id}] Blind setting Target :${target}`);
                 this.stopMoveTracking();
                 this.target = target as number;
@@ -233,13 +296,23 @@ export class OwnBlindAccessory extends OwnAccessory {
         this.windowCoveringService.getCharacteristic(this.Characteristic.PositionState)
             .onGet(() => this.state);
 
+        this.windowCoveringService.getCharacteristic(this.Characteristic.ObstructionDetected)
+            .onGet(() => false);
+
         this.windowCoveringService.getCharacteristic(this.Characteristic.HoldPosition)
             .onSet((hold: CharacteristicValue) => {
+                if (this.controller.queueSize() >= 50) {
+                    throw new this.HapStatusError(this.HAPStatus.SERVICE_COMMUNICATION_FAILURE);
+                }
                 this.log.info(`[${this.id}] Blind hold position :${hold}`);
                 this.stopMoveTracking();
                 this.target = this.position;
                 this.move();
             });
+    }
+
+    setOnline(online: boolean): void {
+        this.setFaultOnline(this.windowCoveringService, online);
     }
 
     updateStatus(): void {
@@ -287,7 +360,8 @@ export class OwnBlindAccessory extends OwnAccessory {
         } else if (this.homeKitMovement) {
             // Absorb gateway echo packets (old-format STOP arriving after UP/DOWN confirmation)
             this.inStatusQuery = true;
-            setTimeout(() => { this.inStatusQuery = false; }, 300);
+            clearTimeout(this.statusQueryTimeout);
+            this.statusQueryTimeout = setTimeout(() => { this.inStatusQuery = false; }, 300);
         }
         this.commandSent = false;
         clearTimeout(this.packetTimeout);
@@ -357,7 +431,7 @@ export class OwnBlindAccessory extends OwnAccessory {
                 this.log.warn('[%s] Blind unknown direction byte %s in packet %s', this.id, direction, packet);
                 return;
             }
-            this.windowCoveringService.getCharacteristic(this.Characteristic.PositionState).updateValue(this.state);
+            this.windowCoveringService.updateCharacteristic(this.Characteristic.PositionState, this.state);
             this.log.info(`[${this.id}] received state dir:${direction} position:${this.position} target:${this.target}`);
 
             if (this.commandIsPending() && this.expectedState === this.state) {
@@ -409,7 +483,7 @@ export class OwnBlindAccessory extends OwnAccessory {
                 this.startPositionTracking();
             }
         }
-        this.windowCoveringService.getCharacteristic(this.Characteristic.CurrentPosition).updateValue(this.position);
+        this.windowCoveringService.updateCharacteristic(this.Characteristic.CurrentPosition, this.position);
     }
 
     msPerPercent(position: number): number {
@@ -479,15 +553,16 @@ export class OwnBlindAccessory extends OwnAccessory {
         this.positionTimeout = undefined;
         clearTimeout(this.packetTimeout);
         this.packetTimeout = undefined;
+        clearTimeout(this.statusQueryTimeout);
+        this.statusQueryTimeout = undefined;
+        this.inStatusQuery = false;
         this.commandSent = false;
         this.homeKitMovement = false;
         this.moveRetries = 0;
     }
 
     destroy(): void {
-        clearTimeout(this.moveTrackingTimeout);
-        clearTimeout(this.packetTimeout);
-        clearTimeout(this.positionTimeout);
+        this.stopMoveTracking();
     }
 }
 
@@ -519,11 +594,7 @@ export class OwnThermostatAccessory extends OwnAccessory {
         this.targetHeatingCoolingState = this.Characteristic.TargetHeatingCoolingState.OFF;
         this.displayUnits = this.Characteristic.TemperatureDisplayUnits.CELSIUS;
 
-        this.accessory.getService(this.Service.AccessoryInformation)!
-            .setCharacteristic(this.Characteristic.Model, 'Thermostat');
-
-        this.thermostatService = this.accessory.getService(this.Service.Thermostat)
-            ?? this.accessory.addService(this.Service.Thermostat);
+        this.thermostatService = this.initPrimaryService(this.Service.Thermostat, 'Thermostat', true);
 
         this.thermostatService.getCharacteristic(this.Characteristic.CurrentHeatingCoolingState)
             .onGet(() => this.heatingCoolingState);
@@ -532,47 +603,51 @@ export class OwnThermostatAccessory extends OwnAccessory {
             .setProps({ validValues: [0, 1, 3] })
             .onGet(() => this.targetHeatingCoolingState)
             .onSet((value: CharacteristicValue) => {
-                this.targetHeatingCoolingState = value as number;
                 this.log.info(`[${this.id}] zone[${this.zone}] setTargetHeatingCoolingState:${value}`);
                 switch (value) {
                     case this.Characteristic.TargetHeatingCoolingState.HEAT: {
                         const temperature = OwnProtcol.encodeTemperature(this.targetTemperature);
                         this.log.info(`[${this.id}] send Heat Manual at ${temperature}`);
-                        this.controller.sendCommand({ command: `*#4*${this.address}*#14*${temperature}*1##`, log: this.log });
+                        this.sendOrThrow(`*#4*${this.address}*#14*${temperature}*1##`);
                         break;
                     }
                     case this.Characteristic.TargetHeatingCoolingState.OFF:
-                        this.controller.sendCommand({ command: `*4*103*${this.address}##`, log: this.log });
                         this.log.info(`[${this.id}] send STOP`);
+                        this.sendOrThrow(`*4*103*${this.address}##`);
                         break;
                     case this.Characteristic.TargetHeatingCoolingState.AUTO:
-                        this.controller.sendCommand({ command: `*4*3100*${this.address}##`, log: this.log });
                         this.log.info(`[${this.id}] send AUTO`);
+                        this.sendOrThrow(`*4*3100*${this.address}##`);
                         break;
                 }
+                this.targetHeatingCoolingState = value as number;
             });
 
         this.thermostatService.getCharacteristic(this.Characteristic.CurrentTemperature)
-            .setProps({ minValue: -50, minStep: 0.1, maxValue: 50 })
+            .setProps({ minValue: -50, maxValue: 50 })
             .onGet(() => this.temperature);
 
         this.thermostatService.getCharacteristic(this.Characteristic.TargetTemperature)
-            .setProps({ minValue: -50, minStep: 0.1, maxValue: 50 })
+            .setProps({ minValue: 5, minStep: 0.5, maxValue: 30 })
             .onGet(() => this.targetTemperature)
             .onSet((value: CharacteristicValue) => {
                 this.log.info(`[${this.id}] zone[${this.zone}] setTargetTemperature:${value}`);
                 if (this.targetHeatingCoolingState !== this.Characteristic.TargetHeatingCoolingState.HEAT) {
                     this.log.error("Can't change target temperature with mode (%s)", this.targetHeatingCoolingState);
-                    throw new this.HapStatusError(-70412);
+                    throw new this.HapStatusError(this.HAPStatus.NOT_ALLOWED_IN_CURRENT_STATE);
                 }
-                this.targetTemperature = value as number;
                 const temperature = OwnProtcol.encodeTemperature(value as number);
-                this.controller.sendCommand({ command: `*#4*${this.address}*#14*${temperature}*1##`, log: this.log });
+                this.sendOrThrow(`*#4*${this.address}*#14*${temperature}*1##`);
+                this.targetTemperature = value as number;
             });
 
         this.thermostatService.getCharacteristic(this.Characteristic.TemperatureDisplayUnits)
             .onGet(() => this.displayUnits)
             .onSet((value: CharacteristicValue) => { this.displayUnits = value as number; });
+    }
+
+    setOnline(online: boolean): void {
+        this.setFaultOnline(this.thermostatService, online);
     }
 
     updateStatus(): void {
@@ -589,25 +664,25 @@ export class OwnThermostatAccessory extends OwnAccessory {
     updateCharacteristicCurrentTemperature(temperature: number): void {
         this.log.info(`[${this.id}] update CurrentTemperature (${temperature})`);
         this.temperature = temperature;
-        this.thermostatService.getCharacteristic(this.Characteristic.CurrentTemperature).updateValue(this.temperature);
+        this.thermostatService.updateCharacteristic(this.Characteristic.CurrentTemperature, this.temperature);
     }
 
     updateCharacteristicTargetTemperature(temperature: number): void {
         this.log.info(`[${this.id}] update TargetTemperature (${temperature})`);
         this.targetTemperature = temperature;
-        this.thermostatService.getCharacteristic(this.Characteristic.TargetTemperature).updateValue(this.targetTemperature);
+        this.thermostatService.updateCharacteristic(this.Characteristic.TargetTemperature, this.targetTemperature);
     }
 
     updateCharacteristicTargetHeatingCoolingState(state: number): void {
         this.log.info(`[${this.id}] update TargetHeatingCoolingState (${state})`);
         this.targetHeatingCoolingState = state;
-        this.thermostatService.getCharacteristic(this.Characteristic.TargetHeatingCoolingState).updateValue(this.targetHeatingCoolingState);
+        this.thermostatService.updateCharacteristic(this.Characteristic.TargetHeatingCoolingState, this.targetHeatingCoolingState);
     }
 
     updateCharacteristicCurrentHeatingCoolingState(state: number): void {
         this.log.info(`[${this.id}] update CurrentHeatingCoolingState (${state})`);
         this.heatingCoolingState = state;
-        this.thermostatService.getCharacteristic(this.Characteristic.CurrentHeatingCoolingState).updateValue(this.heatingCoolingState);
+        this.thermostatService.updateCharacteristic(this.Characteristic.CurrentHeatingCoolingState, this.heatingCoolingState);
     }
 
     onData(packet: string): void {
@@ -719,21 +794,17 @@ export class OwnScenarioAccessory extends OwnAccessory {
 
         this.resetTimeout = undefined;
 
-        this.accessory.getService(this.Service.AccessoryInformation)!
-            .setCharacteristic(this.Characteristic.Model, 'Scenario');
-
-        this.switchService = this.accessory.getService(this.Service.Switch)
-            ?? this.accessory.addService(this.Service.Switch);
+        this.switchService = this.initPrimaryService(this.Service.Switch, 'Scenario');
 
         this.switchService.getCharacteristic(this.Characteristic.On)
             .onGet(() => false)
             .onSet((value: CharacteristicValue) => {
                 if (value) {
                     this.log.info(`[${this.id}] Scenario activate`);
-                    this.controller.sendCommand({ command: `*0*${this.id}*0##`, log: this.log });
+                    this.sendOrThrow(`*0*${this.id}*0##`);
                     clearTimeout(this.resetTimeout);
                     this.resetTimeout = setTimeout(() => {
-                        this.switchService.getCharacteristic(this.Characteristic.On).updateValue(false);
+                        this.switchService.updateCharacteristic(this.Characteristic.On, false);
                     }, 500);
                 }
             });
@@ -754,14 +825,14 @@ export class OwnContactAccessory extends OwnAccessory {
 
         this.contactState = this.Characteristic.ContactSensorState.CONTACT_DETECTED;
 
-        this.accessory.getService(this.Service.AccessoryInformation)!
-            .setCharacteristic(this.Characteristic.Model, 'ContactSensor');
-
-        this.contactService = this.accessory.getService(this.Service.ContactSensor)
-            ?? this.accessory.addService(this.Service.ContactSensor);
+        this.contactService = this.initPrimaryService(this.Service.ContactSensor, 'ContactSensor', true, true);
 
         this.contactService.getCharacteristic(this.Characteristic.ContactSensorState)
             .onGet(() => this.contactState);
+    }
+
+    setOnline(online: boolean): void {
+        this.setFaultOnline(this.contactService, online, true);
     }
 
     updateStatus(): void {
@@ -780,7 +851,7 @@ export class OwnContactAccessory extends OwnAccessory {
                 ? this.Characteristic.ContactSensorState.CONTACT_DETECTED
                 : this.Characteristic.ContactSensorState.CONTACT_NOT_DETECTED;
             this.log.info(`[${this.id}] Contact state: ${this.contactState}`);
-            this.contactService.getCharacteristic(this.Characteristic.ContactSensorState).updateValue(this.contactState);
+            this.contactService.updateCharacteristic(this.Characteristic.ContactSensorState, this.contactState);
         } else {
             this.log.error('[%s] Contact unknown packet:%s', this.id, packet);
         }
@@ -791,6 +862,7 @@ export class OwnEnergyAccessory extends OwnAccessory {
     watts: number;
     private energyService: InstanceType<typeof Service>;
     private pollInterval: ReturnType<typeof setInterval>;
+    private destroyed = false;
 
     constructor(platform: OwnPlatformLike, accessory: PlatformAccessory, config: EnergyConfig) {
         if (!config.name) config.name = `energy-${config.id}`;
@@ -798,11 +870,7 @@ export class OwnEnergyAccessory extends OwnAccessory {
 
         this.watts = 0.0001;
 
-        this.accessory.getService(this.Service.AccessoryInformation)!
-            .setCharacteristic(this.Characteristic.Model, 'EnergyMonitor');
-
-        this.energyService = this.accessory.getService(this.Service.LightSensor)
-            ?? this.accessory.addService(this.Service.LightSensor);
+        this.energyService = this.initPrimaryService(this.Service.LightSensor, 'EnergyMonitor', true, true);
 
         this.energyService.getCharacteristic(this.Characteristic.CurrentAmbientLightLevel)
             .onGet(() => Math.max(0.0001, this.watts));
@@ -812,11 +880,17 @@ export class OwnEnergyAccessory extends OwnAccessory {
         }, 30000);
     }
 
+    setOnline(online: boolean): void {
+        this.setFaultOnline(this.energyService, online, true);
+    }
+
     destroy(): void {
+        this.destroyed = true;
         clearInterval(this.pollInterval);
     }
 
     updateStatus(): void {
+        if (this.destroyed) return;
         this.log.debug(`[${this.id}] Energy updateStatus`);
         this.controller.sendCommand({
             command: `*#18*${this.id}*113##`,
@@ -830,7 +904,7 @@ export class OwnEnergyAccessory extends OwnAccessory {
         if (extract) {
             this.watts = Math.max(0.0001, parseInt(extract[1], 10));
             this.log.debug(`[${this.id}] Energy: ${this.watts}W`);
-            this.energyService.getCharacteristic(this.Characteristic.CurrentAmbientLightLevel).updateValue(this.watts);
+            this.energyService.updateCharacteristic(this.Characteristic.CurrentAmbientLightLevel, this.watts);
         } else {
             this.log.debug('[%s] Energy: ignoring packet %s', this.id, packet);
         }

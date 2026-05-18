@@ -1,5 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import { EventEmitter } from 'node:events';
 import { makeMockPlatform, makeSpy } from './helpers';
 import { OwnPlatform } from '../lib/OwnPlatform';
 import { PLUGIN_NAME } from '../lib/constants';
@@ -22,21 +23,31 @@ function makeAccessoryStub(name: string, uuid: string): PlatformAccessory {
     function addSvc(svc: string): unknown {
         const chars: Record<string, ReturnType<typeof makeCharStub>> = {};
         services[svc] = {
+            setPrimaryService: () => services[svc],
             getCharacteristic: (c: string) => {
                 if (!chars[c]) chars[c] = makeCharStub();
                 return chars[c];
             },
             setCharacteristic: () => services[svc],
+            updateCharacteristic: () => services[svc],
         };
         return services[svc];
     }
     addSvc('AccessoryInformation');
+    const listeners: Record<string, ((...args: unknown[]) => void)[]> = {};
     return {
         displayName: name,
         UUID: uuid,
         context: {},
         getService: (svc: string) => services[svc] ?? null,
         addService: (svc: string) => addSvc(svc),
+        on: (event: string, cb: (...args: unknown[]) => void) => {
+            if (!listeners[event]) listeners[event] = [];
+            listeners[event].push(cb);
+        },
+        removeAllListeners: (event?: string) => {
+            if (event) delete listeners[event]; else Object.keys(listeners).forEach(k => delete listeners[k]);
+        },
     } as unknown as PlatformAccessory;
 }
 
@@ -90,7 +101,7 @@ function makePlatformInstance(config: Record<string, unknown>, api: MockApi): Ow
     const defaultConfig = { port: 20000, lights: [], blinds: [], thermostats: [], scenarios: [], contacts: [], energies: [] };
     const mergedConfig = { ...defaultConfig, ...config };
 
-    const log: Logging = { info: () => {}, debug: () => {}, warn: () => {}, error: () => {} } as unknown as Logging;
+    const log: Logging = { info: () => {}, debug: () => {}, warn: () => {}, error: () => {}, success: () => {} } as unknown as Logging;
 
     const platform = {
         config: mergedConfig,
@@ -101,7 +112,7 @@ function makePlatformInstance(config: Record<string, unknown>, api: MockApi): Ow
         HapStatusError: function (this: { code: number }, code: number) { this.code = code; } as unknown as new (status: number) => Error,
         cachedAccessories: [] as PlatformAccessory[],
         activeHandlers: [],
-        controller: { sendCommand: makeSpy(), on: () => {}, startMonitor: () => {}, commandQueue: [] as unknown[], queueSize: () => 0 },
+        controller: Object.assign(new EventEmitter(), { sendCommand: makeSpy(), startMonitor: () => {}, commandQueue: [] as unknown[], queueSize: () => 0 }),
     };
 
     const p = platform as unknown as OwnPlatform;
@@ -227,7 +238,7 @@ describe('OwnPlatform.onMonitor', () => {
         const platform = makePlatformInstance({ host: '127.0.0.1' }, api);
         const debugCalls: unknown[][] = [];
         platform.log.debug = function (...args: unknown[]) { debugCalls.push(args); } as typeof platform.log.debug;
-        platform.onMonitor('*16*1*0##');
+        platform.onMonitor('*99*1*0##');
         assert.ok(debugCalls.length > 0);
     });
 
@@ -240,6 +251,47 @@ describe('OwnPlatform.onMonitor', () => {
         platform.log.error = function (...args: unknown[]) { errors.push(args); } as typeof platform.log.error;
         platform.onMonitor('*1*1*42##');
         assert.ok(errors.some(e => (e[0] as string).includes('Error processing packet')));
+    });
+
+    it('auth-failed event sets all accessories offline and logs error', () => {
+        const api = makeMockApi();
+        // Capture the didFinishLaunching callback without firing it immediately
+        let launchCb: (() => void) | undefined;
+        api.on = (event: string, cb: () => void) => { if (event === 'didFinishLaunching') launchCb = cb; };
+
+        const errors: unknown[][] = [];
+        const log = {
+            info: () => {}, debug: () => {}, warn: () => {},
+            error: (...args: unknown[]) => { errors.push(args); },
+        } as unknown as import('homebridge').Logging;
+
+        const platform = new OwnPlatform(log, {
+            platform: 'MyHome', host: '127.0.0.1', lights: [{ id: 42, name: 'L' }],
+        }, api as unknown as API);
+
+        // Replace the real OwnClient with an EventEmitter-based mock before firing launch
+        const mockCtrl = Object.assign(new EventEmitter(), {
+            detectGatewayModel: (cb: (m: string | null) => void) => cb(null),
+            startMonitor: () => {},
+            stopMonitor: () => {},
+            commandQueue: [] as unknown[],
+            queueSize: () => 0,
+            maxConcurrent: 2,
+        });
+        (platform as unknown as { controller: unknown }).controller = mockCtrl;
+
+        assert.ok(launchCb, 'didFinishLaunching callback should be captured');
+        launchCb!(); // registers ctrl.on('auth-failed', ...) and calls discoverDevices
+
+        assert.ok(platform.activeHandlers.length > 0);
+        let onlineState: boolean | null = null;
+        platform.activeHandlers[0].setOnline = (v: boolean) => { onlineState = v; };
+
+        mockCtrl.emit('auth-failed');
+        assert.ok(errors.some(e => (e[0] as string).includes('authentication failed')));
+        assert.equal(onlineState, false);
+
+        for (const h of platform.activeHandlers) h.destroy();
     });
 });
 
@@ -282,7 +334,7 @@ describe('OwnPlatform config validation', () => {
 
     it('configureAccessory is safe when host is missing', () => {
         const api = makeMockApi();
-        const log: Logging = { info: () => {}, debug: () => {}, warn: () => {}, error: () => {} } as unknown as Logging;
+        const log: Logging = { info: () => {}, debug: () => {}, warn: () => {}, error: () => {}, success: () => {} } as unknown as Logging;
         const platform = new OwnPlatform(log, { platform: 'MyHome', lights: [] }, api as unknown as API);
         platform.configureAccessory({ displayName: 'test', UUID: 'test-uuid' } as unknown as PlatformAccessory);
     });
@@ -290,9 +342,21 @@ describe('OwnPlatform config validation', () => {
     it('starts normally when host is present', () => {
         const api = makeMockApi();
         (api as unknown as { on: (e: string, cb: () => void) => void }).on = () => {};
-        const log: Logging = { info: () => {}, debug: () => {}, warn: () => {}, error: () => {} } as unknown as Logging;
+        const log: Logging = { info: () => {}, debug: () => {}, warn: () => {}, error: () => {}, success: () => {} } as unknown as Logging;
         const platform = new OwnPlatform(log, { platform: 'MyHome', host: '127.0.0.1', password: '12345' }, api as unknown as API);
         assert.notEqual(platform.controller as unknown as undefined, undefined);
+    });
+
+    it('configureAccessory creates handler early when context.type is present', () => {
+        const api = makeMockApi();
+        (api as unknown as { on: (e: string, cb: () => void) => void }).on = () => {};
+        const log: Logging = { info: () => {}, debug: () => {}, warn: () => {}, error: () => {}, success: () => {} } as unknown as Logging;
+        const platform = new OwnPlatform(log, { platform: 'MyHome', host: '127.0.0.1' }, api as unknown as API);
+        const acc = makeAccessoryStub('Kitchen', api.hap.uuid.generate('myhome-light-42'));
+        (acc as unknown as { context: Record<string, unknown> }).context = { type: 'light', device: { id: 42, name: 'Kitchen' } };
+        platform.configureAccessory(acc);
+        assert.equal(platform.activeHandlers.length, 1);
+        for (const h of platform.activeHandlers) h.destroy();
     });
 });
 

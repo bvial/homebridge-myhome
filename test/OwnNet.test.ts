@@ -52,7 +52,7 @@ describe('OwnConnection state machine', () => {
         written = [];
         destroyed = false;
         conn = new OwnConnection('127.0.0.1', '20000', '12345', MODE.MONITOR, {
-            info: () => {}, debug: () => {}, warn: () => {}, error: () => {},
+            info: () => {}, debug: () => {}, warn: () => {}, error: () => {}, success: () => {},
         } as unknown as import('homebridge').Logging);
         (conn as unknown as { conn: unknown }).conn = {
             write: (d: string) => { written.push(d); },
@@ -164,7 +164,7 @@ describe('TCP fragmentation', () => {
     beforeEach(() => {
         packets = [];
         conn = new OwnConnection('127.0.0.1', '20000', '12345', MODE.MONITOR, {
-            info: () => {}, debug: () => {}, warn: () => {}, error: () => {},
+            info: () => {}, debug: () => {}, warn: () => {}, error: () => {}, success: () => {},
         } as unknown as import('homebridge').Logging);
         (conn as unknown as { conn: unknown }).conn = { write: () => {}, end: () => {}, setTimeout: () => {}, on: () => {} };
         conn.state = 'CONNECTED';
@@ -201,7 +201,7 @@ describe('TCP fragmentation', () => {
 describe('OwnClient command queue', () => {
     it('limits concurrent commands', (_t: unknown, done: () => void) => {
         const client = new OwnClient('127.0.0.1', '20000', '12345', {
-            info: () => {}, debug: () => {}, warn: () => {}, error: () => {},
+            info: () => {}, debug: () => {}, warn: () => {}, error: () => {}, success: () => {},
         } as unknown as import('homebridge').Logging);
         client.maxConcurrent = 1;
 
@@ -273,7 +273,7 @@ describe('OwnConnection logPacket masking', () => {
 describe('OwnClient command failure callback', () => {
     it('calls done with null and -1 on connection close without response', (_t: unknown, done: () => void) => {
         const client = new OwnClient('127.0.0.1', '20000', '12345', {
-            info: () => {}, debug: () => {}, warn: () => {}, error: () => {},
+            info: () => {}, debug: () => {}, warn: () => {}, error: () => {}, success: () => {},
         } as unknown as import('homebridge').Logging);
         client.maxConcurrent = 1;
 
@@ -308,7 +308,7 @@ describe('OwnMonitor reconnect logic', () => {
     function makeMockClient() {
         const commands: CommandParams[] = [];
         return {
-            log: { info: function () {}, debug: function () {}, warn: function () {}, error: function () {} } as unknown as import('homebridge').Logging,
+            log: { info: function () {}, debug: function () {}, warn: function () {}, error: function () {}, success: function () {} } as unknown as import('homebridge').Logging,
             sendCommand: function (params: CommandParams) { commands.push(params); },
             newConnection: function () { return null as unknown as OwnConnection; },
             commands: commands,

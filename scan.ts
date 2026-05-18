@@ -188,7 +188,6 @@ async function main() {
 
     // Summary table
     if (found.length === 0) {
-        const whoLabel: Record<number, string> = { 1: 'light', 2: 'blind', 4: 'thermostat', 9: 'contact', 18: 'energy' };
         console.log('No devices found.');
         console.log('Suggestions:');
         console.log('  • Check host/port/password');
