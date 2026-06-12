@@ -24,6 +24,7 @@ function makeAccessoryStub(name: string, uuid: string): PlatformAccessory {
         const chars: Record<string, ReturnType<typeof makeCharStub>> = {};
         services[svc] = {
             setPrimaryService: () => services[svc],
+            addLinkedService: () => services[svc],
             getCharacteristic: (c: string) => {
                 if (!chars[c]) chars[c] = makeCharStub();
                 return chars[c];
@@ -83,6 +84,7 @@ function makeMockApi(): MockApi {
                 Switch: 'Switch',
                 ContactSensor: 'ContactSensor',
                 LightSensor: 'LightSensor',
+                TemperatureSensor: 'TemperatureSensor',
             },
             Characteristic: makeMockPlatform().Characteristic,
         },

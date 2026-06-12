@@ -1,5 +1,6 @@
 import type { API, DynamicPlatformPlugin, HapStatusError, Logging, PlatformAccessory, PlatformConfig, Service, Characteristic } from 'homebridge';
 import { PLUGIN_NAME, PLATFORM_NAME } from './constants';
+import { errorMessage } from './utils';
 import { OwnClient } from './OwnNet';
 import { OwnProtcol, WHO } from './OwnProtcol';
 import {
@@ -87,7 +88,12 @@ export class OwnPlatform implements DynamicPlatformPlugin {
         this.Service = api.hap.Service as typeof Service;
         this.Characteristic = api.hap.Characteristic as typeof Characteristic;
         this.HapStatusError = api.hap.HapStatusError as unknown as new (status: number) => HapStatusError;
-        this.HAPStatus = { NOT_ALLOWED_IN_CURRENT_STATE: -70412, SERVICE_COMMUNICATION_FAILURE: -70402 };
+        this.HAPStatus = {
+            NOT_ALLOWED_IN_CURRENT_STATE: -70412,
+            SERVICE_COMMUNICATION_FAILURE: -70402,
+            RESOURCE_BUSY: -70403,
+            OPERATION_TIMED_OUT: -70408,
+        };
         this.cachedAccessories = [];
         this.activeHandlers = [];
         this.staggerTimers = [];
@@ -128,7 +134,10 @@ export class OwnPlatform implements DynamicPlatformPlugin {
             });
             ctrl.detectGatewayModel((model) => {
                 ctrl.maxConcurrent = recommendedConcurrency(model);
-                this.log.info(`maxConcurrent auto-set to ${ctrl.maxConcurrent} (gateway: ${modelLabel(model)})`);
+                const label = modelLabel(model);
+                this.log.info(`maxConcurrent auto-set to ${ctrl.maxConcurrent} (gateway: ${label})`);
+                // Propagate detected gateway model to each accessory's HardwareRevision
+                for (const handler of this.activeHandlers) handler.setHardwareRevision(label);
                 ctrl.startMonitor();
             });
         });
@@ -153,7 +162,7 @@ export class OwnPlatform implements DynamicPlatformPlugin {
                     accessory.context.device as Record<string, unknown>,
                 );
             } catch (err) {
-                this.log.error('Failed to restore handler for %s: %s', accessory.displayName, (err as Error).message);
+                this.log.error('Failed to restore handler for %s: %s', accessory.displayName, errorMessage(err));
             }
         }
     }
@@ -197,7 +206,7 @@ export class OwnPlatform implements DynamicPlatformPlugin {
                     try {
                         this.createHandler(device.type, existingAccessory, device);
                     } catch (err) {
-                        this.log.error('Failed to create handler for %s id=%s: %s', device.type, device.id, (err as Error).message);
+                        this.log.error('Failed to create handler for %s id=%s: %s', device.type, device.id, errorMessage(err));
                     }
                 }
             } else {
@@ -211,7 +220,7 @@ export class OwnPlatform implements DynamicPlatformPlugin {
                     this.createHandler(device.type, accessory, device);
                     this.api.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
                 } catch (err) {
-                    this.log.error('Failed to create handler for %s id=%s: %s', device.type, device.id, (err as Error).message);
+                    this.log.error('Failed to create handler for %s id=%s: %s', device.type, device.id, errorMessage(err));
                 }
             }
         }
@@ -276,7 +285,7 @@ export class OwnPlatform implements DynamicPlatformPlugin {
                     this.log.debug('Unsupported packet', packet);
             }
         } catch (err) {
-            this.log.error('Error processing packet %s: %s', packet, (err as Error).message);
+            this.log.error('Error processing packet %s: %s', packet, errorMessage(err));
         }
     }
 

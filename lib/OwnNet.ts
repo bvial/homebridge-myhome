@@ -1,6 +1,7 @@
 import { EventEmitter } from 'events';
 import * as net from 'net';
 import type { Logging } from 'homebridge';
+import { errorMessage } from './utils';
 
 export const STATE = {
     UNCONNECTED: 'UNCONNECTED',
@@ -51,6 +52,9 @@ let idCount = 0;
 
 export function calcPass(pass: string | undefined, nonce: string): string {
     let flag = true; let num1 = 0x0; let num2 = 0x0;
+    if (pass === undefined || pass === '' || !/^\d+$/.test(pass)) {
+        throw new Error('OWN password must be a non-empty decimal integer string');
+    }
     const password = Number(pass);
     if (!Number.isInteger(password)) throw new Error('OWN password must be a number (got non-numeric value)');
     for (const c of nonce) {
@@ -212,7 +216,7 @@ export class OwnConnection extends EventEmitter {
                                 this.state = STATE.LOGGING_IN;
                                 if (this.conn) this.conn.write(`*#${p}##`);
                             } catch (err) {
-                                this.log.error('conn:%s Password error: %s', this.id, (err as Error).message);
+                                this.log.error('conn:%s Password error: %s', this.id, errorMessage(err));
                                 this.state = STATE.UNCONNECTED;
                                 this.emit('auth-failed');
                                 this.end();
@@ -425,42 +429,47 @@ export class OwnClient extends EventEmitter {
             }
         };
 
-        let cmdTimeout: ReturnType<typeof setTimeout> | undefined;
-        const commandconn = this.newConnection(MODE.COMMAND, params.log);
-        commandconn.on('connected', () => {
-            commandconn.sendPacket(params.command);
-            if (params.started) params.started();
-            cmdTimeout = setTimeout(() => {
-                commandconn.log.debug('conn:%s command timeout', commandconn.id);
-                commandconn.end();
-                releaseSlot(true);
-            }, 10000);
-        });
-        commandconn.on('packet', (packet: string) => {
-            const done = (pkt: string, index: number) => {
-                clearTimeout(cmdTimeout);
-                commandconn.end();
-                releaseSlot(false);
-                if (params.done) params.done(pkt, index);
-            };
+        try {
+            let cmdTimeout: ReturnType<typeof setTimeout> | undefined;
+            const commandconn = this.newConnection(MODE.COMMAND, params.log);
+            commandconn.on('connected', () => {
+                commandconn.sendPacket(params.command);
+                if (params.started) params.started();
+                cmdTimeout = setTimeout(() => {
+                    commandconn.log.debug('conn:%s command timeout', commandconn.id);
+                    commandconn.end();
+                    releaseSlot(true);
+                }, 10000);
+            });
+            commandconn.on('packet', (packet: string) => {
+                const done = (pkt: string, index: number) => {
+                    clearTimeout(cmdTimeout);
+                    commandconn.end();
+                    releaseSlot(false);
+                    if (params.done) params.done(pkt, index);
+                };
 
-            if (params.stopon !== undefined) {
-                if (Array.isArray(params.stopon)) {
-                    const i = params.stopon.indexOf(packet);
-                    if (i !== -1) return done(packet, i);
-                } else if (packet === params.stopon) {
+                if (params.stopon !== undefined) {
+                    if (Array.isArray(params.stopon)) {
+                        const i = params.stopon.indexOf(packet);
+                        if (i !== -1) return done(packet, i);
+                    } else if (packet === params.stopon) {
+                        return done(packet, 0);
+                    }
+                } else if (packet === PKT.ACK) {
                     return done(packet, 0);
                 }
-            } else if (packet === PKT.ACK) {
-                return done(packet, 0);
-            }
-            if (params.packet) params.packet(packet);
-        });
-        commandconn.on('close', () => {
-            clearTimeout(cmdTimeout);
+                if (params.packet) params.packet(packet);
+            });
+            commandconn.on('close', () => {
+                clearTimeout(cmdTimeout);
+                releaseSlot(true);
+            });
+            commandconn.connect();
+        } catch (err) {
+            this.log.error('executeCommand failed synchronously: %s', errorMessage(err));
             releaseSlot(true);
-        });
-        commandconn.connect();
+        }
     }
 
     startMonitor(): void {
@@ -485,7 +494,9 @@ export class OwnClient extends EventEmitter {
             this.monitor.stop();
             this.monitor = null;
         }
-        this.removeAllListeners();
+        // Note: do NOT call this.removeAllListeners() here — OwnPlatform attaches
+        // 'packet'/'monitoring'/'unmonitoring'/'auth-failed' listeners on the OwnClient
+        // instance and would lose them across reconnects.
     }
 
     private runScan(cmd: string, callback?: (macs: number[]) => void): void {

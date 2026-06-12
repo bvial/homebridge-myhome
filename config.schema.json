@@ -137,6 +137,13 @@
                             "title": "Name",
                             "type": "string",
                             "required": false
+                        },
+                        "asButton": {
+                            "title": "Expose as button",
+                            "description": "Use Stateless Programmable Switch instead of Switch (better for momentary actions; may break existing automations)",
+                            "type": "boolean",
+                            "required": false,
+                            "default": false
                         }
                     }
                 }
@@ -158,6 +165,18 @@
                             "title": "Name",
                             "type": "string",
                             "required": false
+                        },
+                        "sensorType": {
+                            "title": "Sensor type",
+                            "description": "How HomeKit displays this dry contact",
+                            "type": "string",
+                            "required": false,
+                            "default": "contact",
+                            "oneOf": [
+                                { "title": "Contact (door/window)", "enum": ["contact"] },
+                                { "title": "Motion (PIR)", "enum": ["motion"] },
+                                { "title": "Occupancy", "enum": ["occupancy"] }
+                            ]
                         }
                     }
                 }
@@ -179,6 +198,13 @@
                             "title": "Name",
                             "type": "string",
                             "required": false
+                        },
+                        "asOutlet": {
+                            "title": "Expose as outlet",
+                            "description": "Use Outlet service with Eve Consumption characteristic instead of LightSensor lux-hack (better Eve.app support)",
+                            "type": "boolean",
+                            "required": false,
+                            "default": false
                         }
                     }
                 }

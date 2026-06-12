@@ -322,7 +322,7 @@ describe('OwnBlindAccessory', () => {
         handler.target = 0;
         handler.evaluatePosition();
         const cmds = spy.calls.map((c: unknown[]) => (c[0] as { command: string }).command);
-        assert.ok(!cmds.some((c: string) => c.startsWith('*2*0*')), 'stop command must not be sent during init phase');
+        assert.ok(!cmds.some((c: string) => c.startsWith('*2*0*')), 'stop command must not be sent during init phase by evaluatePosition');
         handler.destroy();
     });
 
@@ -338,6 +338,93 @@ describe('OwnBlindAccessory', () => {
         handler.state = POSITION_STATE.STOPPED;
         handler.onData('*2*0*23##');
         assert.equal(handler.initPhase, true, 'initPhase must survive a state broadcast before DECREASING echo');
+    });
+
+    it('physical STOP syncs TargetPosition to CurrentPosition', () => {
+        const svc = accessory.services['WindowCovering'];
+        handler.state = POSITION_STATE.INCREASING;
+        handler.homeKitMovement = false;
+        handler.position = 60;
+        handler.target = 100;
+        handler.onData('*2*0*23##');
+        assert.equal(handler.target, 60, 'target must match position after physical stop');
+        assert.equal(svc.characteristics['TargetPosition'].value, 60, 'TargetPosition characteristic must be pushed to HomeKit');
+    });
+
+    it('STOPPED during HomeKit movement does NOT overwrite target', () => {
+        handler.state = POSITION_STATE.STOPPED;
+        handler.homeKitMovement = true;
+        handler.position = 65;
+        handler.target = 50;
+        handler.evaluatePosition();
+        assert.equal(handler.target, 50, 'target must be preserved while homeKitMovement is true');
+    });
+
+    it('init STOP timer fires moveStop after travel time', (_t, done) => {
+        const spy = platform.sendCommandSpy;
+        spy.calls.length = 0;
+        handler.time = 0.05;  // 50ms travel + 1000ms margin → ~1050ms
+        handler.updateStatus();
+        // Verify init DOWN was sent immediately
+        const downSent = spy.calls.some((c: unknown[]) => (c[0] as { command: string }).command === '*2*2*23##');
+        assert.ok(downSent, 'init DOWN must be sent immediately');
+        // Wait for the calibration timer to fire
+        setTimeout(() => {
+            const stopSent = spy.calls.some((c: unknown[]) => (c[0] as { command: string }).command === '*2*0*23##');
+            assert.ok(stopSent, 'init STOP must be sent after travel time + margin');
+            handler.destroy();
+            done();
+        }, 1200);
+    });
+
+    it('init STOP timer accounts for timeSlat (venetian blinds)', (_t, done) => {
+        const spy = platform.sendCommandSpy;
+        spy.calls.length = 0;
+        handler.time = 0.05;       // 50ms linear
+        handler.timeSlat = 0.3;    // 300ms slat → total 350ms + 1000ms margin = 1350ms
+        handler.updateStatus();
+        // At 1100ms, STOP must NOT yet be sent (linear timer would have fired at 1050ms)
+        setTimeout(() => {
+            const stopSentEarly = spy.calls.some((c: unknown[]) => (c[0] as { command: string }).command === '*2*0*23##');
+            assert.ok(!stopSentEarly, 'STOP must NOT fire before time+timeSlat elapsed');
+        }, 1100);
+        // After 1500ms, STOP must have fired
+        setTimeout(() => {
+            const stopSent = spy.calls.some((c: unknown[]) => (c[0] as { command: string }).command === '*2*0*23##');
+            assert.ok(stopSent, 'STOP must fire after (time+timeSlat) + margin');
+            handler.destroy();
+            done();
+        }, 1500);
+    });
+
+    it('stopMoveTracking clears initPhase to unblock subsequent stops', () => {
+        handler.initPhase = true;
+        handler.stopMoveTracking();
+        assert.equal(handler.initPhase, false, 'initPhase must be cleared so future moves can stop at target');
+    });
+
+    it('init timer clears initPhase before moveStop (gateway STOP echo may not clear it)', (_t, done) => {
+        handler.time = 0.05;
+        handler.updateStatus();
+        // Wait for the calibration timer to fire
+        setTimeout(() => {
+            assert.equal(handler.initPhase, false, 'initPhase must be cleared by init timer to unblock future DECREASING stops');
+            handler.destroy();
+            done();
+        }, 1200);
+    });
+
+    it('STOPPED during status query does NOT overwrite target', () => {
+        const svc = accessory.services['WindowCovering'];
+        handler.state = POSITION_STATE.STOPPED;
+        handler.homeKitMovement = false;
+        (handler as unknown as { inStatusQuery: boolean }).inStatusQuery = true;
+        handler.position = 75;
+        handler.target = 50;
+        svc.characteristics['TargetPosition'].value = 50;
+        handler.evaluatePosition();
+        assert.equal(handler.target, 50, 'target must be preserved during status query');
+        assert.equal(svc.characteristics['TargetPosition'].value, 50, 'TargetPosition must not be pushed during status query');
     });
 
     it('onData duplicate STOP does not call evaluatePosition when already STOPPED', () => {

@@ -10,6 +10,7 @@
  */
 
 import { OwnClient, OwnConnection, PKT, CMD, MODE } from './lib/OwnNet';
+import { errorMessage } from './lib/utils';
 import type { Logging } from 'homebridge';
 
 // ─── CLI args ─────────────────────────────────────────────────────────────────
@@ -223,6 +224,6 @@ async function main() {
 }
 
 main().catch(err => {
-    console.error('Fatal error:', (err as Error).message);
+    console.error('Fatal error:', errorMessage(err));
     process.exit(1);
 });

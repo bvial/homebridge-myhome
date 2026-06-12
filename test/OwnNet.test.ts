@@ -13,7 +13,7 @@ describe('calcPass', () => {
     });
 
     it('throws on float password', () => {
-        assert.throws(() => calcPass('12.9', '12345'), /must be a number/);
+        assert.throws(() => calcPass('12.9', '12345'), /decimal integer/);
     });
 
     it('exercises all nonce digits', () => {
@@ -35,11 +35,19 @@ describe('calcPass', () => {
     });
 
     it('throws on non-numeric password', () => {
-        assert.throws(() => calcPass('abc', '12345'), /must be a number/);
+        assert.throws(() => calcPass('abc', '12345'), /decimal integer/);
     });
 
     it('throws on undefined password', () => {
-        assert.throws(() => calcPass(undefined as unknown as string, '12345'), /must be a number/);
+        assert.throws(() => calcPass(undefined as unknown as string, '12345'), /decimal integer/);
+    });
+
+    it('throws on hex password (security: prevent silent miscompute)', () => {
+        assert.throws(() => calcPass('0x1A', '12345'), /decimal integer/);
+    });
+
+    it('throws on empty password', () => {
+        assert.throws(() => calcPass('', '12345'), /decimal integer/);
     });
 });
 

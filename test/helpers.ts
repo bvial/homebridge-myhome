@@ -45,9 +45,11 @@ function makeCharacteristicStub() {
 
 function makeServiceStub(name: string) {
     const characteristics: Record<string, ReturnType<typeof makeCharacteristicStub>> = {};
+    const linked: string[] = [];
     const svc = {
         name: name,
         setPrimaryService: (_primary: boolean) => svc,
+        addLinkedService: (other: { name: string }) => { linked.push(other.name); return svc; },
         getCharacteristic: (c: string) => {
             if (!characteristics[c]) characteristics[c] = makeCharacteristicStub();
             return characteristics[c];
@@ -63,6 +65,7 @@ function makeServiceStub(name: string) {
             return svc;
         },
         characteristics: characteristics,
+        linked: linked,
     };
     return svc;
 }
@@ -73,7 +76,7 @@ export function makeMockAccessory() {
     return {
         context: {} as Record<string, unknown>,
         getService: (svc: string) => services[svc] ?? null,
-        addService: (svc: string) => {
+        addService: (svc: string, _displayName?: string, _subtype?: string) => {
             services[svc] = makeServiceStub(svc);
             return services[svc];
         },
@@ -99,6 +102,11 @@ export function makeMockPlatform() {
         Switch: 'Switch',
         ContactSensor: 'ContactSensor',
         LightSensor: 'LightSensor',
+        TemperatureSensor: 'TemperatureSensor',
+        MotionSensor: 'MotionSensor',
+        OccupancySensor: 'OccupancySensor',
+        StatelessProgrammableSwitch: 'StatelessProgrammableSwitch',
+        Outlet: 'Outlet',
     };
 
     const Characteristic = {
@@ -121,6 +129,13 @@ export function makeMockPlatform() {
         CurrentAmbientLightLevel: 'CurrentAmbientLightLevel',
         StatusActive: 'StatusActive',
         StatusFault: Object.assign('StatusFault', { NO_FAULT: 0, GENERAL_FAULT: 1 }),
+        ConfiguredName: 'ConfiguredName',
+        FirmwareRevision: 'FirmwareRevision',
+        HardwareRevision: 'HardwareRevision',
+        OutletInUse: 'OutletInUse',
+        MotionDetected: 'MotionDetected',
+        OccupancyDetected: 'OccupancyDetected',
+        ProgrammableSwitchEvent: Object.assign('ProgrammableSwitchEvent', { SINGLE_PRESS: 0 }),
     };
 
     const sendCommandSpy = makeSpy(true);
