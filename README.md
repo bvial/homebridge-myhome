@@ -4,7 +4,7 @@ Homebridge platform plugin for **Legrand MyHome / BTicino** home automation gate
 
 ## Requirements
 
-- Homebridge ≥ 1.6 (or 2.x)
+- Homebridge ≥ 2.0
 - Node.js ≥ 18
 - A Legrand MyHome gateway (F452, F454, F455, MH200, …) reachable on the local network over TCP port 20000
 
@@ -126,6 +126,22 @@ Read-only contact sensor. For `motion`/`occupancy`/`leak`/`smoke`/`co` types: co
 | `asOutlet` | boolean | no | Expose as `Outlet` with Eve Consumption characteristic instead of `LightSensor` (default `false`). |
 
 Default mode: light sensor (watts reported as lux). With `asOutlet: true` the meter is exposed as an Outlet whose `In Use` reflects power draw, plus the Eve custom Consumption characteristic for proper Eve.app energy graphing. Polls every 30 s. **Changing this flag at runtime removes the old service.**
+
+#### `doors` (door entry / video door — WHO=7)
+
+| Key | Type | Required | Description |
+|-----|------|----------|-------------|
+| `id` | integer | yes | Door entry / video door address (WHO=7) |
+| `name` | string | no | Display name |
+| `openCommand` | string | no | OWN command to send when the lock is opened (default `*7*19*<id>##`) |
+| `doorbell` | boolean | no | Add a linked `Doorbell` service that fires `SINGLE_PRESS` on incoming WHO=7 packets matching the address |
+
+Exposed as `LockMechanism`. Setting the lock to UNSECURED sends the open command; the lock auto-resets to SECURED after 3 s (the relay is momentary). With `doorbell: true`, an incoming bus packet (e.g. an intercom button press) fires a HomeKit doorbell event for automation.
+
+## Known Limitations
+
+- **UUID stability**: HomeKit accessory UUIDs are derived from `myhome-${type}-${id}`. Changing the `type` of a config entry (e.g. moving an `id` from `lights` to `contacts`) generates a new UUID, unregisters the old accessory, and registers a new one. HomeKit automations referencing the old accessory will need to be recreated.
+- **Tile flips**: When you toggle `asButton`, `asOutlet`, or `sensorType`, the plugin removes the old service from the accessory at next startup. HomeKit automations bound to the old service will need to be recreated.
 
 ## Example configuration
 

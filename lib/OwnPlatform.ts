@@ -1,7 +1,6 @@
 import type { API, DynamicPlatformPlugin, HapStatusError, Logging, PlatformAccessory, PlatformConfig, Service, Characteristic } from 'homebridge';
 import { PLUGIN_NAME, PLATFORM_NAME } from './constants';
-import { errorMessage } from './utils';
-import { STATUS_UPDATE_STAGGER_MS } from './utils';
+import { errorMessage, STATUS_UPDATE_STAGGER_MS, isValidConfig } from './utils';
 import { OwnClient } from './OwnNet';
 import { OwnProtcol, WHO } from './OwnProtcol';
 import {
@@ -11,6 +10,7 @@ import {
     OwnScenarioAccessory,
     OwnContactAccessory,
     OwnEnergyAccessory,
+    OwnDoorAccessory,
     OwnPlatformLike,
     LightConfig,
     BlindConfig,
@@ -18,12 +18,15 @@ import {
     ScenarioConfig,
     ContactConfig,
     EnergyConfig,
+    DoorConfig,
 } from './OwnAccessory';
 
 interface MyHomeConfig extends PlatformConfig {
     host?: string;
     port?: number;
     password?: string;
+    maxConcurrent?: number;
+    doors?: DoorConfig[];
     lights?: LightConfig[];
     blinds?: BlindConfig[];
     thermostats?: ThermostatConfig[];
@@ -33,7 +36,7 @@ interface MyHomeConfig extends PlatformConfig {
 }
 
 type AnyAccessory = OwnLightAccessory | OwnBlindAccessory | OwnThermostatAccessory
-    | OwnScenarioAccessory | OwnContactAccessory | OwnEnergyAccessory;
+    | OwnScenarioAccessory | OwnContactAccessory | OwnEnergyAccessory | OwnDoorAccessory;
 
 // Model codes from *#13**15## (DIM 15 = Device Type). Codes 2–13 per OWN spec; 200 = F454 (post-2006).
 const MODEL_NAMES: Record<number, string> = {
@@ -67,7 +70,7 @@ export class OwnPlatform implements DynamicPlatformPlugin {
     activeHandlers: AnyAccessory[];
     controller: OwnClient | undefined;
     private staggerTimers: ReturnType<typeof setTimeout>[];
-    private readonly config: Required<Omit<MyHomeConfig, 'host'>> & { host?: string };
+    private readonly config: Required<Omit<MyHomeConfig, 'host' | 'maxConcurrent' | 'password'>> & { host?: string; password?: string; maxConcurrent?: number };
 
     constructor(
         public readonly log: Logging,
@@ -76,6 +79,7 @@ export class OwnPlatform implements DynamicPlatformPlugin {
     ) {
         const defaultConfig: Omit<MyHomeConfig, keyof PlatformConfig> = {
             port: 20000,
+            doors: [],
             lights: [],
             blinds: [],
             thermostats: [],
@@ -84,7 +88,7 @@ export class OwnPlatform implements DynamicPlatformPlugin {
             energies: [],
         };
 
-        this.config = { ...defaultConfig, ...config } as Required<Omit<MyHomeConfig, 'host'>> & { host?: string };
+        this.config = { ...defaultConfig, ...config } as Required<Omit<MyHomeConfig, 'host' | 'maxConcurrent' | 'password'>> & { host?: string; password?: string; maxConcurrent?: number };
 
         this.Service = api.hap.Service as typeof Service;
         this.Characteristic = api.hap.Characteristic as typeof Characteristic;
@@ -134,9 +138,15 @@ export class OwnPlatform implements DynamicPlatformPlugin {
                 this.setAllOnline(false);
             });
             ctrl.detectGatewayModel((model) => {
-                ctrl.maxConcurrent = recommendedConcurrency(model);
+                const userOverride = this.config.maxConcurrent;
                 const label = modelLabel(model);
-                this.log.info(`maxConcurrent auto-set to ${ctrl.maxConcurrent} (gateway: ${label})`);
+                if (typeof userOverride === 'number' && Number.isInteger(userOverride) && userOverride >= 1 && userOverride <= 10) {
+                    ctrl.maxConcurrent = userOverride;
+                    this.log.info(`maxConcurrent set to ${ctrl.maxConcurrent} (user override; gateway: ${label})`);
+                } else {
+                    ctrl.maxConcurrent = recommendedConcurrency(model);
+                    this.log.info(`maxConcurrent auto-set to ${ctrl.maxConcurrent} (gateway: ${label})`);
+                }
                 // Propagate detected gateway model to each accessory's HardwareRevision
                 for (const handler of this.activeHandlers) handler.setHardwareRevision(label);
                 ctrl.startMonitor();
@@ -155,29 +165,21 @@ export class OwnPlatform implements DynamicPlatformPlugin {
     configureAccessory(accessory: PlatformAccessory): void {
         this.log.info('Restoring cached accessory:', accessory.displayName);
         this.cachedAccessories.push(accessory);
-        if (this.controller && accessory.context.type && accessory.context.device) {
-            try {
-                this.createHandler(
-                    accessory.context.type as string,
-                    accessory,
-                    accessory.context.device as Record<string, unknown>,
-                );
-            } catch (err) {
-                this.log.error('Failed to restore handler for %s: %s', accessory.displayName, errorMessage(err));
-            }
-        }
+        // Note: handler creation is deferred to discoverDevices() which has the up-to-date
+        // config.device. Creating here with stale context.device would skip the service-flip
+        // cleanup when the user changes asButton/asOutlet/sensorType in config.
     }
 
     discoverDevices(): void {
         this.log.info('Discovering OpenWebNet devices from config');
 
         // HAP category codes hardcoded (Categories is a const enum — no runtime object):
-        // 5=Lightbulb, 7=Outlet, 8=Switch, 9=Thermostat, 10=Sensor, 14=WindowCovering, 15=ProgrammableSwitch
+        // 5=Lightbulb, 6=DoorLock, 7=Outlet, 8=Switch, 9=Thermostat, 10=Sensor, 14=WindowCovering, 15=ProgrammableSwitch
         function deviceCategory(d: { type: string } & Record<string, unknown>): number {
             if (d.type === 'scenario' && d.asButton) return 15;
             if (d.type === 'energy'   && d.asOutlet) return 7;
             const base: Record<string, number> = {
-                light: 5, blind: 14, thermostat: 9, scenario: 8, contact: 10, energy: 10,
+                light: 5, blind: 14, thermostat: 9, scenario: 8, contact: 10, energy: 10, door: 6,
             };
             return base[d.type] ?? 1;
         }
@@ -189,6 +191,7 @@ export class OwnPlatform implements DynamicPlatformPlugin {
             ...(this.config.scenarios ?? []).map((d: ScenarioConfig) => ({ ...d, type: 'scenario' as const })),
             ...(this.config.contacts ?? []).map((d: ContactConfig) => ({ ...d, type: 'contact' as const })),
             ...(this.config.energies ?? []).map((d: EnergyConfig) => ({ ...d, type: 'energy' as const })),
+            ...(this.config.doors ?? []).map((d: DoorConfig) => ({ ...d, type: 'door' as const })),
         ];
 
         const discoveredUUIDs: string[] = [];
@@ -247,6 +250,10 @@ export class OwnPlatform implements DynamicPlatformPlugin {
     }
 
     createHandler(type: string, accessory: PlatformAccessory, config: Record<string, unknown>): void {
+        if (!isValidConfig(config)) {
+            this.log.warn('createHandler: invalid config for type "%s" — skipping (%j)', type, config);
+            return;
+        }
         const platform = this as unknown as OwnPlatformLike;
         let handler: AnyAccessory | undefined;
         switch (type) {
@@ -256,6 +263,10 @@ export class OwnPlatform implements DynamicPlatformPlugin {
             case 'scenario': handler = new OwnScenarioAccessory(platform, accessory, config as unknown as ScenarioConfig); break;
             case 'contact': handler = new OwnContactAccessory(platform, accessory, config as unknown as ContactConfig); break;
             case 'energy': handler = new OwnEnergyAccessory(platform, accessory, config as unknown as EnergyConfig); break;
+            case 'door': handler = new OwnDoorAccessory(platform, accessory, config as unknown as DoorConfig); break;
+            default:
+                this.log.warn('createHandler: unknown device type "%s" — skipping', type);
+                return;
         }
         if (handler) this.activeHandlers.push(handler);
     }
@@ -269,6 +280,7 @@ export class OwnPlatform implements DynamicPlatformPlugin {
                 case WHO.temperature:
                 case WHO.auxiliary:
                 case WHO.energy:
+                case WHO.videoDoor:
                     this.onAccessory(info.where, packet);
                     break;
                 case WHO.gateway:
@@ -278,7 +290,6 @@ export class OwnPlatform implements DynamicPlatformPlugin {
                 case WHO.CEN:
                 case WHO.load:
                 case WHO.alarm:
-                case WHO.videoDoor:
                 case WHO.scene:
                 case WHO.soundSystem:
                 case WHO.soundDiffusion:

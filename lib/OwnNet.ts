@@ -1,7 +1,7 @@
 import { EventEmitter } from 'events';
 import * as net from 'net';
 import type { Logging } from 'homebridge';
-import { errorMessage } from './utils';
+import { errorMessage, COMMAND_QUEUE_CAPACITY, COMMAND_TIMEOUT_MS } from './utils';
 
 export const STATE = {
     UNCONNECTED: 'UNCONNECTED',
@@ -204,8 +204,12 @@ export class OwnConnection extends EventEmitter {
                         this.emit('connected');
                         this.state = STATE.CONNECTED;
                         this.log.debug('conn:%s start unauthenticated connection', this.id);
+                    } else if (packet === PKT.NACK) {
+                        this.log.error('conn:%s Gateway rejected session type (NACK) — gateway may be busy or out of slots', this.id);
+                        this.state = STATE.UNCONNECTED;
+                        this.end();
                     } else {
-                        const loginMatch = packet.match(/\*#(\d+)##/);
+                        const loginMatch = packet.match(/^\*#(\d+)##$/);
                         if (loginMatch === null) {
                             this.log.error("conn:%s Unable to recognize packet '%s'", this.id, packet);
                         } else {
@@ -396,7 +400,7 @@ export class OwnClient extends EventEmitter {
     }
 
     sendCommand(params: CommandParams): boolean {
-        if (this.commandQueue.length >= 50) {
+        if (this.commandQueue.length >= COMMAND_QUEUE_CAPACITY) {
             this.log.warn('Command queue full (%d), dropping: %s', this.commandQueue.length, params.command);
             return false;
         }
@@ -439,7 +443,7 @@ export class OwnClient extends EventEmitter {
                     commandconn.log.debug('conn:%s command timeout', commandconn.id);
                     commandconn.end();
                     releaseSlot(true);
-                }, 10000);
+                }, COMMAND_TIMEOUT_MS);
             });
             commandconn.on('packet', (packet: string) => {
                 const done = (pkt: string, index: number) => {

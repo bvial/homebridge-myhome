@@ -114,6 +114,8 @@ export function makeMockPlatform() {
         CarbonMonoxideSensor: 'CarbonMonoxideSensor',
         StatelessProgrammableSwitch: 'StatelessProgrammableSwitch',
         Outlet: 'Outlet',
+        LockMechanism: 'LockMechanism',
+        Doorbell: 'Doorbell',
     };
 
     const Characteristic = {
@@ -145,6 +147,8 @@ export function makeMockPlatform() {
         LeakDetected: 'LeakDetected',
         SmokeDetected: 'SmokeDetected',
         CarbonMonoxideDetected: 'CarbonMonoxideDetected',
+        LockCurrentState: Object.assign('LockCurrentState', { UNSECURED: 0, SECURED: 1, JAMMED: 2, UNKNOWN: 3 }),
+        LockTargetState: Object.assign('LockTargetState', { UNSECURED: 0, SECURED: 1 }),
         ProgrammableSwitchEvent: Object.assign('ProgrammableSwitchEvent', { SINGLE_PRESS: 0 }),
     };
 
@@ -156,7 +160,12 @@ export function makeMockPlatform() {
         Service: Service as unknown as OwnPlatformLike['Service'],
         Characteristic: Characteristic as unknown as OwnPlatformLike['Characteristic'],
         HapStatusError: function (this: { code: number }, code: number) { this.code = code; } as unknown as new (status: number) => Error,
-        HAPStatus: { NOT_ALLOWED_IN_CURRENT_STATE: -70412, SERVICE_COMMUNICATION_FAILURE: -70402 } as unknown as OwnPlatformLike['HAPStatus'],
+        HAPStatus: {
+            NOT_ALLOWED_IN_CURRENT_STATE: -70412,
+            SERVICE_COMMUNICATION_FAILURE: -70402,
+            RESOURCE_BUSY: -70403,
+            OPERATION_TIMED_OUT: -70408,
+        } as unknown as OwnPlatformLike['HAPStatus'],
         sendCommandSpy: sendCommandSpy,
     };
 }

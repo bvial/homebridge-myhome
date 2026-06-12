@@ -20,13 +20,24 @@
                 "title": "MyHome server port",
                 "type": "integer",
                 "required": false,
+                "minimum": 1,
+                "maximum": 65535,
                 "default": 20000
             },
             "password": {
                 "title": "MyHome server password",
                 "type": "string",
                 "required": false,
-                "default": ""
+                "default": "",
+                "description": "Numeric password for OWN authentication (decimal integer; leave empty if no password)"
+            },
+            "maxConcurrent": {
+                "title": "Max concurrent commands",
+                "description": "Optional override for the max simultaneous TCP command connections (1–10). If omitted the plugin queries the gateway model and sets it automatically.",
+                "type": "integer",
+                "required": false,
+                "minimum": 1,
+                "maximum": 10
             },
             "lights": {
                 "title": "Lights",
@@ -38,7 +49,8 @@
                         "id": {
                             "title": "id",
                             "type": "integer",
-                            "required": true
+                            "required": true,
+                            "minimum": 1
                         },
                         "name": {
                             "title": "Name",
@@ -65,7 +77,8 @@
                         "id": {
                             "title": "id",
                             "type": "integer",
-                            "required": true
+                            "required": true,
+                            "minimum": 1
                         },
                         "name": {
                             "title": "Name",
@@ -76,13 +89,15 @@
                             "title": "Travel time (s)",
                             "description": "Time in seconds for full linear travel (up or down)",
                             "type": "integer",
-                            "required": true
+                            "required": true,
+                            "minimum": 1
                         },
                         "timeSlat": {
                             "title": "Slat rotation time (s)",
                             "description": "Additional time in seconds for slat rotation (venetian blinds only, leave 0 for roller blinds)",
                             "type": "integer",
                             "required": false,
+                            "minimum": 0,
                             "default": 0
                         },
                         "slatPercent": {
@@ -90,6 +105,8 @@
                             "description": "Position (%) below which slat rotation occurs. E.g. 10 means: 10%=blind down slats open, 0%=fully closed. Leave 0 for roller blinds.",
                             "type": "integer",
                             "required": false,
+                            "minimum": 0,
+                            "maximum": 100,
                             "default": 0
                         }
                     }
@@ -105,12 +122,14 @@
                         "id": {
                             "title": "id",
                             "type": "integer",
-                            "required": true
+                            "required": true,
+                            "minimum": 1
                         },
                         "zone": {
                             "title": "zone",
                             "type": "integer",
-                            "required": true
+                            "required": true,
+                            "minimum": 1
                         },
                         "name": {
                             "title": "Name",
@@ -131,7 +150,8 @@
                             "title": "id",
                             "description": "Scenario number (WHO=0)",
                             "type": "integer",
-                            "required": true
+                            "required": true,
+                            "minimum": 1
                         },
                         "name": {
                             "title": "Name",
@@ -159,7 +179,8 @@
                             "title": "id",
                             "description": "Auxiliary/dry contact address (WHO=9)",
                             "type": "integer",
-                            "required": true
+                            "required": true,
+                            "minimum": 1
                         },
                         "name": {
                             "title": "Name",
@@ -195,7 +216,8 @@
                             "title": "id",
                             "description": "Energy meter address (WHO=18)",
                             "type": "integer",
-                            "required": true
+                            "required": true,
+                            "minimum": 1
                         },
                         "name": {
                             "title": "Name",
@@ -205,6 +227,41 @@
                         "asOutlet": {
                             "title": "Expose as outlet",
                             "description": "Use Outlet service with Eve Consumption characteristic instead of LightSensor lux-hack (better Eve.app support)",
+                            "type": "boolean",
+                            "required": false,
+                            "default": false
+                        }
+                    }
+                }
+            },
+            "doors": {
+                "title": "Door / Video Door (intercom)",
+                "buttonText": "Add door",
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "id": {
+                            "title": "id",
+                            "description": "Door entry / video door address (WHO=7)",
+                            "type": "integer",
+                            "required": true,
+                            "minimum": 1
+                        },
+                        "name": {
+                            "title": "Name",
+                            "type": "string",
+                            "required": false
+                        },
+                        "openCommand": {
+                            "title": "OWN open command",
+                            "description": "OWN command to send to release the door (defaults to *7*19*<id>##)",
+                            "type": "string",
+                            "required": false
+                        },
+                        "doorbell": {
+                            "title": "Expose as Doorbell too",
+                            "description": "Adds a linked Doorbell service that fires SINGLE_PRESS when an incoming call is received on the bus",
                             "type": "boolean",
                             "required": false,
                             "default": false

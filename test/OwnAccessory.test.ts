@@ -10,6 +10,7 @@ import {
     OwnScenarioAccessory,
     OwnContactAccessory,
     OwnEnergyAccessory,
+    OwnDoorAccessory,
 } from '../lib/OwnAccessory';
 
 type P = OwnPlatformLike;
@@ -135,6 +136,22 @@ describe('OwnLightAccessory', () => {
         handler.setOnline(false);
         handler.setOnline(true);
         assert.equal(svc.characteristics['StatusFault'].value, 0);
+    });
+
+    it('identify event triggers blink command sequence', (_t, done) => {
+        platform.sendCommandSpy.calls.length = 0;
+        handler.value = true;
+        accessory.emit('identify', false);
+        // Initial OFF immediate
+        const cmds1 = platform.sendCommandSpy.calls.map((c: unknown[]) => (c[0] as { command: string }).command);
+        assert.ok(cmds1.includes('*1*0*42##'), 'initial OFF must be sent');
+        // Restore happens after IDENTIFY_BLINK_MS (500ms)
+        setTimeout(() => {
+            const cmds2 = platform.sendCommandSpy.calls.map((c: unknown[]) => (c[0] as { command: string }).command);
+            assert.ok(cmds2.includes('*1*1*42##'), 'restore ON must be sent after blink');
+            handler.destroy();
+            done();
+        }, 600);
     });
 });
 
@@ -1140,5 +1157,61 @@ describe('OwnEnergyAccessory', () => {
         const wattsBefore = handler.watts;
         handler.onData('*#18*71*113*999##');
         assert.equal(handler.watts, wattsBefore, 'onData must not mutate state after destroy');
+    });
+});
+
+
+describe("OwnDoorAccessory", () => {
+    let platform: ReturnType<typeof makeMockPlatform>;
+    let accessory: ReturnType<typeof makeMockAccessory>;
+    let handler: OwnDoorAccessory;
+    beforeEach(() => {
+        platform = makeMockPlatform();
+        accessory = makeMockAccessory();
+        accessory.addService("AccessoryInformation");
+        handler = new OwnDoorAccessory(platform as unknown as P, accessory as unknown as A, { id: 91, name: "front-door" });
+    });
+    afterEach(() => { handler.destroy(); });
+
+    it("creates LockMechanism service", () => {
+        assert.ok(accessory.services["LockMechanism"]);
+    });
+
+    it("LockTargetState UNSECURED sends open command and reverts after 3s", () => {
+        const svc = accessory.services["LockMechanism"];
+        platform.sendCommandSpy.calls.length = 0;
+        svc.characteristics["LockTargetState"].setter!(0); // UNSECURED
+        const cmds = platform.sendCommandSpy.calls.map((c: unknown[]) => (c[0] as { command: string }).command);
+        assert.ok(cmds.includes("*7*19*91##"), "expected default door open command, got: " + cmds.join(", "));
+        assert.equal(svc.characteristics["LockCurrentState"].value, 0, "current state should be UNSECURED");
+    });
+
+    it("custom openCommand is sent when configured", () => {
+        const p = makeMockPlatform();
+        const a = makeMockAccessory();
+        a.addService("AccessoryInformation");
+        const h = new OwnDoorAccessory(p as unknown as P, a as unknown as A, { id: 92, openCommand: "*7*40*92##" });
+        const svc = a.services["LockMechanism"];
+        p.sendCommandSpy.calls.length = 0;
+        svc.characteristics["LockTargetState"].setter!(0);
+        const cmds = p.sendCommandSpy.calls.map((c: unknown[]) => (c[0] as { command: string }).command);
+        assert.ok(cmds.includes("*7*40*92##"));
+        h.destroy();
+    });
+
+    it("doorbell:true creates linked Doorbell service and fires SINGLE_PRESS on incoming ring packet", () => {
+        const p = makeMockPlatform();
+        const a = makeMockAccessory();
+        a.addService("AccessoryInformation");
+        const h = new OwnDoorAccessory(p as unknown as P, a as unknown as A, { id: 93, doorbell: true });
+        assert.ok(a.services["Doorbell"], "Doorbell service must be created");
+        h.onData("*7*8*93##");
+        assert.equal(a.services["Doorbell"].characteristics["ProgrammableSwitchEvent"].value, 0, "SINGLE_PRESS must fire on ring");
+        h.destroy();
+    });
+
+    it("checkWhere matches numeric id", () => {
+        assert.ok(handler.checkWhere("91"));
+        assert.ok(!handler.checkWhere("92"));
     });
 });

@@ -7,6 +7,7 @@ import {
     ownLevelToBrightness,
     errorMessage,
     IDENTIFY_BLINK_MS,
+    IDENTIFY_JOG_MS,
     SCENARIO_RESET_MS,
     BLIND_MOVE_RETRY_INTERVAL_MS,
     BLIND_MAX_MOVE_RETRIES,
@@ -14,6 +15,7 @@ import {
     BLIND_ECHO_GRACE_WINDOW_MS,
     BLIND_INIT_CALIBRATION_MARGIN_MS,
     BLIND_QUEUE_BUSY_THRESHOLD,
+    BLIND_MIN_TICK_MS,
     ENERGY_POLL_INTERVAL_MS,
     ENERGY_POLL_QUEUE_THRESHOLD,
     ENERGY_OUTLET_IN_USE_THRESHOLD_W,
@@ -57,6 +59,10 @@ export interface ContactConfig extends BaseConfig {
 export interface EnergyConfig extends BaseConfig {
     asOutlet?: boolean;
 }
+export interface DoorConfig extends BaseConfig {
+    openCommand?: string;
+    doorbell?: boolean;
+}
 
 class OwnAccessory {
     protected log: Logging;
@@ -69,6 +75,8 @@ class OwnAccessory {
     name: string;
     protected id: number;
     protected fault = false;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    private charWarningListener: ((warning: any) => void) | undefined;
 
     constructor(platform: OwnPlatformLike, accessory: PlatformAccessory, config: BaseConfig) {
         this.log = platform.log;
@@ -107,10 +115,11 @@ class OwnAccessory {
         const accAny = this.accessory as any;
         if (typeof accAny.on === 'function') {
             try {
-                accAny.on('characteristic-warning', (warning: { type: string; message: string; characteristic?: { displayName?: string } }) => {
+                this.charWarningListener = (warning: { type: string; message: string; characteristic?: { displayName?: string } }) => {
                     const charName = warning.characteristic?.displayName ?? '?';
                     this.log.warn('[%s] HAP warn (%s) on %s: %s', this.id, warning.type, charName, warning.message);
-                });
+                };
+                accAny.on('characteristic-warning', this.charWarningListener);
             } catch {
                 // older HAP versions don't emit this event — silently ignore
             }
@@ -196,7 +205,17 @@ class OwnAccessory {
 
     setOnline(_online: boolean): void {}
 
-    destroy(): void {}
+    destroy(): void {
+        // Best-effort listener cleanup — accessory is unregistered shortly after destroy(),
+        // but explicit removal documents intent and prevents leaks if the object survives.
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const accAny = this.accessory as any;
+        if (this.charWarningListener && typeof accAny.off === 'function') {
+            try { accAny.off('characteristic-warning', this.charWarningListener); } catch { /* ignore */ }
+        }
+        this.charWarningListener = undefined;
+        this.accessory.removeAllListeners('identify');
+    }
 }
 
 export class OwnLightAccessory extends OwnAccessory {
@@ -204,6 +223,7 @@ export class OwnLightAccessory extends OwnAccessory {
     dimmer: boolean;
     brightness: number;
     private lightbulbService: InstanceType<typeof Service>;
+    private identifyTimeout: ReturnType<typeof setTimeout> | undefined;
 
     constructor(platform: OwnPlatformLike, accessory: PlatformAccessory, config: LightConfig) {
         if (!config.name) config.name = `light-${config.id}`;
@@ -212,13 +232,16 @@ export class OwnLightAccessory extends OwnAccessory {
         this.value = false;
         this.dimmer = config.dimmer ?? false;
         this.brightness = 100;
+        this.identifyTimeout = undefined;
 
         this.accessory.removeAllListeners('identify');
         this.accessory.on('identify', () => {
             this.log.info(`[${this.id}] Identify — blink`);
             const wasOn = this.value;
             this.controller.sendCommand({ command: `*1*0*${this.id}##`, log: this.log });
-            setTimeout(() => {
+            clearTimeout(this.identifyTimeout);
+            this.identifyTimeout = setTimeout(() => {
+                this.identifyTimeout = undefined;
                 if (wasOn) this.controller.sendCommand({ command: `*1*1*${this.id}##`, log: this.log });
             }, IDENTIFY_BLINK_MS);
         });
@@ -296,6 +319,11 @@ export class OwnLightAccessory extends OwnAccessory {
             this.log.error('[%s] Light unknown packet:%s', this.id, packet);
         }
     }
+
+    destroy(): void {
+        clearTimeout(this.identifyTimeout);
+        super.destroy();
+    }
 }
 
 export class OwnBlindAccessory extends OwnAccessory {
@@ -317,6 +345,7 @@ export class OwnBlindAccessory extends OwnAccessory {
     private inStatusQuery: boolean;
     private statusQueryTimeout: ReturnType<typeof setTimeout> | undefined;
     private initTimeout: ReturnType<typeof setTimeout> | undefined;
+    private identifyJogTimeout: ReturnType<typeof setTimeout> | undefined;
     private windowCoveringService: InstanceType<typeof Service>;
 
     constructor(platform: OwnPlatformLike, accessory: PlatformAccessory, config: BlindConfig) {
@@ -384,7 +413,11 @@ export class OwnBlindAccessory extends OwnAccessory {
         this.accessory.on('identify', () => {
             this.log.info(`[${this.id}] Identify — jog`);
             this.moveUp();
-            setTimeout(() => this.moveStop(), 1000);
+            clearTimeout(this.identifyJogTimeout);
+            this.identifyJogTimeout = setTimeout(() => {
+                this.identifyJogTimeout = undefined;
+                this.moveStop();
+            }, IDENTIFY_JOG_MS);
         });
     }
 
@@ -539,7 +572,7 @@ export class OwnBlindAccessory extends OwnAccessory {
                 return;
             }
             this.windowCoveringService.updateCharacteristic(this.Characteristic.PositionState, this.state);
-            this.log.info(`[${this.id}] received state dir:${direction} position:${this.position} target:${this.target}`);
+            this.log.debug(`[${this.id}] received state dir:${direction} position:${this.position} target:${this.target}`);
 
             if (this.commandIsPending() && this.expectedState === this.state) {
                 this.log.info(`[${this.id}] expected state ${this.expectedState} reached`);
@@ -575,7 +608,7 @@ export class OwnBlindAccessory extends OwnAccessory {
         } else if (this.state === this.Characteristic.PositionState.INCREASING) {
             if (this.position < 100) this.position++;
             if (this.position % 10 === 0 || this.position >= this.target)
-                this.log.info(`[${this.id}] Blind moving UP pos:${this.position} target:${this.target}`);
+                this.log.debug(`[${this.id}] Blind moving UP pos:${this.position} target:${this.target}`);
             if (this.homeKitMovement && this.position >= this.target) {
                 this.moveStop();
             } else if (!this.homeKitMovement && this.position >= 100) {
@@ -586,7 +619,7 @@ export class OwnBlindAccessory extends OwnAccessory {
         } else if (this.state === this.Characteristic.PositionState.DECREASING) {
             if (this.position > 0) this.position--;
             if (this.position % 10 === 0 || this.position <= this.target)
-                this.log.info(`[${this.id}] Blind moving DOWN pos:${this.position} target:${this.target}`);
+                this.log.debug(`[${this.id}] Blind moving DOWN pos:${this.position} target:${this.target}`);
             if (!this.initPhase && this.homeKitMovement && this.position <= this.target) {
                 this.moveStop();
             } else if (this.initPhase && this.position === 0) {
@@ -602,7 +635,7 @@ export class OwnBlindAccessory extends OwnAccessory {
 
     msPerPercent(position: number): number {
         if (this.slatPercent > 0 && position < this.slatPercent) {
-            return Math.max(50, (this.timeSlat / this.slatPercent) * 1000);
+            return Math.max(BLIND_MIN_TICK_MS, (this.timeSlat / this.slatPercent) * 1000);
         }
         return (this.time / Math.max(1, 100 - this.slatPercent)) * 1000;
     }
@@ -680,6 +713,8 @@ export class OwnBlindAccessory extends OwnAccessory {
 
     destroy(): void {
         this.stopMoveTracking();
+        clearTimeout(this.identifyJogTimeout);
+        super.destroy();
     }
 }
 
@@ -726,8 +761,9 @@ export class OwnThermostatAccessory extends OwnAccessory {
         this.thermostatService.getCharacteristic(this.Characteristic.CurrentHeatingCoolingState)
             .onGet(() => this.heatingCoolingState);
 
+        const TargetState = this.Characteristic.TargetHeatingCoolingState;
         this.thermostatService.getCharacteristic(this.Characteristic.TargetHeatingCoolingState)
-            .setProps({ validValues: [0, 1, 2, 3] })
+            .setProps({ validValues: [TargetState.OFF, TargetState.HEAT, TargetState.COOL, TargetState.AUTO] })
             .onGet(() => this.targetHeatingCoolingState)
             .onSet((value: CharacteristicValue) => {
                 this.log.info(`[${this.id}] zone[${this.zone}] setTargetHeatingCoolingState:${value}`);
@@ -757,7 +793,7 @@ export class OwnThermostatAccessory extends OwnAccessory {
             });
 
         this.thermostatService.getCharacteristic(this.Characteristic.CurrentTemperature)
-            .setProps({ minValue: -50, maxValue: 50 })
+            .setProps({ minValue: -50, maxValue: 50, minStep: 0.1 })
             .onGet(() => this.temperature);
 
         this.thermostatService.getCharacteristic(this.Characteristic.TargetTemperature)
@@ -980,17 +1016,20 @@ export class OwnScenarioAccessory extends OwnAccessory {
 
     onData(_packet: string): void {}
     checkWhere(_where: string): boolean { return false; }
-    destroy(): void { clearTimeout(this.resetTimeout); }
+    destroy(): void {
+        clearTimeout(this.resetTimeout);
+        super.destroy();
+    }
 }
+
+type SensorTypeKey = 'contact' | 'motion' | 'occupancy' | 'leak' | 'smoke' | 'co';
 
 export class OwnContactAccessory extends OwnAccessory {
     contactState: number;
-    private sensorType: 'contact' | 'motion' | 'occupancy' | 'leak' | 'smoke' | 'co';
+    private sensorType: SensorTypeKey;
     private sensorService: InstanceType<typeof Service>;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     private stateChar: any;
-
-    private static readonly SENSOR_TYPES = ['contact', 'motion', 'occupancy', 'leak', 'smoke', 'co'] as const;
 
     constructor(platform: OwnPlatformLike, accessory: PlatformAccessory, config: ContactConfig) {
         if (!config.name) config.name = `contact-${config.id}`;
@@ -999,64 +1038,32 @@ export class OwnContactAccessory extends OwnAccessory {
         this.sensorType = config.sensorType ?? 'contact';
         this.contactState = this.Characteristic.ContactSensorState.CONTACT_DETECTED;
 
-        // Pick the appropriate HomeKit service based on the sensor type
-        let serviceClass: typeof Service;
-        let modelName: string;
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        let stateCharacteristicClass: any;
-        switch (this.sensorType) {
-            case 'motion':
-                serviceClass = this.Service.MotionSensor;
-                modelName = 'MotionSensor';
-                stateCharacteristicClass = this.Characteristic.MotionDetected;
-                break;
-            case 'occupancy':
-                serviceClass = this.Service.OccupancySensor;
-                modelName = 'OccupancySensor';
-                stateCharacteristicClass = this.Characteristic.OccupancyDetected;
-                break;
-            case 'leak':
-                serviceClass = this.Service.LeakSensor;
-                modelName = 'LeakSensor';
-                stateCharacteristicClass = this.Characteristic.LeakDetected;
-                break;
-            case 'smoke':
-                serviceClass = this.Service.SmokeSensor;
-                modelName = 'SmokeSensor';
-                stateCharacteristicClass = this.Characteristic.SmokeDetected;
-                break;
-            case 'co':
-                serviceClass = this.Service.CarbonMonoxideSensor;
-                modelName = 'CarbonMonoxideSensor';
-                stateCharacteristicClass = this.Characteristic.CarbonMonoxideDetected;
-                break;
-            default:
-                serviceClass = this.Service.ContactSensor;
-                modelName = 'ContactSensor';
-                stateCharacteristicClass = this.Characteristic.ContactSensorState;
-        }
+        // Single mapping table: sensor type → (HAP service, model name, state characteristic).
+        // Adding a new sensor type is a one-line entry here.
+        const SENSOR_MAP: Record<SensorTypeKey, { svc: typeof Service; model: string; char: unknown }> = {
+            contact:   { svc: this.Service.ContactSensor,         model: 'ContactSensor',         char: this.Characteristic.ContactSensorState },
+            motion:    { svc: this.Service.MotionSensor,          model: 'MotionSensor',          char: this.Characteristic.MotionDetected },
+            occupancy: { svc: this.Service.OccupancySensor,       model: 'OccupancySensor',       char: this.Characteristic.OccupancyDetected },
+            leak:      { svc: this.Service.LeakSensor,            model: 'LeakSensor',            char: this.Characteristic.LeakDetected },
+            smoke:     { svc: this.Service.SmokeSensor,           model: 'SmokeSensor',           char: this.Characteristic.SmokeDetected },
+            co:        { svc: this.Service.CarbonMonoxideSensor,  model: 'CarbonMonoxideSensor',  char: this.Characteristic.CarbonMonoxideDetected },
+        };
+        const cfg = SENSOR_MAP[this.sensorType];
 
         // Remove stale sensor services if sensorType changed across restarts
-        const sensorServiceMap: Record<typeof OwnContactAccessory.SENSOR_TYPES[number], typeof Service> = {
-            contact: this.Service.ContactSensor,
-            motion: this.Service.MotionSensor,
-            occupancy: this.Service.OccupancySensor,
-            leak: this.Service.LeakSensor,
-            smoke: this.Service.SmokeSensor,
-            co: this.Service.CarbonMonoxideSensor,
-        };
-        for (const t of OwnContactAccessory.SENSOR_TYPES) {
+        for (const t of Object.keys(SENSOR_MAP) as SensorTypeKey[]) {
             if (t !== this.sensorType) {
                 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-                const stale = this.accessory.getService(sensorServiceMap[t] as any);
+                const stale = this.accessory.getService(SENSOR_MAP[t].svc as any);
                 if (stale) this.accessory.removeService(stale);
             }
         }
 
-        this.sensorService = this.initPrimaryService(serviceClass, modelName, true, true);
-        this.stateChar = stateCharacteristicClass;
+        this.sensorService = this.initPrimaryService(cfg.svc, cfg.model, true, true);
+        this.stateChar = cfg.char;
 
-        this.sensorService.getCharacteristic(stateCharacteristicClass)
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        this.sensorService.getCharacteristic(cfg.char as any)
             .onGet(() => this.mapStateForSensor(this.contactState));
     }
 
@@ -1162,6 +1169,8 @@ export class OwnEnergyAccessory extends OwnAccessory {
     destroy(): void {
         this.destroyed = true;
         clearInterval(this.pollInterval);
+        this.eveWattsChar = null;
+        super.destroy();
     }
 
     updateStatus(): void {
@@ -1195,3 +1204,81 @@ export class OwnEnergyAccessory extends OwnAccessory {
         }
     }
 }
+
+export class OwnDoorAccessory extends OwnAccessory {
+    private openCommand: string;
+    private doorbellEnabled: boolean;
+    private lockService: InstanceType<typeof Service>;
+    private doorbellService: InstanceType<typeof Service> | null;
+    private resetTimeout: ReturnType<typeof setTimeout> | undefined;
+
+    constructor(platform: OwnPlatformLike, accessory: PlatformAccessory, config: DoorConfig) {
+        if (!config.name) config.name = `door-${config.id}`;
+        super(platform, accessory, config);
+
+        this.openCommand = config.openCommand ?? `*7*19*${this.id}##`;
+        this.doorbellEnabled = config.doorbell ?? false;
+        this.resetTimeout = undefined;
+        this.doorbellService = null;
+
+        this.lockService = this.initPrimaryService(this.Service.LockMechanism, 'Door', true);
+
+        // LockCurrentState: always SECURED until activated, briefly UNSECURED on open
+        this.lockService.getCharacteristic(this.Characteristic.LockCurrentState)
+            .onGet(() => this.Characteristic.LockCurrentState.SECURED);
+
+        this.lockService.getCharacteristic(this.Characteristic.LockTargetState)
+            .onGet(() => this.Characteristic.LockTargetState.SECURED)
+            .onSet((value: CharacteristicValue) => {
+                if (value === this.Characteristic.LockTargetState.UNSECURED) {
+                    this.log.info(`[${this.id}] Door open`);
+                    this.sendOrThrow(this.openCommand);
+                    this.lockService.updateCharacteristic(this.Characteristic.LockCurrentState,
+                        this.Characteristic.LockCurrentState.UNSECURED);
+                    clearTimeout(this.resetTimeout);
+                    this.resetTimeout = setTimeout(() => {
+                        this.lockService.updateCharacteristic(this.Characteristic.LockTargetState,
+                            this.Characteristic.LockTargetState.SECURED);
+                        this.lockService.updateCharacteristic(this.Characteristic.LockCurrentState,
+                            this.Characteristic.LockCurrentState.SECURED);
+                    }, 3000);
+                }
+            });
+
+        if (this.doorbellEnabled) {
+            this.doorbellService = this.accessory.getService(this.Service.Doorbell)
+                ?? this.accessory.addService(this.Service.Doorbell, `${this.name} Doorbell`, 'doorbell');
+            this.doorbellService.getCharacteristic(this.Characteristic.ProgrammableSwitchEvent)
+                .setProps({ validValues: [this.Characteristic.ProgrammableSwitchEvent.SINGLE_PRESS] });
+            this.lockService.addLinkedService(this.doorbellService);
+        } else {
+            // Remove a previously-registered Doorbell service if config flipped
+            const existing = this.accessory.getService(this.Service.Doorbell);
+            if (existing) this.accessory.removeService(existing);
+        }
+    }
+
+    setOnline(online: boolean): void {
+        this.setFaultOnline(this.lockService, online);
+    }
+
+    onData(packet: string): void {
+        // WHO=7 monitor packets vary by gateway model. The most common ring event is *7*<event>*<id>##.
+        // We accept any *7*…*<id>## packet as a doorbell ring when doorbell mode is enabled.
+        if (!this.doorbellEnabled || !this.doorbellService) return;
+        const m = packet.match(/^\*7\*(\d+)\*(\d+)##$/);
+        if (m && parseInt(m[2], 10) === this.id) {
+            this.log.info(`[${this.id}] Doorbell ring (event=${m[1]})`);
+            this.doorbellService.updateCharacteristic(
+                this.Characteristic.ProgrammableSwitchEvent,
+                this.Characteristic.ProgrammableSwitchEvent.SINGLE_PRESS,
+            );
+        }
+    }
+
+    destroy(): void {
+        clearTimeout(this.resetTimeout);
+        super.destroy();
+    }
+}
+

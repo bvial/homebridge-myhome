@@ -36,6 +36,8 @@ export function ownLevelToBrightness(level: number): number {
 
 /** Brightness blink for Light.identify */
 export const IDENTIFY_BLINK_MS = 500;
+/** Blind jog duration for identify (UP for Nms then STOP) */
+export const IDENTIFY_JOG_MS = 1000;
 /** Scenario auto-reset window (Switch fallback) */
 export const SCENARIO_RESET_MS = 500;
 /** Blind move() retry interval when a command is still pending */
@@ -48,8 +50,14 @@ export const BLIND_COMMAND_ECHO_TIMEOUT_MS = 1000;
 export const BLIND_ECHO_GRACE_WINDOW_MS = 300;
 /** Margin added to (time + timeSlat) for the init calibration timer */
 export const BLIND_INIT_CALIBRATION_MARGIN_MS = 1000;
+/** Minimum interval between blind position ticks (slat zone floor) */
+export const BLIND_MIN_TICK_MS = 50;
 /** TargetPosition queue-full guard threshold */
 export const BLIND_QUEUE_BUSY_THRESHOLD = 50;
+/** Hard cap on the OwnClient command queue (sendCommand returns false above this) */
+export const COMMAND_QUEUE_CAPACITY = 50;
+/** Per-command TCP connection timeout (gateway must ACK within this window) */
+export const COMMAND_TIMEOUT_MS = 10_000;
 /** Energy meter polling interval */
 export const ENERGY_POLL_INTERVAL_MS = 30_000;
 /** Energy meter polling skip threshold (queue depth) */
@@ -60,3 +68,15 @@ export const ENERGY_OUTLET_IN_USE_THRESHOLD_W = 1;
 export const ENERGY_MIN_LIGHT_LEVEL = 0.0001;
 /** Stagger delay between consecutive accessory status fetches at startup */
 export const STATUS_UPDATE_STAGGER_MS = 200;
+
+/**
+ * Verify that a value is a valid accessory config object (positive integer id, optional string name).
+ * Used to validate accessory.context.device after JSON round-trip.
+ */
+export function isValidConfig(c: unknown): c is { id: number; name?: string } {
+    if (typeof c !== 'object' || c === null) return false;
+    const obj = c as Record<string, unknown>;
+    if (typeof obj.id !== 'number' || !Number.isInteger(obj.id) || obj.id <= 0) return false;
+    if (obj.name !== undefined && typeof obj.name !== 'string') return false;
+    return true;
+}

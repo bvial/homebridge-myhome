@@ -42,6 +42,10 @@ function makeAccessoryStub(name: string, uuid: string): PlatformAccessory {
         context: {},
         getService: (svc: string) => services[svc] ?? null,
         addService: (svc: string) => addSvc(svc),
+        removeService: (svc: { name?: string } | string) => {
+            const key = typeof svc === 'string' ? svc : svc.name ?? '';
+            delete services[key];
+        },
         on: (event: string, cb: (...args: unknown[]) => void) => {
             if (!listeners[event]) listeners[event] = [];
             listeners[event].push(cb);
@@ -83,8 +87,17 @@ function makeMockApi(): MockApi {
                 Thermostat: 'Thermostat',
                 Switch: 'Switch',
                 ContactSensor: 'ContactSensor',
+                MotionSensor: 'MotionSensor',
+                OccupancySensor: 'OccupancySensor',
+                LeakSensor: 'LeakSensor',
+                SmokeSensor: 'SmokeSensor',
+                CarbonMonoxideSensor: 'CarbonMonoxideSensor',
                 LightSensor: 'LightSensor',
                 TemperatureSensor: 'TemperatureSensor',
+                StatelessProgrammableSwitch: 'StatelessProgrammableSwitch',
+                Outlet: 'Outlet',
+                LockMechanism: 'LockMechanism',
+                Doorbell: 'Doorbell',
             },
             Characteristic: makeMockPlatform().Characteristic,
         },
@@ -170,6 +183,46 @@ describe('OwnPlatform.discoverDevices', () => {
         platform.discoverDevices();
         assert.equal(platform.activeHandlers.length, 6);
         assert.equal(api.registered.length, 6);
+        for (const h of platform.activeHandlers) h.destroy();
+    });
+
+    it('assigns category 15 (PROGRAMMABLE_SWITCH) for asButton scenario', () => {
+        const api = makeMockApi();
+        const platform = makePlatformInstance({
+            host: '127.0.0.1',
+            scenarios: [{ id: 1, name: 'btn', asButton: true }],
+        }, api);
+        platform.discoverDevices();
+        // accessory.category is set on the new accessory before register
+        const registered = api.registered[0]?.[2] as Array<{ category: number }> | undefined;
+        assert.ok(registered, 'expected an accessory to be registered');
+        assert.equal(registered[0].category, 15, 'asButton scenario should have category PROGRAMMABLE_SWITCH (15)');
+        for (const h of platform.activeHandlers) h.destroy();
+    });
+
+    it('assigns category 7 (OUTLET) for asOutlet energy', () => {
+        const api = makeMockApi();
+        const platform = makePlatformInstance({
+            host: '127.0.0.1',
+            energies: [{ id: 1, asOutlet: true }],
+        }, api);
+        platform.discoverDevices();
+        const registered = api.registered[0]?.[2] as Array<{ category: number }> | undefined;
+        assert.ok(registered, 'expected an accessory to be registered');
+        assert.equal(registered[0].category, 7, 'asOutlet energy should have category OUTLET (7)');
+        for (const h of platform.activeHandlers) h.destroy();
+    });
+
+    it('assigns category 6 (DOOR_LOCK) for door accessory', () => {
+        const api = makeMockApi();
+        const platform = makePlatformInstance({
+            host: '127.0.0.1',
+            doors: [{ id: 1, name: 'gate' }],
+        }, api);
+        platform.discoverDevices();
+        const registered = api.registered[0]?.[2] as Array<{ category: number }> | undefined;
+        assert.ok(registered);
+        assert.equal(registered[0].category, 6, 'door accessory should have category DOOR_LOCK (6)');
         for (const h of platform.activeHandlers) h.destroy();
     });
 
@@ -349,7 +402,7 @@ describe('OwnPlatform config validation', () => {
         assert.notEqual(platform.controller as unknown as undefined, undefined);
     });
 
-    it('configureAccessory creates handler early when context.type is present', () => {
+    it('configureAccessory caches accessory but defers handler creation to discoverDevices', () => {
         const api = makeMockApi();
         (api as unknown as { on: (e: string, cb: () => void) => void }).on = () => {};
         const log: Logging = { info: () => {}, debug: () => {}, warn: () => {}, error: () => {}, success: () => {} } as unknown as Logging;
@@ -357,8 +410,8 @@ describe('OwnPlatform config validation', () => {
         const acc = makeAccessoryStub('Kitchen', api.hap.uuid.generate('myhome-light-42'));
         (acc as unknown as { context: Record<string, unknown> }).context = { type: 'light', device: { id: 42, name: 'Kitchen' } };
         platform.configureAccessory(acc);
-        assert.equal(platform.activeHandlers.length, 1);
-        for (const h of platform.activeHandlers) h.destroy();
+        assert.equal(platform.cachedAccessories.length, 1, 'accessory must be cached');
+        assert.equal(platform.activeHandlers.length, 0, 'handler creation deferred to discoverDevices');
     });
 });
 

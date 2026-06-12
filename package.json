@@ -1,17 +1,23 @@
 {
   "name": "homebridge-myhome-unik",
+  "displayName": "MyHome (Legrand / BTicino)",
   "version": "0.3.6",
   "description": "MyHome Legrand plugin for homebridge",
   "license": "ISC",
   "keywords": [
-    "homebridge-plugin"
+    "homebridge-plugin",
+    "homebridge-platform",
+    "legrand",
+    "bticino",
+    "myhome",
+    "openwebnet"
   ],
   "repository": {
     "type": "git",
-    "url": "git://github.com/bvial/homebridge-myhome.git"
+    "url": "https://github.com/bvial/homebridge-myhome.git"
   },
   "bugs": {
-    "url": "http://github.com/bvial/homebridge-myhome/issues"
+    "url": "https://github.com/bvial/homebridge-myhome/issues"
   },
   "engines": {
     "node": "^18.20.4 || ^20.15.1 || ^22 || ^24",
