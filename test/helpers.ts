@@ -2,7 +2,7 @@ import type { OwnPlatformLike } from '../lib/OwnAccessory';
 
 export const POSITION_STATE = { DECREASING: 0, INCREASING: 1, STOPPED: 2 } as const;
 export const HEATING_COOLING_CURRENT = { OFF: 0, HEAT: 1, COOL: 2 } as const;
-export const HEATING_COOLING_TARGET = { OFF: 0, HEAT: 1, AUTO: 3 } as const;
+export const HEATING_COOLING_TARGET = { OFF: 0, HEAT: 1, COOL: 2, AUTO: 3 } as const;
 export const CONTACT_STATE = { CONTACT_DETECTED: 0, CONTACT_NOT_DETECTED: 1 } as const;
 const TEMP_UNITS = { CELSIUS: 0 } as const;
 
@@ -80,6 +80,10 @@ export function makeMockAccessory() {
             services[svc] = makeServiceStub(svc);
             return services[svc];
         },
+        removeService: (svc: { name: string } | string) => {
+            const key = typeof svc === 'string' ? svc : svc.name;
+            delete services[key];
+        },
         on: (event: string, cb: (...args: unknown[]) => void) => {
             if (!listeners[event]) listeners[event] = [];
             listeners[event].push(cb);
@@ -105,6 +109,9 @@ export function makeMockPlatform() {
         TemperatureSensor: 'TemperatureSensor',
         MotionSensor: 'MotionSensor',
         OccupancySensor: 'OccupancySensor',
+        LeakSensor: 'LeakSensor',
+        SmokeSensor: 'SmokeSensor',
+        CarbonMonoxideSensor: 'CarbonMonoxideSensor',
         StatelessProgrammableSwitch: 'StatelessProgrammableSwitch',
         Outlet: 'Outlet',
     };
@@ -135,6 +142,9 @@ export function makeMockPlatform() {
         OutletInUse: 'OutletInUse',
         MotionDetected: 'MotionDetected',
         OccupancyDetected: 'OccupancyDetected',
+        LeakDetected: 'LeakDetected',
+        SmokeDetected: 'SmokeDetected',
+        CarbonMonoxideDetected: 'CarbonMonoxideDetected',
         ProgrammableSwitchEvent: Object.assign('ProgrammableSwitchEvent', { SINGLE_PRESS: 0 }),
     };
 

@@ -103,8 +103,9 @@ Add a platform block to your Homebridge `config.json`:
 |-----|------|----------|-------------|
 | `id` | integer | yes | Scenario number (WHO=0) |
 | `name` | string | no | Display name |
+| `asButton` | boolean | no | Expose as `StatelessProgrammableSwitch` instead of Switch (default `false`). Switch with auto-reset preserves existing automations; button is semantically correct for momentary scenarios. **Changing this flag at runtime removes the old service.** |
 
-Exposed as a momentary switch — pressing it triggers the scenario, then resets to off after 500 ms. Prefer gateway scenarios over HomeKit scenes when controlling many devices at once (single command vs. one command per device).
+Default mode: momentary switch — pressing it triggers the scenario, then resets to off after 500 ms. With `asButton: true` the scenario is exposed as a Stateless Programmable Switch (Home app shows it as a button rather than a toggle). Prefer gateway scenarios over HomeKit scenes when controlling many devices at once (single command vs. one command per device).
 
 #### `contacts`
 
@@ -112,8 +113,9 @@ Exposed as a momentary switch — pressing it triggers the scenario, then resets
 |-----|------|----------|-------------|
 | `id` | integer | yes | Auxiliary/dry contact address (WHO=9) |
 | `name` | string | no | Display name |
+| `sensorType` | string | no | One of `contact` (default), `motion`, `occupancy`, `leak`, `smoke`, `co`. Selects the HomeKit service used to display the dry contact. |
 
-Read-only contact sensor.
+Read-only contact sensor. For `motion`/`occupancy`/`leak`/`smoke`/`co` types: contact CLOSED = safe/idle, contact OPEN = triggered/alarm. **Changing `sensorType` at runtime removes the old service.**
 
 #### `energies`
 
@@ -121,8 +123,9 @@ Read-only contact sensor.
 |-----|------|----------|-------------|
 | `id` | integer | yes | Energy meter address (WHO=18) |
 | `name` | string | no | Display name |
+| `asOutlet` | boolean | no | Expose as `Outlet` with Eve Consumption characteristic instead of `LightSensor` (default `false`). |
 
-Exposed as a light sensor (watts reported as lux). Polls every 30 s.
+Default mode: light sensor (watts reported as lux). With `asOutlet: true` the meter is exposed as an Outlet whose `In Use` reflects power draw, plus the Eve custom Consumption characteristic for proper Eve.app energy graphing. Polls every 30 s. **Changing this flag at runtime removes the old service.**
 
 ## Example configuration
 

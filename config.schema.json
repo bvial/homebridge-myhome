@@ -175,7 +175,10 @@
                             "oneOf": [
                                 { "title": "Contact (door/window)", "enum": ["contact"] },
                                 { "title": "Motion (PIR)", "enum": ["motion"] },
-                                { "title": "Occupancy", "enum": ["occupancy"] }
+                                { "title": "Occupancy", "enum": ["occupancy"] },
+                                { "title": "Leak", "enum": ["leak"] },
+                                { "title": "Smoke", "enum": ["smoke"] },
+                                { "title": "Carbon Monoxide", "enum": ["co"] }
                             ]
                         }
                     }

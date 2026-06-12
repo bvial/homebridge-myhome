@@ -748,7 +748,26 @@ describe('OwnThermostatAccessory', () => {
         platform.sendCommandSpy.calls.length = 0;
         svc.characteristics['TargetHeatingCoolingState'].setter!(HEATING_COOLING_TARGET.HEAT);
         const cmds = platform.sendCommandSpy.calls.map((c: unknown[]) => (c[0] as { command: string }).command);
-        assert.ok(cmds.some((c: string) => c.startsWith('*#4*#0#1*#14*')));
+        assert.ok(cmds.some((c: string) => c.startsWith('*#4*#0#1*#14*') && c.endsWith('*1##')));
+    });
+
+    it('TargetHeatingCoolingState onSet COOL sends manual cool command', () => {
+        const svc = accessory.services['Thermostat'];
+        handler.targetTemperature = 22;
+        platform.sendCommandSpy.calls.length = 0;
+        svc.characteristics['TargetHeatingCoolingState'].setter!(HEATING_COOLING_TARGET.COOL);
+        const cmds = platform.sendCommandSpy.calls.map((c: unknown[]) => (c[0] as { command: string }).command);
+        assert.ok(cmds.some((c: string) => c.startsWith('*#4*#0#1*#14*') && c.endsWith('*2##')),
+            'expected COOL command (mode byte 2), got: ' + cmds.join(', '));
+    });
+
+    it('TargetTemperature onSet in COOL mode sends cool command', () => {
+        const svc = accessory.services['Thermostat'];
+        handler.targetHeatingCoolingState = HEATING_COOLING_TARGET.COOL;
+        platform.sendCommandSpy.calls.length = 0;
+        svc.characteristics['TargetTemperature'].setter!(22);
+        const cmds = platform.sendCommandSpy.calls.map((c: unknown[]) => (c[0] as { command: string }).command);
+        assert.ok(cmds.some((c: string) => c.startsWith('*#4*#0#1*#14*') && c.endsWith('*2##')));
     });
 
     it('TargetHeatingCoolingState onSet OFF sends stop command', () => {
@@ -818,6 +837,43 @@ describe('OwnScenarioAccessory', () => {
     it('onData is a no-op', () => {
         handler.onData('*0*5*0##');
     });
+
+    it('asButton: true creates StatelessProgrammableSwitch and removes Switch', () => {
+        const p = makeMockPlatform();
+        const a = makeMockAccessory();
+        a.addService('AccessoryInformation');
+        a.addService('Switch'); // simulate previous run with asButton=false
+        const h = new OwnScenarioAccessory(p as unknown as P, a as unknown as A, { id: 7, name: 'btn', asButton: true });
+        assert.ok(a.services['StatelessProgrammableSwitch'], 'StatelessProgrammableSwitch must be created');
+        assert.ok(!a.services['Switch'], 'old Switch must be removed');
+        h.destroy();
+    });
+
+    it('asButton: true activate fires SINGLE_PRESS event and sends scenario command', () => {
+        const p = makeMockPlatform();
+        const a = makeMockAccessory();
+        a.addService('AccessoryInformation');
+        const h = new OwnScenarioAccessory(p as unknown as P, a as unknown as A, { id: 11, name: 'btn', asButton: true });
+        const svc = a.services['StatelessProgrammableSwitch'];
+        p.sendCommandSpy.calls.length = 0;
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        (h as any).activate();
+        const cmds = p.sendCommandSpy.calls.map((c: unknown[]) => (c[0] as { command: string }).command);
+        assert.ok(cmds.includes('*0*11*0##'));
+        assert.equal(svc.characteristics['ProgrammableSwitchEvent'].value, 0);
+        h.destroy();
+    });
+
+    it('asButton: false (legacy) flip removes any pre-existing StatelessProgrammableSwitch', () => {
+        const p = makeMockPlatform();
+        const a = makeMockAccessory();
+        a.addService('AccessoryInformation');
+        a.addService('StatelessProgrammableSwitch');
+        const h = new OwnScenarioAccessory(p as unknown as P, a as unknown as A, { id: 13, name: 'sw' });
+        assert.ok(a.services['Switch'], 'Switch must be created in legacy mode');
+        assert.ok(!a.services['StatelessProgrammableSwitch'], 'old StatelessProgrammableSwitch must be removed');
+        h.destroy();
+    });
 });
 
 describe('OwnContactAccessory', () => {
@@ -837,6 +893,30 @@ describe('OwnContactAccessory', () => {
         a.addService('AccessoryInformation');
         const h = new OwnContactAccessory(p as unknown as P, a as unknown as A, { id: 8 });
         assert.equal(h.name, 'contact-8');
+    });
+
+    it('restores configuredName from accessory.context across restart', () => {
+        const p = makeMockPlatform();
+        const a = makeMockAccessory();
+        a.addService('AccessoryInformation');
+        a.context.configuredName = 'My Renamed Sensor';
+        const h = new OwnContactAccessory(p as unknown as P, a as unknown as A, { id: 99, name: 'config-name' });
+        assert.equal(h.name, 'My Renamed Sensor', 'name must be loaded from context.configuredName');
+    });
+
+    it('ConfiguredName onSet persists rename and updates displayName', () => {
+        const p = makeMockPlatform();
+        const a = makeMockAccessory();
+        a.addService('AccessoryInformation');
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        (a as any).displayName = 'old';
+        const h = new OwnContactAccessory(p as unknown as P, a as unknown as A, { id: 100, name: 'config-name' });
+        const svc = a.services['ContactSensor'];
+        svc.characteristics['ConfiguredName'].setter!('Renamed in Home');
+        assert.equal(a.context.configuredName, 'Renamed in Home');
+        assert.equal(h.name, 'Renamed in Home');
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        assert.equal((a as any).displayName, 'Renamed in Home', 'displayName must be synced');
     });
 
     it('onData contact detected', () => {
@@ -880,6 +960,72 @@ describe('OwnContactAccessory', () => {
         handler.setOnline(true);
         assert.equal(svc.characteristics['StatusActive'].value, true);
         assert.equal(svc.characteristics['StatusFault'].value, 0);
+    });
+
+    it('sensorType motion creates MotionSensor service', () => {
+        const p = makeMockPlatform();
+        const a = makeMockAccessory();
+        a.addService('AccessoryInformation');
+        const h = new OwnContactAccessory(p as unknown as P, a as unknown as A, { id: 60, name: 'pir', sensorType: 'motion' });
+        assert.ok(a.services['MotionSensor']);
+        assert.ok(!a.services['ContactSensor']);
+        // contact OPEN (1) → motion detected (true)
+        h.onData('*9*1*60##');
+        assert.equal(a.services['MotionSensor'].characteristics['MotionDetected'].value, true);
+        h.onData('*9*0*60##');
+        assert.equal(a.services['MotionSensor'].characteristics['MotionDetected'].value, false);
+    });
+
+    it('sensorType occupancy creates OccupancySensor service', () => {
+        const p = makeMockPlatform();
+        const a = makeMockAccessory();
+        a.addService('AccessoryInformation');
+        const h = new OwnContactAccessory(p as unknown as P, a as unknown as A, { id: 61, name: 'occ', sensorType: 'occupancy' });
+        assert.ok(a.services['OccupancySensor']);
+        h.onData('*9*1*61##');
+        assert.equal(a.services['OccupancySensor'].characteristics['OccupancyDetected'].value, true);
+    });
+
+    it('sensorType leak creates LeakSensor service with 0/1 alarm states', () => {
+        const p = makeMockPlatform();
+        const a = makeMockAccessory();
+        a.addService('AccessoryInformation');
+        const h = new OwnContactAccessory(p as unknown as P, a as unknown as A, { id: 62, name: 'leak', sensorType: 'leak' });
+        assert.ok(a.services['LeakSensor']);
+        h.onData('*9*0*62##');
+        assert.equal(a.services['LeakSensor'].characteristics['LeakDetected'].value, 0, 'closed contact = NOT_DETECTED');
+        h.onData('*9*1*62##');
+        assert.equal(a.services['LeakSensor'].characteristics['LeakDetected'].value, 1, 'open contact = DETECTED');
+    });
+
+    it('sensorType smoke creates SmokeSensor service', () => {
+        const p = makeMockPlatform();
+        const a = makeMockAccessory();
+        a.addService('AccessoryInformation');
+        const h = new OwnContactAccessory(p as unknown as P, a as unknown as A, { id: 63, sensorType: 'smoke' });
+        assert.ok(a.services['SmokeSensor']);
+        h.onData('*9*1*63##');
+        assert.equal(a.services['SmokeSensor'].characteristics['SmokeDetected'].value, 1);
+    });
+
+    it('sensorType co creates CarbonMonoxideSensor service', () => {
+        const p = makeMockPlatform();
+        const a = makeMockAccessory();
+        a.addService('AccessoryInformation');
+        const h = new OwnContactAccessory(p as unknown as P, a as unknown as A, { id: 64, sensorType: 'co' });
+        assert.ok(a.services['CarbonMonoxideSensor']);
+        h.onData('*9*1*64##');
+        assert.equal(a.services['CarbonMonoxideSensor'].characteristics['CarbonMonoxideDetected'].value, 1);
+    });
+
+    it('sensorType flip removes stale service from previous run', () => {
+        const p = makeMockPlatform();
+        const a = makeMockAccessory();
+        a.addService('AccessoryInformation');
+        a.addService('ContactSensor'); // simulate stale service from previous run
+        new OwnContactAccessory(p as unknown as P, a as unknown as A, { id: 70, sensorType: 'motion' });
+        assert.ok(!a.services['ContactSensor'], 'old ContactSensor must be removed');
+        assert.ok(a.services['MotionSensor']);
     });
 });
 
@@ -950,5 +1096,49 @@ describe('OwnEnergyAccessory', () => {
         handler.setOnline(true);
         assert.equal(svc.characteristics['StatusActive'].value, true);
         assert.equal(svc.characteristics['StatusFault'].value, 0);
+    });
+
+    it('asOutlet: true creates Outlet service and removes LightSensor', () => {
+        const p = makeMockPlatform();
+        const a = makeMockAccessory();
+        a.addService('AccessoryInformation');
+        a.addService('LightSensor'); // simulate previous run
+        const h = new OwnEnergyAccessory(p as unknown as P, a as unknown as A, { id: 80, asOutlet: true });
+        assert.ok(a.services['Outlet']);
+        assert.ok(!a.services['LightSensor'], 'old LightSensor must be removed');
+        h.destroy();
+    });
+
+    it('asOutlet: true updates On + OutletInUse based on watt threshold', () => {
+        const p = makeMockPlatform();
+        const a = makeMockAccessory();
+        a.addService('AccessoryInformation');
+        const h = new OwnEnergyAccessory(p as unknown as P, a as unknown as A, { id: 81, asOutlet: true });
+        const svc = a.services['Outlet'];
+        h.onData('*#18*81*113*0##');     // 0 W → not in use
+        assert.equal(svc.characteristics['On'].value, false);
+        assert.equal(svc.characteristics['OutletInUse'].value, false);
+        h.onData('*#18*81*113*250##');   // 250 W → in use
+        assert.equal(svc.characteristics['On'].value, true);
+        assert.equal(svc.characteristics['OutletInUse'].value, true);
+        h.destroy();
+    });
+
+    it('asOutlet: false (legacy) flip removes any pre-existing Outlet service', () => {
+        const p = makeMockPlatform();
+        const a = makeMockAccessory();
+        a.addService('AccessoryInformation');
+        a.addService('Outlet'); // simulate previous run with asOutlet=true
+        const h = new OwnEnergyAccessory(p as unknown as P, a as unknown as A, { id: 82 });
+        assert.ok(a.services['LightSensor']);
+        assert.ok(!a.services['Outlet'], 'old Outlet must be removed');
+        h.destroy();
+    });
+
+    it('onData no-op after destroy', () => {
+        handler.destroy();
+        const wattsBefore = handler.watts;
+        handler.onData('*#18*71*113*999##');
+        assert.equal(handler.watts, wattsBefore, 'onData must not mutate state after destroy');
     });
 });

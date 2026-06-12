@@ -1,6 +1,7 @@
 import type { API, DynamicPlatformPlugin, HapStatusError, Logging, PlatformAccessory, PlatformConfig, Service, Characteristic } from 'homebridge';
 import { PLUGIN_NAME, PLATFORM_NAME } from './constants';
 import { errorMessage } from './utils';
+import { STATUS_UPDATE_STAGGER_MS } from './utils';
 import { OwnClient } from './OwnNet';
 import { OwnProtcol, WHO } from './OwnProtcol';
 import {
@@ -110,7 +111,7 @@ export class OwnPlatform implements DynamicPlatformPlugin {
             return;
         }
 
-        this.log.info(`LegrandMyHome for MyHome Gateway at ${this.config.host}:${this.config.port}`);
+        this.log.info(`LegrandMyHome for MyHome Gateway at ${this.config.host}:${this.config.port} (Homebridge ${api.serverVersion})`);
         this.controller = new OwnClient(
             this.config.host,
             this.config.port ?? 20000,
@@ -171,10 +172,15 @@ export class OwnPlatform implements DynamicPlatformPlugin {
         this.log.info('Discovering OpenWebNet devices from config');
 
         // HAP category codes hardcoded (Categories is a const enum — no runtime object):
-        // 5=Lightbulb, 8=Switch, 9=Thermostat, 10=Sensor, 14=WindowCovering
-        const CATEGORY: Record<string, number> = {
-            light: 5, blind: 14, thermostat: 9, scenario: 8, contact: 10, energy: 10,
-        };
+        // 5=Lightbulb, 7=Outlet, 8=Switch, 9=Thermostat, 10=Sensor, 14=WindowCovering, 15=ProgrammableSwitch
+        function deviceCategory(d: { type: string } & Record<string, unknown>): number {
+            if (d.type === 'scenario' && d.asButton) return 15;
+            if (d.type === 'energy'   && d.asOutlet) return 7;
+            const base: Record<string, number> = {
+                light: 5, blind: 14, thermostat: 9, scenario: 8, contact: 10, energy: 10,
+            };
+            return base[d.type] ?? 1;
+        }
 
         const allDevices = [
             ...(this.config.lights ?? []).map((d: LightConfig) => ({ ...d, type: 'light' as const })),
@@ -213,7 +219,7 @@ export class OwnPlatform implements DynamicPlatformPlugin {
                 const name = device.name ?? `${device.type}-${device.id}`;
                 this.log.info('Adding new accessory:', name);
                 const accessory = new this.api.platformAccessory(name, uuid);
-                accessory.category = (CATEGORY[device.type] ?? 1) as unknown as typeof accessory.category;
+                accessory.category = (deviceCategory(device) ?? 1) as unknown as typeof accessory.category;
                 accessory.context.device = device;
                 accessory.context.type = device.type;
                 try {
@@ -306,7 +312,7 @@ export class OwnPlatform implements DynamicPlatformPlugin {
         let delay = 0;
         for (const handler of this.activeHandlers) {
             this.staggerTimers.push(setTimeout((h: AnyAccessory) => h.updateStatus(), delay, handler));
-            delay += 200;
+            delay += STATUS_UPDATE_STAGGER_MS;
         }
     }
 

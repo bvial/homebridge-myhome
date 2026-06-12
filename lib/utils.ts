@@ -54,3 +54,9 @@ export const BLIND_QUEUE_BUSY_THRESHOLD = 50;
 export const ENERGY_POLL_INTERVAL_MS = 30_000;
 /** Energy meter polling skip threshold (queue depth) */
 export const ENERGY_POLL_QUEUE_THRESHOLD = 10;
+/** Watt threshold above which an energy meter outlet is considered "in use" */
+export const ENERGY_OUTLET_IN_USE_THRESHOLD_W = 1;
+/** HAP LightSensor minimum lux value (legacy energy lux-hack floor) */
+export const ENERGY_MIN_LIGHT_LEVEL = 0.0001;
+/** Stagger delay between consecutive accessory status fetches at startup */
+export const STATUS_UPDATE_STAGGER_MS = 200;

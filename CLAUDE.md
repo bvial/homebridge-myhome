@@ -50,12 +50,16 @@ The plugin connects to a Legrand gateway over **raw TCP on port 20000** using th
 
 ### Accessory Behavior Notes
 
-- **`OwnLightAccessory`**: Supports dimmer mode (config `dimmer: true`). Brightness maps to OWN levels 2-10; brightness=0 sends an off command. Also handles extended packets `*1*1000#X*WHERE##` (sent by the gateway when a light is triggered by a scenario or automation rule): `X=0` → off, `X>0` → on.
-- **`OwnBlindAccessory`**: Position modeled by timing movement against configured `time` (seconds for full travel). Supports venetian blinds with `timeSlat`/`slatPercent`. On first `updateStatus()` resets to known state by issuing a full down command.
-- **`OwnThermostatAccessory`**: Uses two addresses — `id` for the zone probe and `#0#<zone>` for central unit commands. Error on set when not in HEAT mode throws `HapStatusError`.
-- **`OwnScenarioAccessory`**: Momentary switch — triggers scenario then resets to off after 500ms.
-- **`OwnContactAccessory`**: Read-only dry contact sensor (WHO=9/auxiliary).
-- **`OwnEnergyAccessory`**: Energy meter exposed as LightSensor (watts as lux). Polls every 30s.
+- **`OwnLightAccessory`**: Supports dimmer mode (config `dimmer: true`). Brightness maps to OWN levels 2-10; brightness=0 sends an off command. Also handles extended packets `*1*1000#X*WHERE##` (sent by the gateway when a light is triggered by a scenario or automation rule): `X=0` → off, `X>0` → on. Identify command blinks the light off then back on.
+- **`OwnBlindAccessory`**: Position modeled by timing movement against configured `time` (seconds for full travel). Supports venetian blinds with `timeSlat`/`slatPercent`. On first `updateStatus()` resets to known state by issuing a full down command, with a calibration-end timer that fires STOP after `time + timeSlat + 1s`. Identify command jogs the blind up for 1s then stops.
+- **`OwnThermostatAccessory`**: Uses two addresses — `id` for the zone probe and `#0#<zone>` for central unit commands. Supports HEAT, COOL, OFF, and AUTO modes. TargetTemperature is writable in both HEAT and COOL modes (DIM 14 mode byte `*1` = Heat, `*2` = Cool). Linked `TemperatureSensor` service provides temperature history graphing in the Home app.
+- **`OwnScenarioAccessory`**: Default mode is a Switch with auto-reset after 500ms (preserves automations). Optional `asButton: true` config exposes it as a `StatelessProgrammableSwitch` for proper momentary-button semantics in the Home app.
+- **`OwnContactAccessory`**: Read-only dry contact sensor (WHO=9/auxiliary). Optional `sensorType` config selects HomeKit display: `contact` (default, door/window), `motion`, `occupancy`, `leak`, `smoke`, or `co` (CarbonMonoxide). For non-`contact` types, contact CLOSED is the safe/idle state, contact OPEN triggers the alarm/detection.
+- **`OwnEnergyAccessory`**: Default mode is `LightSensor` with watts displayed as lux (legacy). Optional `asOutlet: true` config exposes it as `Outlet` with the Eve Consumption custom characteristic (UUID `E863F10D-079E-48FF-8F27-9C2605A29F52`) for proper Eve.app integration. Polls every 30s.
+
+### Service-flip cleanup
+
+When `asButton`, `asOutlet`, or `sensorType` is changed in config, the accessory removes the previously-registered service of the other type at next startup so that only one primary service remains. This prevents both Switch+StatelessProgrammableSwitch (or LightSensor+Outlet) from being attached to the same accessory.
 
 ### Reconnect Logic
 

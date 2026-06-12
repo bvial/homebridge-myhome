@@ -5,6 +5,7 @@ import { PLUGIN_VERSION } from './constants';
 import {
     brightnessToOwnLevel,
     ownLevelToBrightness,
+    errorMessage,
     IDENTIFY_BLINK_MS,
     SCENARIO_RESET_MS,
     BLIND_MOVE_RETRY_INTERVAL_MS,
@@ -15,6 +16,8 @@ import {
     BLIND_QUEUE_BUSY_THRESHOLD,
     ENERGY_POLL_INTERVAL_MS,
     ENERGY_POLL_QUEUE_THRESHOLD,
+    ENERGY_OUTLET_IN_USE_THRESHOLD_W,
+    ENERGY_MIN_LIGHT_LEVEL,
 } from './utils';
 
 export interface OwnPlatformLike {
@@ -49,7 +52,7 @@ export interface ScenarioConfig extends BaseConfig {
     asButton?: boolean;
 }
 export interface ContactConfig extends BaseConfig {
-    sensorType?: 'contact' | 'motion' | 'occupancy';
+    sensorType?: 'contact' | 'motion' | 'occupancy' | 'leak' | 'smoke' | 'co';
 }
 export interface EnergyConfig extends BaseConfig {
     asOutlet?: boolean;
@@ -97,6 +100,21 @@ class OwnAccessory {
             .setCharacteristic(this.Characteristic.FirmwareRevision, PLUGIN_VERSION);
 
         this.accessory.on('identify', () => { this.log.info(`[${this.id}] Identify`); });
+
+        // Surface HAP-NodeJS characteristic warnings (e.g. validValues clamping, missing perms)
+        // so they appear in the Homebridge log instead of being silently swallowed.
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const accAny = this.accessory as any;
+        if (typeof accAny.on === 'function') {
+            try {
+                accAny.on('characteristic-warning', (warning: { type: string; message: string; characteristic?: { displayName?: string } }) => {
+                    const charName = warning.characteristic?.displayName ?? '?';
+                    this.log.warn('[%s] HAP warn (%s) on %s: %s', this.id, warning.type, charName, warning.message);
+                });
+            } catch {
+                // older HAP versions don't emit this event — silently ignore
+            }
+        }
     }
 
     /** Updates the gateway hardware revision on this accessory's AccessoryInformation service. */
@@ -125,6 +143,9 @@ class OwnAccessory {
                 if (newName === this.name) return;
                 this.name = newName;
                 (this.accessory.context as Record<string, unknown>).configuredName = newName;
+                // Keep Homebridge UI in sync — displayName is what shows in the bridge logs/UI
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                (this.accessory as any).displayName = newName;
                 this.log.info(`[${this.id}] Renamed to "${newName}"`);
             });
         if (withStatusActive) {
@@ -150,8 +171,13 @@ class OwnAccessory {
     }
 
     protected sendOrThrow(command: string): void {
+        if (this.controller.queueSize() >= BLIND_QUEUE_BUSY_THRESHOLD) {
+            this.log.warn('[%s] Command dropped (queue full): %s', this.id, command);
+            throw new this.HapStatusError(this.HAPStatus.RESOURCE_BUSY);
+        }
         if (!this.controller.sendCommand({ command, log: this.log })) {
-            throw new this.HapStatusError(this.HAPStatus.SERVICE_COMMUNICATION_FAILURE);
+            this.log.warn('[%s] Command rejected (queue saturated): %s', this.id, command);
+            throw new this.HapStatusError(this.HAPStatus.RESOURCE_BUSY);
         }
     }
 
@@ -353,6 +379,13 @@ export class OwnBlindAccessory extends OwnAccessory {
                 this.target = this.position;
                 this.move();
             });
+
+        this.accessory.removeAllListeners('identify');
+        this.accessory.on('identify', () => {
+            this.log.info(`[${this.id}] Identify — jog`);
+            this.moveUp();
+            setTimeout(() => this.moveStop(), 1000);
+        });
     }
 
     setOnline(online: boolean): void {
@@ -363,7 +396,11 @@ export class OwnBlindAccessory extends OwnAccessory {
         this.log.info(`[${this.id}] Blind updateStatus`);
         if (!this.initStartPosition) {
             this.log.info(`[${this.id}] Initialization phase of blind: reset position to 0 and send move down`);
-            this.controller.sendCommand({ command: `*2*2*${this.id}##`, log: this.log });
+            const queued = this.controller.sendCommand({ command: `*2*2*${this.id}##`, log: this.log });
+            if (!queued) {
+                this.log.warn('[%s] Blind init DOWN dropped: queue full — calibration deferred', this.id);
+                return;
+            }
             this.position = 0;
             this.target = 0;
             this.initPhase = true;
@@ -432,11 +469,15 @@ export class OwnBlindAccessory extends OwnAccessory {
         this.homeKitMovement = false;
         this.expectedState = this.Characteristic.PositionState.STOPPED;
         this.startTimerCommand();
-        this.controller.sendCommand({
+        const queued = this.controller.sendCommand({
             command: `*2*0*${this.id}##`,
             log: this.log,
             started: () => this.startConfirmationTimer(),
         });
+        if (!queued) {
+            this.log.warn('[%s] Blind STOP dropped: queue full', this.id);
+            this.commandSent = false;
+        }
     }
 
     moveUp(): void {
@@ -444,11 +485,16 @@ export class OwnBlindAccessory extends OwnAccessory {
         this.homeKitMovement = true;
         this.expectedState = this.Characteristic.PositionState.INCREASING;
         this.startTimerCommand();
-        this.controller.sendCommand({
+        const queued = this.controller.sendCommand({
             command: `*2*1*${this.id}##`,
             log: this.log,
             started: () => this.startConfirmationTimer(),
         });
+        if (!queued) {
+            this.log.warn('[%s] Blind UP dropped: queue full', this.id);
+            this.commandSent = false;
+            this.homeKitMovement = false;
+        }
     }
 
     moveDown(): void {
@@ -456,11 +502,16 @@ export class OwnBlindAccessory extends OwnAccessory {
         this.homeKitMovement = true;
         this.expectedState = this.Characteristic.PositionState.DECREASING;
         this.startTimerCommand();
-        this.controller.sendCommand({
+        const queued = this.controller.sendCommand({
             command: `*2*2*${this.id}##`,
             log: this.log,
             started: () => this.startConfirmationTimer(),
         });
+        if (!queued) {
+            this.log.warn('[%s] Blind DOWN dropped: queue full', this.id);
+            this.commandSent = false;
+            this.homeKitMovement = false;
+        }
     }
 
     onData(packet: string): void {
@@ -676,7 +727,7 @@ export class OwnThermostatAccessory extends OwnAccessory {
             .onGet(() => this.heatingCoolingState);
 
         this.thermostatService.getCharacteristic(this.Characteristic.TargetHeatingCoolingState)
-            .setProps({ validValues: [0, 1, 3] })
+            .setProps({ validValues: [0, 1, 2, 3] })
             .onGet(() => this.targetHeatingCoolingState)
             .onSet((value: CharacteristicValue) => {
                 this.log.info(`[${this.id}] zone[${this.zone}] setTargetHeatingCoolingState:${value}`);
@@ -685,6 +736,12 @@ export class OwnThermostatAccessory extends OwnAccessory {
                         const temperature = OwnProtcol.encodeTemperature(this.targetTemperature);
                         this.log.info(`[${this.id}] send Heat Manual at ${temperature}`);
                         this.sendOrThrow(`*#4*${this.address}*#14*${temperature}*1##`);
+                        break;
+                    }
+                    case this.Characteristic.TargetHeatingCoolingState.COOL: {
+                        const temperature = OwnProtcol.encodeTemperature(this.targetTemperature);
+                        this.log.info(`[${this.id}] send Cool Manual at ${temperature}`);
+                        this.sendOrThrow(`*#4*${this.address}*#14*${temperature}*2##`);
                         break;
                     }
                     case this.Characteristic.TargetHeatingCoolingState.OFF:
@@ -708,12 +765,15 @@ export class OwnThermostatAccessory extends OwnAccessory {
             .onGet(() => this.targetTemperature)
             .onSet((value: CharacteristicValue) => {
                 this.log.info(`[${this.id}] zone[${this.zone}] setTargetTemperature:${value}`);
-                if (this.targetHeatingCoolingState !== this.Characteristic.TargetHeatingCoolingState.HEAT) {
+                const isHeat = this.targetHeatingCoolingState === this.Characteristic.TargetHeatingCoolingState.HEAT;
+                const isCool = this.targetHeatingCoolingState === this.Characteristic.TargetHeatingCoolingState.COOL;
+                if (!isHeat && !isCool) {
                     this.log.error("Can't change target temperature with mode (%s)", this.targetHeatingCoolingState);
                     throw new this.HapStatusError(this.HAPStatus.NOT_ALLOWED_IN_CURRENT_STATE);
                 }
                 const temperature = OwnProtcol.encodeTemperature(value as number);
-                this.sendOrThrow(`*#4*${this.address}*#14*${temperature}*1##`);
+                const modeByte = isCool ? '2' : '1';
+                this.sendOrThrow(`*#4*${this.address}*#14*${temperature}*${modeByte}##`);
                 this.targetTemperature = value as number;
             });
 
@@ -842,8 +902,8 @@ export class OwnThermostatAccessory extends OwnAccessory {
             } else if (valInt === 21) {
                 this.log.debug('[%s] zone[%s] Remote control enabled', this.id, this.zone);
             } else if (valInt === 0) {
-                this.updateCharacteristicTargetHeatingCoolingState(this.Characteristic.TargetHeatingCoolingState.OFF);
-                this.log.debug('[%s] zone[%s] operation mode Conditioning (generic OFF)', this.id, this.zone);
+                this.updateCharacteristicTargetHeatingCoolingState(this.Characteristic.TargetHeatingCoolingState.COOL);
+                this.log.debug('[%s] zone[%s] operation mode Conditioning', this.id, this.zone);
             } else {
                 this.log.error('[%s] zone[%s] unknown value (%i) in packet: %s', this.id, this.zone, valInt, packet);
             }
@@ -853,6 +913,11 @@ export class OwnThermostatAccessory extends OwnAccessory {
                 const temp = OwnProtcol.decodeTemperature(extract[2]);
                 this.log.debug('[%s] zone[%s] operation mode Manual Heating (%s)', this.id, this.zone, temp);
                 this.updateCharacteristicTargetHeatingCoolingState(this.Characteristic.TargetHeatingCoolingState.HEAT);
+                this.updateCharacteristicTargetTemperature(temp);
+            } else if (value === '210') {
+                const temp = OwnProtcol.decodeTemperature(extract[2]);
+                this.log.debug('[%s] zone[%s] operation mode Manual Cooling (%s)', this.id, this.zone, temp);
+                this.updateCharacteristicTargetHeatingCoolingState(this.Characteristic.TargetHeatingCoolingState.COOL);
                 this.updateCharacteristicTargetTemperature(temp);
             }
         } else {
@@ -891,6 +956,9 @@ export class OwnScenarioAccessory extends OwnAccessory {
                 .onSet((value: CharacteristicValue) => {
                     if (value) this.activate();
                 });
+            // Remove a previously-registered StatelessProgrammableSwitch (asButton flipped true→false)
+            const existingSPS = this.accessory.getService(this.Service.StatelessProgrammableSwitch);
+            if (existingSPS) this.accessory.removeService(existingSPS);
         }
     }
 
@@ -917,10 +985,12 @@ export class OwnScenarioAccessory extends OwnAccessory {
 
 export class OwnContactAccessory extends OwnAccessory {
     contactState: number;
-    private sensorType: 'contact' | 'motion' | 'occupancy';
+    private sensorType: 'contact' | 'motion' | 'occupancy' | 'leak' | 'smoke' | 'co';
     private sensorService: InstanceType<typeof Service>;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     private stateChar: any;
+
+    private static readonly SENSOR_TYPES = ['contact', 'motion', 'occupancy', 'leak', 'smoke', 'co'] as const;
 
     constructor(platform: OwnPlatformLike, accessory: PlatformAccessory, config: ContactConfig) {
         if (!config.name) config.name = `contact-${config.id}`;
@@ -945,10 +1015,42 @@ export class OwnContactAccessory extends OwnAccessory {
                 modelName = 'OccupancySensor';
                 stateCharacteristicClass = this.Characteristic.OccupancyDetected;
                 break;
+            case 'leak':
+                serviceClass = this.Service.LeakSensor;
+                modelName = 'LeakSensor';
+                stateCharacteristicClass = this.Characteristic.LeakDetected;
+                break;
+            case 'smoke':
+                serviceClass = this.Service.SmokeSensor;
+                modelName = 'SmokeSensor';
+                stateCharacteristicClass = this.Characteristic.SmokeDetected;
+                break;
+            case 'co':
+                serviceClass = this.Service.CarbonMonoxideSensor;
+                modelName = 'CarbonMonoxideSensor';
+                stateCharacteristicClass = this.Characteristic.CarbonMonoxideDetected;
+                break;
             default:
                 serviceClass = this.Service.ContactSensor;
                 modelName = 'ContactSensor';
                 stateCharacteristicClass = this.Characteristic.ContactSensorState;
+        }
+
+        // Remove stale sensor services if sensorType changed across restarts
+        const sensorServiceMap: Record<typeof OwnContactAccessory.SENSOR_TYPES[number], typeof Service> = {
+            contact: this.Service.ContactSensor,
+            motion: this.Service.MotionSensor,
+            occupancy: this.Service.OccupancySensor,
+            leak: this.Service.LeakSensor,
+            smoke: this.Service.SmokeSensor,
+            co: this.Service.CarbonMonoxideSensor,
+        };
+        for (const t of OwnContactAccessory.SENSOR_TYPES) {
+            if (t !== this.sensorType) {
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                const stale = this.accessory.getService(sensorServiceMap[t] as any);
+                if (stale) this.accessory.removeService(stale);
+            }
         }
 
         this.sensorService = this.initPrimaryService(serviceClass, modelName, true, true);
@@ -963,7 +1065,10 @@ export class OwnContactAccessory extends OwnAccessory {
             return rawState; // 0=DETECTED, 1=NOT_DETECTED
         }
         // For motion/occupancy: contact CLOSED (0) → no motion/no occupancy; OPEN (1) → motion/occupancy
-        return rawState !== this.Characteristic.ContactSensorState.CONTACT_DETECTED;
+        // For leak/smoke/co: contact CLOSED (0) → safe (NOT_DETECTED=0); OPEN (1) → alarm (DETECTED=1)
+        const triggered = rawState !== this.Characteristic.ContactSensorState.CONTACT_DETECTED;
+        if (this.sensorType === 'motion' || this.sensorType === 'occupancy') return triggered;
+        return triggered ? 1 : 0;
     }
 
     setOnline(online: boolean): void {
@@ -1009,16 +1114,16 @@ export class OwnEnergyAccessory extends OwnAccessory {
         if (!config.name) config.name = `energy-${config.id}`;
         super(platform, accessory, config);
 
-        this.watts = 0.0001;
+        this.watts = ENERGY_MIN_LIGHT_LEVEL;
         this.asOutlet = config.asOutlet ?? false;
 
         if (this.asOutlet) {
             this.energyService = this.initPrimaryService(this.Service.Outlet, 'EnergyMonitor', true, true);
             this.energyService.getCharacteristic(this.Characteristic.On)
-                .onGet(() => this.watts > 1)
+                .onGet(() => this.watts > ENERGY_OUTLET_IN_USE_THRESHOLD_W)
                 .onSet(() => { /* read-only meter — ignore writes */ });
             this.energyService.getCharacteristic(this.Characteristic.OutletInUse)
-                .onGet(() => this.watts > 1);
+                .onGet(() => this.watts > ENERGY_OUTLET_IN_USE_THRESHOLD_W);
             // Eve custom characteristic for watts
             // eslint-disable-next-line @typescript-eslint/no-explicit-any
             const Char = (this.Characteristic as unknown as { new (...args: any[]): any });
@@ -1029,8 +1134,8 @@ export class OwnEnergyAccessory extends OwnAccessory {
                 });
                 this.energyService.addCharacteristic(eveChar);
                 this.eveWattsChar = eveChar;
-            } catch {
-                this.log.debug('[%s] Eve consumption characteristic unavailable in this hap version', this.id);
+            } catch (err) {
+                this.log.debug('[%s] Eve consumption characteristic unavailable: %s', this.id, errorMessage(err));
             }
             // Remove a previously-registered LightSensor service if config flipped
             const existing = this.accessory.getService(this.Service.LightSensor);
@@ -1039,7 +1144,10 @@ export class OwnEnergyAccessory extends OwnAccessory {
             // Legacy mode: lux-hack on LightSensor (preserves existing automations)
             this.energyService = this.initPrimaryService(this.Service.LightSensor, 'EnergyMonitor', true, true);
             this.energyService.getCharacteristic(this.Characteristic.CurrentAmbientLightLevel)
-                .onGet(() => Math.max(0.0001, this.watts));
+                .onGet(() => Math.max(ENERGY_MIN_LIGHT_LEVEL, this.watts));
+            // Remove a previously-registered Outlet service (asOutlet flipped true→false)
+            const existingOutlet = this.accessory.getService(this.Service.Outlet);
+            if (existingOutlet) this.accessory.removeService(existingOutlet);
         }
 
         this.pollInterval = setInterval(() => {
@@ -1067,12 +1175,13 @@ export class OwnEnergyAccessory extends OwnAccessory {
     }
 
     onData(packet: string): void {
+        if (this.destroyed) return;
         const extract = packet.match(/^\*#18\*\d+\*113\*(\d+)##$/);
         if (extract) {
-            this.watts = Math.max(0.0001, parseInt(extract[1], 10));
+            this.watts = Math.max(ENERGY_MIN_LIGHT_LEVEL, parseInt(extract[1], 10));
             this.log.debug(`[${this.id}] Energy: ${this.watts}W`);
             if (this.asOutlet) {
-                const inUse = this.watts > 1;
+                const inUse = this.watts > ENERGY_OUTLET_IN_USE_THRESHOLD_W;
                 this.energyService.updateCharacteristic(this.Characteristic.On, inUse);
                 this.energyService.updateCharacteristic(this.Characteristic.OutletInUse, inUse);
                 if (this.eveWattsChar) {
