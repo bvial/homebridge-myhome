@@ -153,6 +153,7 @@ export function makeMockPlatform() {
     };
 
     const sendCommandSpy = makeSpy(true);
+    const updateAccessorySpy = makeSpy(true);
 
     return {
         log: { info: noop, debug: noop, warn: noop, error: noop, success: noop } as unknown as import('homebridge').Logging,
@@ -166,6 +167,8 @@ export function makeMockPlatform() {
             RESOURCE_BUSY: -70403,
             OPERATION_TIMED_OUT: -70408,
         } as unknown as OwnPlatformLike['HAPStatus'],
+        updateAccessory: updateAccessorySpy as unknown as (a: import('homebridge').PlatformAccessory) => void,
         sendCommandSpy: sendCommandSpy,
+        updateAccessorySpy: updateAccessorySpy,
     };
 }

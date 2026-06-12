@@ -9,6 +9,7 @@ import {
     IDENTIFY_BLINK_MS,
     IDENTIFY_JOG_MS,
     SCENARIO_RESET_MS,
+    DOOR_RESET_MS,
     BLIND_MOVE_RETRY_INTERVAL_MS,
     BLIND_MAX_MOVE_RETRIES,
     BLIND_COMMAND_ECHO_TIMEOUT_MS,
@@ -29,6 +30,8 @@ export interface OwnPlatformLike {
     Characteristic: typeof Characteristic;
     HapStatusError: new (status: number) => HapStatusError;
     HAPStatus: Record<string, number>;
+    /** Optional: notify Homebridge that an accessory was mutated (e.g., displayName change). */
+    updateAccessory?(accessory: PlatformAccessory): void;
 }
 
 export interface BaseConfig {
@@ -71,6 +74,7 @@ class OwnAccessory {
     protected Characteristic: typeof Characteristic;
     protected HapStatusError: new (status: number) => HapStatusError;
     protected HAPStatus: Record<string, number>;
+    protected platform: OwnPlatformLike;
     accessory: PlatformAccessory;
     name: string;
     protected id: number;
@@ -85,6 +89,7 @@ class OwnAccessory {
         this.Characteristic = platform.Characteristic;
         this.HapStatusError = platform.HapStatusError;
         this.HAPStatus = platform.HAPStatus;
+        this.platform = platform;
         this.accessory = accessory;
 
         this.name = config.name ?? '';
@@ -155,6 +160,8 @@ class OwnAccessory {
                 // Keep Homebridge UI in sync — displayName is what shows in the bridge logs/UI
                 // eslint-disable-next-line @typescript-eslint/no-explicit-any
                 (this.accessory as any).displayName = newName;
+                // Push the displayName change to Homebridge's accessory cache so it survives a restart.
+                this.platform.updateAccessory?.(this.accessory);
                 this.log.info(`[${this.id}] Renamed to "${newName}"`);
             });
         if (withStatusActive) {
@@ -201,6 +208,15 @@ class OwnAccessory {
     checkWhere(where: string): boolean {
         const id = parseInt(where, 10);
         return this.id === id;
+    }
+
+    /**
+     * OWN WHO code this accessory subscribes to. Subclasses override.
+     * Used by OwnPlatform.onAccessory to disambiguate routing when two accessories
+     * of different types share the same numeric id (e.g. lights[id=42] and doors[id=42]).
+     */
+    get who(): number | null {
+        return null;
     }
 
     setOnline(_online: boolean): void {}
@@ -751,12 +767,16 @@ export class OwnThermostatAccessory extends OwnAccessory {
 
         // Linked TemperatureSensor — exposes CurrentTemperature for the Home app's
         // temperature history graph (Thermostat.CurrentTemperature is not graphed).
-        this.temperatureSensorService = this.accessory.getService(this.Service.TemperatureSensor)
+        const existingTempSensor = this.accessory.getService(this.Service.TemperatureSensor);
+        this.temperatureSensorService = existingTempSensor
             ?? this.accessory.addService(this.Service.TemperatureSensor, `${this.name} Temperature`, 'temperature');
         this.temperatureSensorService.getCharacteristic(this.Characteristic.CurrentTemperature)
             .setProps({ minValue: -50, maxValue: 50, minStep: 0.1 })
             .onGet(() => this.temperature);
-        this.thermostatService.addLinkedService(this.temperatureSensorService);
+        // Only link on first-time creation; HAP persists the link descriptor across restarts.
+        if (!existingTempSensor) {
+            this.thermostatService.addLinkedService(this.temperatureSensorService);
+        }
 
         this.thermostatService.getCharacteristic(this.Characteristic.CurrentHeatingCoolingState)
             .onGet(() => this.heatingCoolingState);
@@ -1207,10 +1227,12 @@ export class OwnEnergyAccessory extends OwnAccessory {
 
 export class OwnDoorAccessory extends OwnAccessory {
     private openCommand: string;
+    private openEventCode: string | null;
     private doorbellEnabled: boolean;
     private lockService: InstanceType<typeof Service>;
     private doorbellService: InstanceType<typeof Service> | null;
     private resetTimeout: ReturnType<typeof setTimeout> | undefined;
+    private currentLockState: number;
 
     constructor(platform: OwnPlatformLike, accessory: PlatformAccessory, config: DoorConfig) {
         if (!config.name) config.name = `door-${config.id}`;
@@ -1220,41 +1242,61 @@ export class OwnDoorAccessory extends OwnAccessory {
         this.doorbellEnabled = config.doorbell ?? false;
         this.resetTimeout = undefined;
         this.doorbellService = null;
+        this.currentLockState = this.Characteristic.LockCurrentState.SECURED;
+
+        // Extract the WHO=7 event code we send when releasing the door, so we can
+        // filter the gateway echo from triggering a spurious doorbell ring.
+        const m = this.openCommand.match(/^\*7\*(\d+)\*/);
+        this.openEventCode = m ? m[1] : null;
 
         this.lockService = this.initPrimaryService(this.Service.LockMechanism, 'Door', true);
 
-        // LockCurrentState: always SECURED until activated, briefly UNSECURED on open
         this.lockService.getCharacteristic(this.Characteristic.LockCurrentState)
-            .onGet(() => this.Characteristic.LockCurrentState.SECURED);
+            .onGet(() => this.currentLockState);
 
         this.lockService.getCharacteristic(this.Characteristic.LockTargetState)
-            .onGet(() => this.Characteristic.LockTargetState.SECURED)
+            .onGet(() => this.currentLockState === this.Characteristic.LockCurrentState.UNSECURED
+                ? this.Characteristic.LockTargetState.UNSECURED
+                : this.Characteristic.LockTargetState.SECURED)
             .onSet((value: CharacteristicValue) => {
-                if (value === this.Characteristic.LockTargetState.UNSECURED) {
-                    this.log.info(`[${this.id}] Door open`);
-                    this.sendOrThrow(this.openCommand);
+                if (value !== this.Characteristic.LockTargetState.UNSECURED) return;
+                this.log.info(`[${this.id}] Door open`);
+                this.sendOrThrow(this.openCommand);
+                this.currentLockState = this.Characteristic.LockCurrentState.UNSECURED;
+                this.lockService.updateCharacteristic(this.Characteristic.LockCurrentState, this.currentLockState);
+                clearTimeout(this.resetTimeout);
+                this.resetTimeout = setTimeout(() => {
+                    this.resetTimeout = undefined;
+                    this.currentLockState = this.Characteristic.LockCurrentState.SECURED;
+                    this.lockService.updateCharacteristic(this.Characteristic.LockTargetState,
+                        this.Characteristic.LockTargetState.SECURED);
                     this.lockService.updateCharacteristic(this.Characteristic.LockCurrentState,
-                        this.Characteristic.LockCurrentState.UNSECURED);
-                    clearTimeout(this.resetTimeout);
-                    this.resetTimeout = setTimeout(() => {
-                        this.lockService.updateCharacteristic(this.Characteristic.LockTargetState,
-                            this.Characteristic.LockTargetState.SECURED);
-                        this.lockService.updateCharacteristic(this.Characteristic.LockCurrentState,
-                            this.Characteristic.LockCurrentState.SECURED);
-                    }, 3000);
-                }
+                        this.currentLockState);
+                }, DOOR_RESET_MS);
             });
 
         if (this.doorbellEnabled) {
-            this.doorbellService = this.accessory.getService(this.Service.Doorbell)
+            const existingDoorbell = this.accessory.getService(this.Service.Doorbell);
+            this.doorbellService = existingDoorbell
                 ?? this.accessory.addService(this.Service.Doorbell, `${this.name} Doorbell`, 'doorbell');
             this.doorbellService.getCharacteristic(this.Characteristic.ProgrammableSwitchEvent)
                 .setProps({ validValues: [this.Characteristic.ProgrammableSwitchEvent.SINGLE_PRESS] });
-            this.lockService.addLinkedService(this.doorbellService);
+            // Avoid duplicating the link descriptor across restarts: only link when not already cached.
+            if (!existingDoorbell) {
+                this.lockService.addLinkedService(this.doorbellService);
+            }
         } else {
-            // Remove a previously-registered Doorbell service if config flipped
+            // Remove a previously-registered Doorbell service if the config flipped.
+            // removeLinkedService first, then removeService — keeps the HAP descriptor consistent.
             const existing = this.accessory.getService(this.Service.Doorbell);
-            if (existing) this.accessory.removeService(existing);
+            if (existing) {
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                const lockAny = this.lockService as any;
+                if (typeof lockAny.removeLinkedService === 'function') {
+                    try { lockAny.removeLinkedService(existing); } catch { /* HAP version mismatch */ }
+                }
+                this.accessory.removeService(existing);
+            }
         }
     }
 
@@ -1262,18 +1304,33 @@ export class OwnDoorAccessory extends OwnAccessory {
         this.setFaultOnline(this.lockService, online);
     }
 
+    /** Doorbell-typed accessories also accept WHO=7 broadcasts (where=0). */
+    checkWhere(where: string): boolean {
+        // Match own id (lock ops always come back for this address) plus
+        // broadcast where=0 packets (intercom incoming-call broadcasts).
+        const idNum = parseInt(where, 10);
+        return idNum === this.id || (this.doorbellEnabled && where === '0');
+    }
+
     onData(packet: string): void {
-        // WHO=7 monitor packets vary by gateway model. The most common ring event is *7*<event>*<id>##.
-        // We accept any *7*…*<id>## packet as a doorbell ring when doorbell mode is enabled.
         if (!this.doorbellEnabled || !this.doorbellService) return;
+        // Accept *7*<event>*<addr>## where addr is digits, including '0' broadcast.
+        // Skip our own open command's event echo to avoid firing the doorbell on user-initiated opens.
         const m = packet.match(/^\*7\*(\d+)\*(\d+)##$/);
-        if (m && parseInt(m[2], 10) === this.id) {
-            this.log.info(`[${this.id}] Doorbell ring (event=${m[1]})`);
-            this.doorbellService.updateCharacteristic(
-                this.Characteristic.ProgrammableSwitchEvent,
-                this.Characteristic.ProgrammableSwitchEvent.SINGLE_PRESS,
-            );
+        if (!m) return;
+        const event = m[1];
+        const where = m[2];
+        if (event === this.openEventCode) {
+            this.log.debug('[%s] Doorbell ignoring open echo (event=%s)', this.id, event);
+            return;
         }
+        const targetsThisDoor = parseInt(where, 10) === this.id || where === '0';
+        if (!targetsThisDoor) return;
+        this.log.info(`[${this.id}] Doorbell ring (event=${event} where=${where})`);
+        this.doorbellService.updateCharacteristic(
+            this.Characteristic.ProgrammableSwitchEvent,
+            this.Characteristic.ProgrammableSwitchEvent.SINGLE_PRESS,
+        );
     }
 
     destroy(): void {

@@ -934,6 +934,8 @@ describe('OwnContactAccessory', () => {
         assert.equal(h.name, 'Renamed in Home');
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         assert.equal((a as any).displayName, 'Renamed in Home', 'displayName must be synced');
+        // updateAccessory should have been called once to push the displayName change to Homebridge
+        assert.equal(p.updateAccessorySpy.calls.length, 1, 'platform.updateAccessory must be called on rename');
     });
 
     it('onData contact detected', () => {
@@ -1213,5 +1215,77 @@ describe("OwnDoorAccessory", () => {
     it("checkWhere matches numeric id", () => {
         assert.ok(handler.checkWhere("91"));
         assert.ok(!handler.checkWhere("92"));
+    });
+
+    it("doorbell does NOT fire on echo of own open command (event=19 by default)", () => {
+        const p = makeMockPlatform();
+        const a = makeMockAccessory();
+        a.addService("AccessoryInformation");
+        const h = new OwnDoorAccessory(p as unknown as P, a as unknown as A, { id: 95, doorbell: true });
+        const svc = a.services["Doorbell"];
+        // Pre-set to ensure we can detect change. Trigger a real ring first to validate test setup.
+        h.onData("*7*8*95##");
+        assert.equal(svc.characteristics["ProgrammableSwitchEvent"].value, 0);
+        // Reset
+        svc.characteristics["ProgrammableSwitchEvent"].value = -1;
+        // Now simulate the echo of the open command
+        h.onData("*7*19*95##");
+        assert.equal(svc.characteristics["ProgrammableSwitchEvent"].value, -1, "echo must not fire doorbell");
+        h.destroy();
+    });
+
+    it("doorbell fires on broadcast packets (where=0)", () => {
+        const p = makeMockPlatform();
+        const a = makeMockAccessory();
+        a.addService("AccessoryInformation");
+        const h = new OwnDoorAccessory(p as unknown as P, a as unknown as A, { id: 96, doorbell: true });
+        const svc = a.services["Doorbell"];
+        h.onData("*7*8*0##");
+        assert.equal(svc.characteristics["ProgrammableSwitchEvent"].value, 0, "broadcast ring must fire doorbell");
+        h.destroy();
+    });
+
+    it("checkWhere accepts where=0 broadcast when doorbell enabled", () => {
+        const p = makeMockPlatform();
+        const a = makeMockAccessory();
+        a.addService("AccessoryInformation");
+        const h = new OwnDoorAccessory(p as unknown as P, a as unknown as A, { id: 97, doorbell: true });
+        assert.ok(h.checkWhere("0"), "doorbell-enabled door must accept broadcast");
+        const a2 = makeMockAccessory();
+        a2.addService("AccessoryInformation");
+        const h2 = new OwnDoorAccessory(p as unknown as P, a2 as unknown as A, { id: 98 });
+        assert.ok(!h2.checkWhere("0"), "non-doorbell door must NOT match where=0");
+        h.destroy(); h2.destroy();
+    });
+
+    it("LockCurrentState.onGet tracks state across the post-open window", () => {
+        const p = makeMockPlatform();
+        const a = makeMockAccessory();
+        a.addService("AccessoryInformation");
+        const h = new OwnDoorAccessory(p as unknown as P, a as unknown as A, { id: 100, name: "front" });
+        const svc = a.services["LockMechanism"];
+        // SECURED initially
+        assert.equal(svc.characteristics["LockCurrentState"].getter!(), 1, "SECURED initially");
+        // Trigger open
+        svc.characteristics["LockTargetState"].setter!(0);
+        // Now onGet should report UNSECURED
+        assert.equal(svc.characteristics["LockCurrentState"].getter!(), 0, "UNSECURED after open");
+        h.destroy();
+    });
+
+    it("custom openCommand: echo filter uses parsed event code, not literal 19", () => {
+        const p = makeMockPlatform();
+        const a = makeMockAccessory();
+        a.addService("AccessoryInformation");
+        const h = new OwnDoorAccessory(p as unknown as P, a as unknown as A, { id: 99, doorbell: true, openCommand: "*7*40*99##" });
+        const svc = a.services["Doorbell"];
+        svc.characteristics["ProgrammableSwitchEvent"].value = -1;
+        // Echo of custom open command (event=40) should NOT fire doorbell
+        h.onData("*7*40*99##");
+        assert.equal(svc.characteristics["ProgrammableSwitchEvent"].value, -1, "custom-event echo must not fire doorbell");
+        // But event=8 (a real ring) should
+        h.onData("*7*8*99##");
+        assert.equal(svc.characteristics["ProgrammableSwitchEvent"].value, 0, "different-event ring must fire doorbell");
+        h.destroy();
     });
 });

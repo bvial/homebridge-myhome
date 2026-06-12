@@ -40,6 +40,8 @@ export const IDENTIFY_BLINK_MS = 500;
 export const IDENTIFY_JOG_MS = 1000;
 /** Scenario auto-reset window (Switch fallback) */
 export const SCENARIO_RESET_MS = 500;
+/** Door auto-reset window (LockMechanism — momentary relay) */
+export const DOOR_RESET_MS = 3000;
 /** Blind move() retry interval when a command is still pending */
 export const BLIND_MOVE_RETRY_INTERVAL_MS = 500;
 /** Max move() retries before giving up */

@@ -210,6 +210,8 @@ export class OwnPlatform implements DynamicPlatformPlugin {
                 this.log.info('Restoring accessory from cache:', existingAccessory.displayName);
                 existingAccessory.context.device = device;
                 existingAccessory.context.type = device.type;
+                // Refresh category in case the user toggled asButton/asOutlet/etc. between sessions.
+                existingAccessory.category = (deviceCategory(device) ?? 1) as unknown as typeof existingAccessory.category;
                 this.api.updatePlatformAccessories([existingAccessory]);
                 if (!this.activeHandlers.find(h => h.accessory === existingAccessory)) {
                     try {
@@ -308,12 +310,15 @@ export class OwnPlatform implements DynamicPlatformPlugin {
 
     onAccessory(where: string | null, packet: string): void {
         if (!where) return;
-        const handler = this.activeHandlers.find(h => h.checkWhere(where));
-        if (handler) {
-            handler.onData(packet);
-        } else {
+        // Dispatch to ALL matching handlers — each subclass's onData regex filters by WHO,
+        // so a light and a door sharing the same numeric id (`where`) both get the packet
+        // and ignore the ones that don't match their WHO prefix.
+        const handlers = this.activeHandlers.filter(h => h.checkWhere(where));
+        if (handlers.length === 0) {
             this.log.debug('Accessory not found', where, packet);
+            return;
         }
+        for (const h of handlers) h.onData(packet);
     }
 
     updateAccessoriesStatus(): void {
@@ -329,5 +334,10 @@ export class OwnPlatform implements DynamicPlatformPlugin {
 
     setAllOnline(online: boolean): void {
         for (const handler of this.activeHandlers) handler.setOnline(online);
+    }
+
+    /** OwnPlatformLike: notify Homebridge that an accessory's mutable state (e.g. displayName) changed. */
+    updateAccessory(accessory: PlatformAccessory): void {
+        this.api.updatePlatformAccessories([accessory]);
     }
 }

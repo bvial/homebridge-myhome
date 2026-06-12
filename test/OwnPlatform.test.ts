@@ -226,6 +226,23 @@ describe('OwnPlatform.discoverDevices', () => {
         for (const h of platform.activeHandlers) h.destroy();
     });
 
+    it('refreshes category for cached accessory when asButton flag flips', () => {
+        const api = makeMockApi();
+        const uuid = api.hap.uuid.generate('myhome-scenario-1');
+        const cached = makeAccessoryStub('btn', uuid);
+        // simulate previous run with asButton:false → category 8 (Switch)
+        (cached as unknown as { category: number }).category = 8;
+        const platform = makePlatformInstance({
+            host: '127.0.0.1',
+            scenarios: [{ id: 1, name: 'btn', asButton: true }],
+        }, api);
+        platform.cachedAccessories.push(cached);
+        platform.discoverDevices();
+        assert.equal((cached as unknown as { category: number }).category, 15,
+            'cached accessory category must be refreshed to PROGRAMMABLE_SWITCH after asButton flip');
+        for (const h of platform.activeHandlers) h.destroy();
+    });
+
     it('destroys handler on stale removal', () => {
         const api = makeMockApi();
         const staleAcc = makeAccessoryStub('Stale', 'uuid-stale');
@@ -359,6 +376,23 @@ describe('OwnPlatform.onAccessory', () => {
         platform.activeHandlers[0].onData = (p: string) => { received = p; };
         platform.onAccessory('42', '*1*1*42##');
         assert.equal(received, '*1*1*42##');
+    });
+
+    it('dispatches packet to ALL handlers matching the same where (cross-WHO id collision)', () => {
+        const api = makeMockApi();
+        const platform = makePlatformInstance({
+            host: '127.0.0.1',
+            lights: [{ id: 42, name: 'L' }],
+            doors: [{ id: 42, name: 'D' }],
+        }, api);
+        platform.discoverDevices();
+        const lightCalls: string[] = [];
+        const doorCalls: string[] = [];
+        platform.activeHandlers[0].onData = (p: string) => { lightCalls.push(p); };
+        platform.activeHandlers[1].onData = (p: string) => { doorCalls.push(p); };
+        platform.onAccessory('42', '*1*1*42##');
+        assert.ok(lightCalls.includes('*1*1*42##'), 'light handler must receive light packet');
+        assert.ok(doorCalls.includes('*1*1*42##'), 'door handler also receives — its onData regex filters it out');
     });
 
     it('logs debug for unmatched where', () => {
