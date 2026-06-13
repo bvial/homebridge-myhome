@@ -283,7 +283,7 @@ export class OwnPlatform implements DynamicPlatformPlugin {
                 case WHO.auxiliary:
                 case WHO.energy:
                 case WHO.videoDoor:
-                    this.onAccessory(info.where, packet);
+                    this.onAccessory(info.who, info.where, packet);
                     break;
                 case WHO.gateway:
                     this.log.debug('Gateway packet', packet);
@@ -308,12 +308,15 @@ export class OwnPlatform implements DynamicPlatformPlugin {
         }
     }
 
-    onAccessory(where: string | null, packet: string): void {
+    onAccessory(who: number | null, where: string | null, packet: string): void {
         if (!where) return;
-        // Dispatch to ALL matching handlers — each subclass's onData regex filters by WHO,
-        // so a light and a door sharing the same numeric id (`where`) both get the packet
-        // and ignore the ones that don't match their WHO prefix.
-        const handlers = this.activeHandlers.filter(h => h.checkWhere(where));
+        // Filter by both WHO and where: the same numeric `where` (e.g. id=42) can be used by
+        // accessories of different WHO codes (light id=42 + door id=42). Without WHO filtering,
+        // each cross-WHO packet would log "unknown packet" errors in mismatched accessories.
+        const handlers = this.activeHandlers.filter(h => {
+            if (who !== null && h.who !== null && h.who !== who) return false;
+            return h.checkWhere(where);
+        });
         if (handlers.length === 0) {
             this.log.debug('Accessory not found', where, packet);
             return;

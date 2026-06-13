@@ -374,11 +374,11 @@ describe('OwnPlatform.onAccessory', () => {
         platform.discoverDevices();
         let received: string | null = null;
         platform.activeHandlers[0].onData = (p: string) => { received = p; };
-        platform.onAccessory('42', '*1*1*42##');
+        platform.onAccessory(1, '42', '*1*1*42##');
         assert.equal(received, '*1*1*42##');
     });
 
-    it('dispatches packet to ALL handlers matching the same where (cross-WHO id collision)', () => {
+    it('dispatches packet to ALL handlers matching the same WHO and where', () => {
         const api = makeMockApi();
         const platform = makePlatformInstance({
             host: '127.0.0.1',
@@ -390,9 +390,14 @@ describe('OwnPlatform.onAccessory', () => {
         const doorCalls: string[] = [];
         platform.activeHandlers[0].onData = (p: string) => { lightCalls.push(p); };
         platform.activeHandlers[1].onData = (p: string) => { doorCalls.push(p); };
-        platform.onAccessory('42', '*1*1*42##');
+        // Light packet (WHO=1) → ONLY the light handler should receive it
+        platform.onAccessory(1, '42', '*1*1*42##');
         assert.ok(lightCalls.includes('*1*1*42##'), 'light handler must receive light packet');
-        assert.ok(doorCalls.includes('*1*1*42##'), 'door handler also receives — its onData regex filters it out');
+        assert.equal(doorCalls.length, 0, 'door handler must NOT receive WHO=1 packets');
+        // Door packet (WHO=7) → ONLY the door handler should receive it
+        platform.onAccessory(7, '42', '*7*8*42##');
+        assert.ok(doorCalls.includes('*7*8*42##'), 'door handler must receive WHO=7 packet');
+        assert.equal(lightCalls.length, 1, 'light handler must NOT receive WHO=7 packets');
     });
 
     it('logs debug for unmatched where', () => {
@@ -400,7 +405,7 @@ describe('OwnPlatform.onAccessory', () => {
         const platform = makePlatformInstance({ host: '127.0.0.1' }, api);
         const debugCalls: unknown[][] = [];
         platform.log.debug = function (...args: unknown[]) { debugCalls.push(args); } as typeof platform.log.debug;
-        platform.onAccessory('99', '*1*1*99##');
+        platform.onAccessory(1, '99', '*1*1*99##');
         assert.ok(debugCalls.length > 0);
     });
 });

@@ -1,6 +1,6 @@
 import type { Characteristic, CharacteristicValue, HapStatusError, Logging, PlatformAccessory, Service } from 'homebridge';
 import type { OwnClient } from './OwnNet';
-import { OwnProtcol } from './OwnProtcol';
+import { OwnProtcol, WHO } from './OwnProtcol';
 import { PLUGIN_VERSION } from './constants';
 import {
     brightnessToOwnLevel,
@@ -241,6 +241,8 @@ export class OwnLightAccessory extends OwnAccessory {
     private lightbulbService: InstanceType<typeof Service>;
     private identifyTimeout: ReturnType<typeof setTimeout> | undefined;
 
+    get who(): number { return WHO.light; }
+
     constructor(platform: OwnPlatformLike, accessory: PlatformAccessory, config: LightConfig) {
         if (!config.name) config.name = `light-${config.id}`;
         super(platform, accessory, config);
@@ -363,6 +365,8 @@ export class OwnBlindAccessory extends OwnAccessory {
     private initTimeout: ReturnType<typeof setTimeout> | undefined;
     private identifyJogTimeout: ReturnType<typeof setTimeout> | undefined;
     private windowCoveringService: InstanceType<typeof Service>;
+
+    get who(): number { return WHO.automation; }
 
     constructor(platform: OwnPlatformLike, accessory: PlatformAccessory, config: BlindConfig) {
         if (!config.name) config.name = `blind-${config.id}`;
@@ -746,6 +750,8 @@ export class OwnThermostatAccessory extends OwnAccessory {
     private thermostatService: InstanceType<typeof Service>;
     private temperatureSensorService: InstanceType<typeof Service>;
 
+    get who(): number { return WHO.temperature; }
+
     constructor(platform: OwnPlatformLike, accessory: PlatformAccessory, config: ThermostatConfig) {
         if (!config.name) config.name = `thermostat-${config.id}`;
         super(platform, accessory, config);
@@ -767,16 +773,13 @@ export class OwnThermostatAccessory extends OwnAccessory {
 
         // Linked TemperatureSensor — exposes CurrentTemperature for the Home app's
         // temperature history graph (Thermostat.CurrentTemperature is not graphed).
-        const existingTempSensor = this.accessory.getService(this.Service.TemperatureSensor);
-        this.temperatureSensorService = existingTempSensor
+        this.temperatureSensorService = this.accessory.getService(this.Service.TemperatureSensor)
             ?? this.accessory.addService(this.Service.TemperatureSensor, `${this.name} Temperature`, 'temperature');
         this.temperatureSensorService.getCharacteristic(this.Characteristic.CurrentTemperature)
             .setProps({ minValue: -50, maxValue: 50, minStep: 0.1 })
             .onGet(() => this.temperature);
-        // Only link on first-time creation; HAP persists the link descriptor across restarts.
-        if (!existingTempSensor) {
-            this.thermostatService.addLinkedService(this.temperatureSensorService);
-        }
+        // HAP-NodeJS deduplicates linked services by iid — calling on every restart is safe.
+        this.thermostatService.addLinkedService(this.temperatureSensorService);
 
         this.thermostatService.getCharacteristic(this.Characteristic.CurrentHeatingCoolingState)
             .onGet(() => this.heatingCoolingState);
@@ -1051,6 +1054,8 @@ export class OwnContactAccessory extends OwnAccessory {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     private stateChar: any;
 
+    get who(): number { return WHO.auxiliary; }
+
     constructor(platform: OwnPlatformLike, accessory: PlatformAccessory, config: ContactConfig) {
         if (!config.name) config.name = `contact-${config.id}`;
         super(platform, accessory, config);
@@ -1134,6 +1139,8 @@ export class OwnEnergyAccessory extends OwnAccessory {
     private energyService: InstanceType<typeof Service>;
     private pollInterval: ReturnType<typeof setInterval>;
     private destroyed = false;
+
+    get who(): number { return WHO.energy; }
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     private eveWattsChar: any;
 
@@ -1234,6 +1241,8 @@ export class OwnDoorAccessory extends OwnAccessory {
     private resetTimeout: ReturnType<typeof setTimeout> | undefined;
     private currentLockState: number;
 
+    get who(): number { return WHO.videoDoor; }
+
     constructor(platform: OwnPlatformLike, accessory: PlatformAccessory, config: DoorConfig) {
         if (!config.name) config.name = `door-${config.id}`;
         super(platform, accessory, config);
@@ -1276,15 +1285,12 @@ export class OwnDoorAccessory extends OwnAccessory {
             });
 
         if (this.doorbellEnabled) {
-            const existingDoorbell = this.accessory.getService(this.Service.Doorbell);
-            this.doorbellService = existingDoorbell
+            this.doorbellService = this.accessory.getService(this.Service.Doorbell)
                 ?? this.accessory.addService(this.Service.Doorbell, `${this.name} Doorbell`, 'doorbell');
             this.doorbellService.getCharacteristic(this.Characteristic.ProgrammableSwitchEvent)
                 .setProps({ validValues: [this.Characteristic.ProgrammableSwitchEvent.SINGLE_PRESS] });
-            // Avoid duplicating the link descriptor across restarts: only link when not already cached.
-            if (!existingDoorbell) {
-                this.lockService.addLinkedService(this.doorbellService);
-            }
+            // HAP-NodeJS deduplicates linked services by iid.
+            this.lockService.addLinkedService(this.doorbellService);
         } else {
             // Remove a previously-registered Doorbell service if the config flipped.
             // removeLinkedService first, then removeService — keeps the HAP descriptor consistent.
@@ -1309,7 +1315,8 @@ export class OwnDoorAccessory extends OwnAccessory {
         // Match own id (lock ops always come back for this address) plus
         // broadcast where=0 packets (intercom incoming-call broadcasts).
         const idNum = parseInt(where, 10);
-        return idNum === this.id || (this.doorbellEnabled && where === '0');
+        if (idNum === this.id) return true;
+        return this.doorbellEnabled && idNum === 0;
     }
 
     onData(packet: string): void {
@@ -1324,7 +1331,8 @@ export class OwnDoorAccessory extends OwnAccessory {
             this.log.debug('[%s] Doorbell ignoring open echo (event=%s)', this.id, event);
             return;
         }
-        const targetsThisDoor = parseInt(where, 10) === this.id || where === '0';
+        const whereNum = parseInt(where, 10);
+        const targetsThisDoor = whereNum === this.id || whereNum === 0;
         if (!targetsThisDoor) return;
         this.log.info(`[${this.id}] Doorbell ring (event=${event} where=${where})`);
         this.doorbellService.updateCharacteristic(
