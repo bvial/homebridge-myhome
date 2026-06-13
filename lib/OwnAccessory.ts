@@ -1139,10 +1139,10 @@ export class OwnEnergyAccessory extends OwnAccessory {
     private energyService: InstanceType<typeof Service>;
     private pollInterval: ReturnType<typeof setInterval>;
     private destroyed = false;
-
-    get who(): number { return WHO.energy; }
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     private eveWattsChar: any;
+
+    get who(): number { return WHO.energy; }
 
     constructor(platform: OwnPlatformLike, accessory: PlatformAccessory, config: EnergyConfig) {
         if (!config.name) config.name = `energy-${config.id}`;
