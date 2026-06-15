@@ -2,41 +2,85 @@
 
 All notable changes to this project are documented here.
 
-## [0.4.1]
+## [0.4.4] — Unreleased
 
 ### Fixed
-- **CRITICAL — Blind manual operation not reflected in HomeKit after first cycle.**
-  `evaluatePosition()` cleared the position-tracking timeout but never reset
-  the field to `undefined`, causing the `!this.positionTimeout` guard in `onData`
-  to permanently block subsequent state updates. Symptom: after autocalibration,
-  the first manual UP/STOP cycle worked, then all later wall-switch movements
-  were silently ignored.
-- **Calibration safety STOP not always sent.** The init timer is meant as a
-  safety net guaranteeing a STOP after the full travel time. `endCalibration()`
-  was clearing this timer when a premature gateway STOP arrived, defeating the
-  guarantee. Now the timer fires unconditionally — duplicate STOPs are harmless.
-- **Blind direction mapping inverted.** On BTicino installations, the gateway
-  broadcasts `*2*1*<id>##` for DOWN/closing and `*2*2*<id>##` for UP/opening.
-  Previous versions mapped these incorrectly, causing HomeKit to display
-  "closing" while the blind opened (and vice versa). Both incoming packet
-  interpretation and outgoing commands (`moveUp`, `moveDown`, calibration init)
-  are now aligned with the BTicino convention:
+- **Blind direction mapping inverted (regression observed in field).** On
+  BTicino installations the gateway broadcasts `*2*1*<id>##` for DOWN/closing
+  and `*2*2*<id>##` for UP/opening. The plugin had these reversed, causing
+  HomeKit to display "closing" when the user manually opened the blind via the
+  wall switch (and vice versa). Both incoming packet interpretation and
+  outgoing commands are now aligned with the BTicino convention:
     - `onData` direction `'1'` → `DECREASING`, direction `'2'` → `INCREASING`
     - `moveUp()` sends `*2*2*<id>##`
     - `moveDown()` sends `*2*1*<id>##`
     - Calibration init sends `*2*1*<id>##`
+- **Calibration safety STOP not always sent.** The init timer is meant as a
+  safety net guaranteeing a STOP after the full travel time. `endCalibration()`
+  was clearing this timer when a premature gateway STOP arrived, defeating the
+  guarantee. Now the timer fires unconditionally — duplicate STOPs are
+  harmless (motor already off).
 - **Thermostat HAP "value 0 exceeded minimum of 5" warning at startup.**
   The `TargetTemperature` characteristic exposes `minValue=5/maxValue=30` but
   the field was initialized to `0`. HomeKit's first read produced a warning.
   Fix: initialize `targetTemperature` to `20°C` (sane default within range)
-  and clamp every `updateCharacteristicTargetTemperature()` value to
-  `[5, 30]` so gateway packets reporting out-of-range setpoints (e.g. `0`
-  when the zone is OFF) no longer trigger the warning.
+  and clamp every `updateCharacteristicTargetTemperature()` value to `[5, 30]`
+  so gateway packets reporting out-of-range setpoints (e.g. `0` when the zone
+  is OFF) no longer trigger the warning.
 
-### Unchanged from 0.4.0
-- Blind position tracking, caching, `calibrateOnStart`, all other behavior.
+## [0.4.3] — 2026-06-15
 
-## [0.4.0]
+### Reverted
+- **`inverted` blind option removed.** Introduced briefly in the previous tag
+  to swap UP/DOWN OWN codes for some installations, the option's default
+  flip caused regressions in setups that did not opt out explicitly. Reverted
+  to the 0.4.0 direction mapping. (A correct fix lands in 0.4.4 by aligning
+  the mapping to the BTicino convention.)
+
+## [0.4.2] — 2026-06-15
+
+### Fixed
+- **CRITICAL — Blind manual operation not reflected in HomeKit after first
+  cycle.** `evaluatePosition()` cleared the position-tracking timeout but
+  never reset the field to `undefined`, causing the `!this.positionTimeout`
+  guard in `onData` to permanently block subsequent state updates. Symptom:
+  after autocalibration, the first manual UP/STOP cycle worked, then all
+  later wall-switch movements were silently ignored.
+
+### Added
+- **`inverted` blind config option** to swap UP/DOWN OWN direction codes.
+  *(Reverted in 0.4.3.)*
+
+## [0.4.1] — 2026-06-15
+
+### Fixed
+- **`log.success` → `log.info`** for compatibility with Homebridge 2.0.x
+  (the `log.success` method was added in 2.1; some installations were on 2.0
+  and could not load the plugin).
+
+### Added
+- **Custom `where` for lights** — optional raw OWN `WHERE` address for
+  special relay configurations (e.g. `"68#4#01"`). Defaults to `String(id)`.
+  Light command and status-query regexes accept `[\d#]+` for the address
+  field so non-numeric addresses are recognized in incoming monitor packets.
+- **Blind position cache + `calibrateOnStart`** — the last known position is
+  cached to `accessory.context.blindPosition` on every STOP and at every 10%
+  boundary during movement. With `calibrateOnStart: false` the cached
+  position is restored at startup without moving the blind.
+- **Auto-discovery of devices** — `autoDiscover: true` (default `false`)
+  scans the gateway at startup for devices not yet in config and registers
+  them as placeholder accessories (`Light 5`, `Blind 3`, …). New
+  `autoDiscoverMaxAddr` (default 20) caps the probe range. Shared
+  `lib/scanHelper.ts` is reused by the standalone `scan.ts` CLI tool.
+- **Bug fix audit pass on the blind state machine** — STOP packets now
+  always trigger `evaluatePosition()` even when `positionTimeout` is pending;
+  position snap on STOP only applies during HomeKit movement; `initPhase` is
+  cleared when `position === 0`; `homeKitMovement` is restored on rapid
+  retarget; `move()` retry path increments `moveRetries` and gives up after
+  `BLIND_MAX_MOVE_RETRIES`; `startMoveTracking` give-up calls
+  `stopMoveTracking()`; `identify` jog protects ongoing movements.
+
+## [0.4.0] — 2026-06-13
 
 ### Added
 - **Door / Video Door (WHO=7)** support: new `doors[]` config entry exposes a
