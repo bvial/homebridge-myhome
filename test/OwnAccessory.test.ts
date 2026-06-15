@@ -501,7 +501,7 @@ describe('OwnBlindAccessory', () => {
         assert.equal(accessory.context.blindPosition, 53, 'position must be cached on physical STOP');
     });
 
-    it('successive manual operations after STOP all reflect in HomeKit (regression test)', () => {
+    it('successive manual operations after STOP all reflect in HomeKit (regression test)', (_t, done) => {
         // Bug: positionTimeout was cleared but never reset to undefined in evaluatePosition().
         // After the first physical STOP, the variable kept its (cancelled) reference, so the
         // onData guard `!this.positionTimeout` was false, blocking subsequent evaluatePosition() calls.
@@ -516,20 +516,46 @@ describe('OwnBlindAccessory', () => {
         assert.equal(handler.state, POSITION_STATE.STOPPED);
         assert.equal(handler.positionTimeout, undefined, 'positionTimeout must be undefined after STOP');
 
-        // 2nd manual cycle: DOWN — must update HomeKit state
-        handler.onData('*2*2*23##');
-        assert.equal(handler.state, POSITION_STATE.DECREASING, '2nd manual movement state must be reflected');
-        assert.equal(svc.characteristics['PositionState'].value, POSITION_STATE.DECREASING,
-            '2nd movement PositionState must be pushed to HomeKit');
+        // Wait past the post-STOP spurious-packet grace window (150ms)
+        setTimeout(() => {
+            // 2nd manual cycle: DOWN — must update HomeKit state
+            handler.onData('*2*2*23##');
+            assert.equal(handler.state, POSITION_STATE.DECREASING, '2nd manual movement state must be reflected');
+            assert.equal(svc.characteristics['PositionState'].value, POSITION_STATE.DECREASING,
+                '2nd movement PositionState must be pushed to HomeKit');
 
-        // 2nd STOP
+            // 2nd STOP
+            handler.onData('*2*0*23##');
+            assert.equal(handler.state, POSITION_STATE.STOPPED, '2nd STOP must be reflected');
+
+            setTimeout(() => {
+                // 3rd manual cycle: UP again — must still update HomeKit
+                handler.onData('*2*1*23##');
+                assert.equal(handler.state, POSITION_STATE.INCREASING, '3rd manual movement state must be reflected');
+                assert.equal(svc.characteristics['PositionState'].value, POSITION_STATE.INCREASING);
+                done();
+            }, 200);
+        }, 200);
+    });
+
+    it('post-STOP spurious direction packet (BTicino F454) is suppressed', () => {
+        // F454 broadcasts *2*2* (DECREASING) immediately after a wall-switch STOP, which
+        // would otherwise be mis-interpreted as a new DOWN movement. The plugin must ignore
+        // this packet when received within ~150ms of the STOP and position == target.
+        const svc = accessory.services['WindowCovering'];
+        handler.position = 34;
+        handler.target = 34;
+        handler.state = POSITION_STATE.STOPPED;
+
+        // Simulate the exact F454 sequence observed in field logs:
+        //   *2*0* (STOP) → *2*2* (spurious, immediately after)
         handler.onData('*2*0*23##');
-        assert.equal(handler.state, POSITION_STATE.STOPPED, '2nd STOP must be reflected');
+        const stateAfterStop = handler.state;
+        handler.onData('*2*2*23##'); // spurious — must be ignored
 
-        // 3rd manual cycle: UP again — must still update HomeKit
-        handler.onData('*2*1*23##');
-        assert.equal(handler.state, POSITION_STATE.INCREASING, '3rd manual movement state must be reflected');
-        assert.equal(svc.characteristics['PositionState'].value, POSITION_STATE.INCREASING);
+        assert.equal(handler.state, stateAfterStop, 'state must remain STOPPED, not DECREASING');
+        assert.equal(svc.characteristics['PositionState'].value, POSITION_STATE.STOPPED,
+            'PositionState must remain STOPPED in HomeKit despite spurious packet');
     });
 
     it('STOPPED during HomeKit movement does NOT overwrite target', () => {

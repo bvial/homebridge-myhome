@@ -14,6 +14,7 @@ import {
     BLIND_MAX_MOVE_RETRIES,
     BLIND_COMMAND_ECHO_TIMEOUT_MS,
     BLIND_INIT_CALIBRATION_MARGIN_MS,
+    BLIND_POST_STOP_GRACE_MS,
     BLIND_QUEUE_BUSY_THRESHOLD,
     BLIND_MIN_TICK_MS,
     ENERGY_POLL_INTERVAL_MS,
@@ -374,6 +375,11 @@ export class OwnBlindAccessory extends OwnAccessory {
     private inStatusQuery: boolean;
     private statusQueryTimeout: ReturnType<typeof setTimeout> | undefined;
     private initTimeout: ReturnType<typeof setTimeout> | undefined;
+    /** True for a brief grace window after a STOP packet, used to suppress the
+     *  spurious post-STOP direction packet some BTicino gateways emit
+     *  (F454 reliably sends *2*2* a few ms after a wall-switch STOP). */
+    private postStopGrace: boolean;
+    private postStopGraceTimeout: ReturnType<typeof setTimeout> | undefined;
     private identifyJogTimeout: ReturnType<typeof setTimeout> | undefined;
     private windowCoveringService: InstanceType<typeof Service>;
 
@@ -406,6 +412,8 @@ export class OwnBlindAccessory extends OwnAccessory {
         this.inStatusQuery = false;
         this.statusQueryTimeout = undefined;
         this.initTimeout = undefined;
+        this.postStopGrace = false;
+        this.postStopGraceTimeout = undefined;
 
         this.windowCoveringService = this.initPrimaryService(this.Service.WindowCovering, 'WindowCovering', true);
 
@@ -604,6 +612,26 @@ export class OwnBlindAccessory extends OwnAccessory {
         if (extract) {
             this.log.debug('id:%s onBlind(%s)', this.id, packet);
             const direction = extract[1];
+
+            // Some BTicino gateways (F454 confirmed) send a spurious *2*1* or *2*2* immediately
+            // after a wall-switch STOP that does not represent a real new movement. Suppress
+            // exactly ONE such direction packet that arrives during the post-STOP grace window
+            // when no HomeKit movement is in progress and position == target (stable rest).
+            if (this.postStopGrace && direction !== '0' && !this.homeKitMovement
+                && !this.commandSent && this.position === this.target) {
+                this.log.debug('[%s] Ignoring spurious post-STOP direction packet %s', this.id, packet);
+                this.postStopGrace = false;
+                clearTimeout(this.postStopGraceTimeout);
+                this.postStopGraceTimeout = undefined;
+                return;
+            }
+            // Any direction packet we DO process closes the grace window early.
+            if (this.postStopGrace) {
+                this.postStopGrace = false;
+                clearTimeout(this.postStopGraceTimeout);
+                this.postStopGraceTimeout = undefined;
+            }
+
             const prevState = this.state;
             if (direction === '0') {
                 const wasDecreasing = this.state === this.Characteristic.PositionState.DECREASING;
@@ -617,6 +645,14 @@ export class OwnBlindAccessory extends OwnAccessory {
                     this.position = this.target;
                 }
                 this.cachePosition();
+                // Arm grace window to ignore the spurious direction packet that some
+                // BTicino gateways emit immediately after a STOP (within tens of ms).
+                this.postStopGrace = true;
+                clearTimeout(this.postStopGraceTimeout);
+                this.postStopGraceTimeout = setTimeout(() => {
+                    this.postStopGrace = false;
+                    this.postStopGraceTimeout = undefined;
+                }, BLIND_POST_STOP_GRACE_MS);
             } else if (direction === '1') {
                 this.state = this.Characteristic.PositionState.INCREASING;
             } else if (direction === '2') {
@@ -788,6 +824,9 @@ export class OwnBlindAccessory extends OwnAccessory {
         this.statusQueryTimeout = undefined;
         clearTimeout(this.initTimeout);
         this.initTimeout = undefined;
+        clearTimeout(this.postStopGraceTimeout);
+        this.postStopGraceTimeout = undefined;
+        this.postStopGrace = false;
         this.inStatusQuery = false;
         this.commandSent = false;
         this.homeKitMovement = false;
@@ -808,7 +847,6 @@ export class OwnThermostatAccessory extends OwnAccessory {
     address: string;
     temperature: number;
     targetTemperature: number;
-    localOffset: number;
     heatingCoolingState: number;
     targetHeatingCoolingState: number;
     displayUnits: number;
@@ -832,7 +870,6 @@ export class OwnThermostatAccessory extends OwnAccessory {
         // characteristic read does not produce a "value exceeded minimum" HAP warning.
         // Real value will be overwritten by the first DIM 14 packet from the gateway.
         this.targetTemperature = 20;
-        this.localOffset = 0;
         this.heatingCoolingState = this.Characteristic.CurrentHeatingCoolingState.OFF;
         this.targetHeatingCoolingState = this.Characteristic.TargetHeatingCoolingState.OFF;
         this.displayUnits = this.Characteristic.TemperatureDisplayUnits.CELSIUS;
@@ -957,22 +994,26 @@ export class OwnThermostatAccessory extends OwnAccessory {
         if ((extract = packet.match(/^\*#4\*\d+\*0\*(\d+)##$/))) {
             this.updateCharacteristicCurrentTemperature(OwnProtcol.decodeTemperature(extract[1]));
         } else if ((extract = packet.match(/^\*#4\*\d+\*12\*(\d+)\*3##$/))) {
-            const probeTemp = OwnProtcol.decodeTemperature(extract[1]);
-            this.log.debug(`[${this.id}] zone[${this.zone}] probe temperature with local offset (${probeTemp})`);
+            this.log.debug(`[${this.id}] zone[${this.zone}] probe temperature with local offset (${OwnProtcol.decodeTemperature(extract[1])})`);
         } else if ((extract = packet.match(/^\*#4\*\d+\*13\*(\d+)##$/))) {
-            let status = 'Local ON';
             const value = extract[1];
-            if (value === '00') this.localOffset = 0;
-            else if (value === '01') this.localOffset = 1;
-            else if (value === '11') this.localOffset = -1;
-            else if (value === '02') this.localOffset = 2;
-            else if (value === '12') this.localOffset = -2;
-            else if (value === '03') this.localOffset = 3;
-            else if (value === '13') this.localOffset = -3;
-            else if (value === '04') { this.localOffset = 0; status = 'Local OFF'; }
-            else if (value === '05') { this.localOffset = 0; status = 'Local protection'; }
-            else { this.log.warn('[%s] zone[%s] unknown DIM 13 value (%s) in packet: %s', this.id, this.zone, value, packet); }
-            this.log.debug('[%s] zone[%s] local offset:%s (%s)', this.id, this.zone, this.localOffset, status);
+            const offsets: Record<string, { offset: number; status: string }> = {
+                '00': { offset: 0, status: 'Local ON' },
+                '01': { offset: 1, status: 'Local ON' },
+                '11': { offset: -1, status: 'Local ON' },
+                '02': { offset: 2, status: 'Local ON' },
+                '12': { offset: -2, status: 'Local ON' },
+                '03': { offset: 3, status: 'Local ON' },
+                '13': { offset: -3, status: 'Local ON' },
+                '04': { offset: 0, status: 'Local OFF' },
+                '05': { offset: 0, status: 'Local protection' },
+            };
+            const decoded = offsets[value];
+            if (!decoded) {
+                this.log.warn('[%s] zone[%s] unknown DIM 13 value (%s) in packet: %s', this.id, this.zone, value, packet);
+            } else {
+                this.log.debug('[%s] zone[%s] local offset:%s (%s)', this.id, this.zone, decoded.offset, decoded.status);
+            }
         } else if ((extract = packet.match(/^\*#4\*[\d#]+\*14\*(\d+)\*\d+##$/))) {
             this.updateCharacteristicTargetTemperature(OwnProtcol.decodeTemperature(extract[1]));
         } else if ((extract = packet.match(/^\*#4\*[\d#]+\*19\*(\d)\*(\d)##$/))) {
@@ -1026,9 +1067,8 @@ export class OwnThermostatAccessory extends OwnAccessory {
                 this.updateCharacteristicTargetHeatingCoolingState(this.Characteristic.TargetHeatingCoolingState.AUTO);
                 this.log.debug('[%s] zone[%s] operation mode Heating program', this.id, this.zone);
             } else if (valInt > 13000 && valInt <= 13255) {
-                const days = valInt - 13000;
                 this.updateCharacteristicTargetHeatingCoolingState(this.Characteristic.TargetHeatingCoolingState.AUTO);
-                this.log.debug('[%s] zone[%s] operation mode Holiday program for %s day', this.id, this.zone, days);
+                this.log.debug('[%s] zone[%s] operation mode Holiday program for %s day', this.id, this.zone, valInt - 13000);
             } else if (valInt === 21) {
                 this.log.debug('[%s] zone[%s] Remote control enabled', this.id, this.zone);
             } else if (valInt === 0) {

@@ -34,8 +34,6 @@ export const CMD = {
     START_MONITOR: '*99*1##',
     SCAN: '*1001*12*0##',
     SCAN_ALL: '*#1001*0*13##',
-    SCAN_UNCONFIGURED: '*#1001*0*13#0##',
-    START_CONFIGURED: '*#1001*0*13#1##',
 } as const;
 
 export interface CommandParams {
@@ -503,61 +501,6 @@ export class OwnClient extends EventEmitter {
         // instance and would lose them across reconnects.
     }
 
-    private runScan(cmd: string, callback?: (macs: number[]) => void): void {
-        const SCAN_INIT = 0;
-        const SCAN_RECEIVE = 1;
-        let state = SCAN_INIT;
-        const macs: number[] = [];
-        let done = false;
-        const finish = (result: number[]) => {
-            if (!done) {
-                done = true;
-                clearTimeout(scanTimeout);
-                if (callback) callback(result);
-            }
-        };
-        const confconn = this.newConnection(MODE.CONFIG);
-        const scanTimeout = setTimeout(() => {
-            this.log.warn('runScan: timeout after 30s, aborting');
-            confconn.end();
-            finish([]);
-        }, 30000);
-        confconn.on('connected', () => {
-            confconn.sendPacket(CMD.SCAN);
-        });
-        confconn.on('packet', (pkt: string) => {
-            switch (state) {
-                case SCAN_INIT:
-                    if (pkt === PKT.ACK) {
-                        state = SCAN_RECEIVE;
-                        confconn.log.debug('Start scan');
-                        confconn.sendPacket(cmd);
-                    } else {
-                        this.log.error(`unexpected packet expected '${PKT.ACK}' got '${pkt}'`);
-                    }
-                    break;
-                case SCAN_RECEIVE:
-                    if (pkt === PKT.ACK) {
-                        confconn.end();
-                        finish(macs);
-                    } else {
-                        const m = pkt.match(/\*#(\d+)\*(\d+)\*(\d+)\*(\d+)##/);
-                        if (m) {
-                            macs.push(parseInt(m[4], 10));
-                        } else {
-                            this.log.debug(`scan: skipping unknown packet: ${pkt}`);
-                        }
-                    }
-                    break;
-            }
-        });
-        confconn.on('close', () => {
-            this.log.warn('runScan: connection closed unexpectedly, aborting');
-            finish([]);
-        });
-        confconn.connect();
-    }
-
     detectGatewayModel(callback: (model: string | null) => void): void {
         const collected: string[] = [];
         this.sendCommand({
@@ -583,17 +526,5 @@ export class OwnClient extends EventEmitter {
                 callback(null);
             },
         });
-    }
-
-    scanSystem(callback?: (macs: number[]) => void): void {
-        this.runScan(CMD.SCAN_ALL, callback);
-    }
-
-    scanUnconfigured(callback?: (macs: number[]) => void): void {
-        this.runScan(CMD.SCAN_UNCONFIGURED, callback);
-    }
-
-    scanConfigured(callback?: (macs: number[]) => void): void {
-        this.runScan(CMD.START_CONFIGURED, callback);
     }
 }

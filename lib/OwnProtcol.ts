@@ -21,21 +21,12 @@ export const WHO = {
 
 export type WhoValue = typeof WHO[keyof typeof WHO];
 
-export interface ParsedStatus {
-    type: WhoValue | null;
-    id: number;
-    status: boolean | number | null;
-}
-
 export interface PacketInfo {
     who: WhoValue | null;
     where: string | null;
 }
 
 export class OwnProtcol {
-    static readonly reGen = /^\*([0-9]+)\*([0-9]+)\*([0-9]+)##$/i;
-    static readonly reTemp = /^\*#4\*([0-9]+)\*0\*([0-9]+)##$/i;
-
     static getWhoType(who: string | number): WhoValue | null {
         const whoInt = parseInt(String(who), 10);
         switch (whoInt) {
@@ -60,46 +51,6 @@ export class OwnProtcol {
             case 1013: return WHO.deviceDiagnostic;
             default: return null;
         }
-    }
-
-    static getStatus(who: string | number, state: string | number): boolean | number | null {
-        const whoInt = parseInt(String(who), 10);
-        const stateInt = parseInt(String(state), 10);
-        switch (whoInt) {
-            case 1:
-                switch (stateInt) {
-                    case 0: return false;
-                    case 1: return true;
-                    default: return null;
-                }
-            case 2: return stateInt;
-            case 4: return stateInt / 10;
-            default: return null;
-        }
-    }
-
-    static status(type: WhoValue | null, id: string, status: boolean | number | null): ParsedStatus {
-        return { type, id: parseInt(id, 10), status };
-    }
-
-    static parseStatus(data: unknown): Partial<ParsedStatus> {
-        if (typeof data !== 'string') return {};
-        let response: RegExpMatchArray | null;
-        if ((response = data.match(OwnProtcol.reGen))) {
-            return OwnProtcol.status(OwnProtcol.getWhoType(response[1]), response[3], OwnProtcol.getStatus(response[1], response[2]));
-        }
-        if ((response = data.match(OwnProtcol.reTemp))) {
-            return OwnProtcol.status(OwnProtcol.getWhoType('4'), response[1], OwnProtcol.decodeTemperature(response[2]));
-        }
-        return {};
-    }
-
-    static parseWHO(packet: string): WhoValue | null {
-        return OwnProtcol.extractPacketInfo(packet).who;
-    }
-
-    static parseWhere(packet: string): string | null {
-        return OwnProtcol.extractPacketInfo(packet).where;
     }
 
     static extractPacketInfo(packet: string): PacketInfo {

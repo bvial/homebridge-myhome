@@ -4,7 +4,6 @@ export const POSITION_STATE = { DECREASING: 0, INCREASING: 1, STOPPED: 2 } as co
 export const HEATING_COOLING_CURRENT = { OFF: 0, HEAT: 1, COOL: 2 } as const;
 export const HEATING_COOLING_TARGET = { OFF: 0, HEAT: 1, COOL: 2, AUTO: 3 } as const;
 export const CONTACT_STATE = { CONTACT_DETECTED: 0, CONTACT_NOT_DETECTED: 1 } as const;
-const TEMP_UNITS = { CELSIUS: 0 } as const;
 
 function noop(): void {}
 
@@ -133,7 +132,7 @@ export function makeMockPlatform() {
         TargetHeatingCoolingState: Object.assign('TargetHeatingCoolingState', HEATING_COOLING_TARGET),
         CurrentTemperature: 'CurrentTemperature',
         TargetTemperature: 'TargetTemperature',
-        TemperatureDisplayUnits: Object.assign('TemperatureDisplayUnits', TEMP_UNITS),
+        TemperatureDisplayUnits: Object.assign('TemperatureDisplayUnits', { CELSIUS: 0 }),
         ContactSensorState: Object.assign('ContactSensorState', CONTACT_STATE),
         CurrentAmbientLightLevel: 'CurrentAmbientLightLevel',
         StatusActive: 'StatusActive',

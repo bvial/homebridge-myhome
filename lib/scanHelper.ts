@@ -9,7 +9,7 @@ export interface ScanFound {
 }
 
 /** OWN protocol maximum zone number for thermostat probes (WHO=4). */
-export const THERMOSTAT_MAX_ZONE = 9;
+const THERMOSTAT_MAX_ZONE = 9;
 
 /** Batch size kept safely below COMMAND_QUEUE_CAPACITY. */
 const SCAN_BATCH = Math.floor(COMMAND_QUEUE_CAPACITY * 0.8);

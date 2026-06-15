@@ -21,67 +21,6 @@ describe('getWhoType', () => {
     });
 });
 
-describe('getStatus', () => {
-    it('light off', () => { assert.equal(OwnProtcol.getStatus('1', '0'), false); });
-    it('light on', () => { assert.equal(OwnProtcol.getStatus('1', '1'), true); });
-    it('light unknown level returns null', () => { assert.equal(OwnProtcol.getStatus('1', '5'), null); });
-    it('automation returns integer', () => { assert.equal(OwnProtcol.getStatus('2', '1'), 1); });
-    it('temperature divides by 10', () => { assert.equal(OwnProtcol.getStatus('4', '210'), 21); });
-    it('unknown who returns null', () => { assert.equal(OwnProtcol.getStatus('99', '0'), null); });
-});
-
-describe('parseStatus', () => {
-    it('parses light on', () => {
-        const r = OwnProtcol.parseStatus('*1*1*42##');
-        assert.deepEqual(r, { type: WHO.light, id: 42, status: true });
-    });
-    it('parses light off', () => {
-        const r = OwnProtcol.parseStatus('*1*0*42##');
-        assert.deepEqual(r, { type: WHO.light, id: 42, status: false });
-    });
-    it('parses automation', () => {
-        const r = OwnProtcol.parseStatus('*2*1*23##');
-        assert.deepEqual(r, { type: WHO.automation, id: 23, status: 1 });
-    });
-    it('parses temperature', () => {
-        const r = OwnProtcol.parseStatus('*#4*1*0*0210##');
-        assert.deepEqual(r, { type: WHO.temperature, id: 1, status: 21 });
-    });
-    it('returns empty object for non-string', () => {
-        assert.deepEqual(OwnProtcol.parseStatus(null), {});
-    });
-    it('returns empty object for malformed', () => {
-        assert.deepEqual(OwnProtcol.parseStatus('garbage'), {});
-    });
-});
-
-describe('parseWHO', () => {
-    it('parses *WHO*..## form', () => {
-        assert.equal(OwnProtcol.parseWHO('*1*1*42##'), WHO.light);
-    });
-    it('parses *#WHO*..## form', () => {
-        assert.equal(OwnProtcol.parseWHO('*#4*1*0*0210##'), WHO.temperature);
-    });
-    it('returns null for unrecognized', () => {
-        assert.equal(OwnProtcol.parseWHO('garbage'), null);
-    });
-});
-
-describe('parseWhere', () => {
-    it('parses *W*X*WHERE## form', () => {
-        assert.equal(OwnProtcol.parseWhere('*1*1*42##'), '42');
-    });
-    it('parses *#W*WHERE*..## form', () => {
-        assert.equal(OwnProtcol.parseWhere('*#4*1*0*0210##'), '1');
-    });
-    it('parses where with hash', () => {
-        assert.equal(OwnProtcol.parseWhere('*#4*#0#1*14*0210*3##'), '#0#1');
-    });
-    it('returns null for malformed', () => {
-        assert.equal(OwnProtcol.parseWhere('garbage'), null);
-    });
-});
-
 describe('extractPacketInfo', () => {
     it('extracts from command form', () => {
         const r = OwnProtcol.extractPacketInfo('*1*1*42##');

@@ -16,8 +16,8 @@ export function errorMessage(err: unknown): string {
 // OWN dimmer level conversion (protocol levels 2..10 ↔ HomeKit brightness 1..100)
 // ---------------------------------------------------------------------------
 
-export const OWN_DIMMER_MIN = 2;
-export const OWN_DIMMER_MAX = 10;
+const OWN_DIMMER_MIN = 2;
+const OWN_DIMMER_MAX = 10;
 const OWN_DIMMER_RANGE = OWN_DIMMER_MAX - OWN_DIMMER_MIN; // 8
 
 /** HomeKit brightness % → OWN dimmer level (clamped to [2, 10]). */
@@ -48,10 +48,13 @@ export const BLIND_MOVE_RETRY_INTERVAL_MS = 500;
 export const BLIND_MAX_MOVE_RETRIES = 30;
 /** Confirmation timer after a blind command is dispatched */
 export const BLIND_COMMAND_ECHO_TIMEOUT_MS = 1000;
-/** Grace window after command confirmation (absorbs old-format gateway STOP echoes) */
-export const BLIND_ECHO_GRACE_WINDOW_MS = 300;
 /** Margin added to (time + timeSlat) for the init calibration timer */
 export const BLIND_INIT_CALIBRATION_MARGIN_MS = 1000;
+/** Grace window after a STOP packet during which a spurious direction packet
+ *  (some BTicino gateways like F454 emit a stray direction byte immediately after
+ *  a wall-switch STOP) is suppressed when it would otherwise be mis-interpreted
+ *  as a new movement. */
+export const BLIND_POST_STOP_GRACE_MS = 150;
 /** Minimum interval between blind position ticks (slat zone floor) */
 export const BLIND_MIN_TICK_MS = 50;
 /** TargetPosition queue-full guard threshold */
