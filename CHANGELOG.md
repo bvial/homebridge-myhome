@@ -5,16 +5,16 @@ All notable changes to this project are documented here.
 ## [0.4.4] — Unreleased
 
 ### Fixed
-- **Blind direction mapping inverted (regression observed in field).** On
-  BTicino installations the gateway broadcasts `*2*1*<id>##` for DOWN/closing
-  and `*2*2*<id>##` for UP/opening. The plugin had these reversed, causing
-  HomeKit to display "closing" when the user manually opened the blind via the
-  wall switch (and vice versa). Both incoming packet interpretation and
-  outgoing commands are now aligned with the BTicino convention:
-    - `onData` direction `'1'` → `DECREASING`, direction `'2'` → `INCREASING`
-    - `moveUp()` sends `*2*2*<id>##`
-    - `moveDown()` sends `*2*1*<id>##`
-    - Calibration init sends `*2*1*<id>##`
+- **Blind direction mapping restored to the 0.1.7 convention** (verified on
+  Legrand / BTicino installations: `*2*1*` = UP/opening, `*2*2*` = DOWN/closing,
+  `*2*0*` = STOP). An attempt during 0.4.x to invert the mapping based on a
+  misinterpretation broke calibration (it OPENED every blind on Homebridge
+  startup instead of closing them). The mapping now matches 0.1.7 exactly:
+    - `onData` direction `'1'` → `INCREASING`, direction `'2'` → `DECREASING`
+    - `moveUp()` sends `*2*1*<id>##`
+    - `moveDown()` sends `*2*2*<id>##`
+    - Calibration init sends `*2*2*<id>##` (closes the blind to establish
+      position 0)
 - **Calibration safety STOP not always sent.** The init timer is meant as a
   safety net guaranteeing a STOP after the full travel time. `endCalibration()`
   was clearing this timer when a premature gateway STOP arrived, defeating the
