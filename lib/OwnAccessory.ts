@@ -793,6 +793,7 @@ export class OwnBlindAccessory extends OwnAccessory {
         this.homeKitMovement = false;
         this.initPhase = false;
         this.moveRetries = 0;
+        this.expectedState = this.Characteristic.PositionState.STOPPED;
     }
 
     destroy(): void {
