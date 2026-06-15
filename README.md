@@ -92,7 +92,6 @@ Add a platform block to your Homebridge `config.json`:
 | `timeSlat` | integer | no | Extra seconds for slat rotation (venetian blinds only) |
 | `slatPercent` | integer | no | Position % below which slat rotation occurs (venetian blinds only) |
 | `calibrateOnStart` | boolean | no | Default `true`. When `true`, the blind moves fully down on first Homebridge start to establish a known position (0%). Set to `false` to restore the last cached position from `accessory.context.blindPosition` without moving the blind — useful if you don't want blinds to move on every Homebridge restart. The position is automatically cached on every STOP and at every 10% boundary during movement. |
-| `inverted` | boolean | no | Default `true` (BTicino convention: `*2*1*` = DOWN, `*2*2*` = UP). Set to `false` if your installation uses the reverse convention and HomeKit shows "opening" while the blind closes. |
 
 #### `thermostats`
 

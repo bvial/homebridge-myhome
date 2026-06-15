@@ -188,7 +188,7 @@ describe('OwnBlindAccessory', () => {
         platform = makeMockPlatform();
         accessory = makeMockAccessory();
         accessory.addService('AccessoryInformation');
-        handler = new OwnBlindAccessory(platform as unknown as P, accessory as unknown as A, { id: 23, name: 'test-blind', time: 30, timeSlat: 0, slatPercent: 0, inverted: false });
+        handler = new OwnBlindAccessory(platform as unknown as P, accessory as unknown as A, { id: 23, name: 'test-blind', time: 30, timeSlat: 0, slatPercent: 0 });
     });
     afterEach(() => { handler.destroy(); });
 
@@ -397,29 +397,11 @@ describe('OwnBlindAccessory', () => {
         a.addService('AccessoryInformation');
         a.context.blindPosition = 65;
         const h = new OwnBlindAccessory(p as unknown as P, a as unknown as A,
-            { id: 31, name: 'test', time: 20, inverted: false }); // calibrateOnStart defaults to true
+            { id: 31, name: 'test', time: 20 }); // calibrateOnStart defaults to true
         p.sendCommandSpy.calls.length = 0;
         h.updateStatus();
         const cmds = p.sendCommandSpy.calls.map((c: unknown[]) => (c[0] as { command: string }).command);
         assert.ok(cmds.some((c: string) => c === '*2*2*31##'), 'move-down must be sent for calibration');
-        h.destroy();
-    });
-
-    it('default convention (inverted=true): *2*1* maps to DECREASING and moveUp sends *2*2*', () => {
-        // Default behavior: BTicino convention where *2*1* = DOWN (closing) and *2*2* = UP (opening).
-        const p = makeMockPlatform();
-        const a = makeMockAccessory();
-        a.addService('AccessoryInformation');
-        const h = new OwnBlindAccessory(p as unknown as P, a as unknown as A,
-            { id: 40, name: 'default', time: 20, calibrateOnStart: false });
-        // Gateway sends *2*1* — must be interpreted as DECREASING
-        h.onData('*2*1*40##');
-        assert.equal(h.state, POSITION_STATE.DECREASING, 'default: *2*1* must be DECREASING');
-        // moveUp must send *2*2*
-        p.sendCommandSpy.calls.length = 0;
-        h.moveUp();
-        const upCmds = p.sendCommandSpy.calls.map((c: unknown[]) => (c[0] as { command: string }).command);
-        assert.ok(upCmds.includes('*2*2*40##'), 'default moveUp must send *2*2*');
         h.destroy();
     });
 
@@ -548,38 +530,6 @@ describe('OwnBlindAccessory', () => {
         handler.onData('*2*1*23##');
         assert.equal(handler.state, POSITION_STATE.INCREASING, '3rd manual movement state must be reflected');
         assert.equal(svc.characteristics['PositionState'].value, POSITION_STATE.INCREASING);
-    });
-
-    it('inverted: true swaps direction codes (1↔2) in onData', () => {
-        const p = makeMockPlatform();
-        const a = makeMockAccessory();
-        a.addService('AccessoryInformation');
-        const h = new OwnBlindAccessory(p as unknown as P, a as unknown as A,
-            { id: 50, name: 'reversed', time: 20, inverted: true });
-        // Gateway sends *2*1*<id>## — with inverted, this means DOWN/closing
-        h.onData('*2*1*50##');
-        assert.equal(h.state, POSITION_STATE.DECREASING, 'inverted: *2*1* must map to DECREASING');
-        h.onData('*2*0*50##');
-        h.onData('*2*2*50##');
-        assert.equal(h.state, POSITION_STATE.INCREASING, 'inverted: *2*2* must map to INCREASING');
-        h.destroy();
-    });
-
-    it('inverted: true uses *2*2* for moveUp and *2*1* for moveDown', () => {
-        const p = makeMockPlatform();
-        const a = makeMockAccessory();
-        a.addService('AccessoryInformation');
-        const h = new OwnBlindAccessory(p as unknown as P, a as unknown as A,
-            { id: 51, name: 'reversed', time: 20, inverted: true, calibrateOnStart: false });
-        p.sendCommandSpy.calls.length = 0;
-        h.moveUp();
-        const upCmd = p.sendCommandSpy.calls.map((c: unknown[]) => (c[0] as { command: string }).command);
-        assert.ok(upCmd.includes('*2*2*51##'), 'inverted moveUp must send *2*2*');
-        p.sendCommandSpy.calls.length = 0;
-        h.moveDown();
-        const downCmd = p.sendCommandSpy.calls.map((c: unknown[]) => (c[0] as { command: string }).command);
-        assert.ok(downCmd.includes('*2*1*51##'), 'inverted moveDown must send *2*1*');
-        h.destroy();
     });
 
     it('STOPPED during HomeKit movement does NOT overwrite target', () => {

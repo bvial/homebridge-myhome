@@ -16,17 +16,8 @@ All notable changes to this project are documented here.
   by a gateway STOP echo (e.g. blind reaches bottom-stop). The STOP is now sent
   unconditionally at timer expiration — sending it twice is harmless.
 
-### Added
-- **`inverted` option for blinds (default `true`).** Maps the OWN direction codes
-  to HomeKit's PositionState in the BTicino default convention: `*2*1*` =
-  DOWN/closing (DECREASING), `*2*2*` = UP/opening (INCREASING). If your
-  installation uses the reverse convention (HomeKit shows "opening" while the
-  blind closes), set `"inverted": false` in the blind config.
-
-### Changed
-- Default direction interpretation now matches the BTicino convention. Previous
-  versions used `*2*1*` = INCREASING which inverted the displayed state for
-  most installations.
+### Unchanged from 0.4.0
+- Blind direction interpretation: `*2*1*` → INCREASING (UP), `*2*2*` → DECREASING (DOWN).
 
 ## [0.4.0]
 

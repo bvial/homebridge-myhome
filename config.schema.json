@@ -137,13 +137,6 @@
                             "type": "boolean",
                             "required": false,
                             "default": true
-                        },
-                        "inverted": {
-                            "title": "Invert direction",
-                            "description": "Default true (BTicino convention: *2*1* = DOWN, *2*2* = UP). Set to false if HomeKit shows 'opening' while the blind closes (reverse-wired installation).",
-                            "type": "boolean",
-                            "required": false,
-                            "default": true
                         }
                     }
                 }
