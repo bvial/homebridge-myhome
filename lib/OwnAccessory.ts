@@ -478,7 +478,7 @@ export class OwnBlindAccessory extends OwnAccessory {
         if (!this.initStartPosition) {
             if (this.calibrateOnStart) {
                 this.log.info(`[${this.id}] Calibrating: move fully down to establish known position`);
-                const queued = this.controller.sendCommand({ command: `*2*1*${this.id}##`, log: this.log });
+                const queued = this.controller.sendCommand({ command: `*2*2*${this.id}##`, log: this.log });
                 if (!queued) {
                     this.log.warn('[%s] Blind init DOWN dropped: queue full — calibration deferred', this.id);
                     return;
@@ -570,7 +570,7 @@ export class OwnBlindAccessory extends OwnAccessory {
         this.expectedState = this.Characteristic.PositionState.INCREASING;
         this.startTimerCommand();
         const queued = this.controller.sendCommand({
-            command: `*2*2*${this.id}##`,  // BTicino: *2*2* = UP
+            command: `*2*1*${this.id}##`,
             log: this.log,
             started: () => this.startConfirmationTimer(),
         });
@@ -587,7 +587,7 @@ export class OwnBlindAccessory extends OwnAccessory {
         this.expectedState = this.Characteristic.PositionState.DECREASING;
         this.startTimerCommand();
         const queued = this.controller.sendCommand({
-            command: `*2*1*${this.id}##`,  // BTicino: *2*1* = DOWN
+            command: `*2*2*${this.id}##`,
             log: this.log,
             started: () => this.startConfirmationTimer(),
         });
@@ -618,11 +618,9 @@ export class OwnBlindAccessory extends OwnAccessory {
                 }
                 this.cachePosition();
             } else if (direction === '1') {
-                // BTicino convention on this gateway: *2*1* = DOWN/closing
-                this.state = this.Characteristic.PositionState.DECREASING;
-            } else if (direction === '2') {
-                // BTicino convention on this gateway: *2*2* = UP/opening
                 this.state = this.Characteristic.PositionState.INCREASING;
+            } else if (direction === '2') {
+                this.state = this.Characteristic.PositionState.DECREASING;
             } else {
                 this.log.warn('[%s] Blind unknown direction byte %s in packet %s', this.id, direction, packet);
                 return;
