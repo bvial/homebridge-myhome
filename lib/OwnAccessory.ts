@@ -541,11 +541,11 @@ export class OwnBlindAccessory extends OwnAccessory {
         clearTimeout(this.packetTimeout);
     }
 
-    /** End the calibration phase: clear `initPhase` and cancel the calibration safety timer. */
+    /** Mark the calibration phase as ended. The initTimeout is intentionally NOT cleared
+     *  here so the safety STOP fires unconditionally at the end of the travel time, even
+     *  when the gateway sends a premature or duplicate STOP. */
     private endCalibration(): void {
         this.initPhase = false;
-        clearTimeout(this.initTimeout);
-        this.initTimeout = undefined;
     }
 
     moveStop(): void {

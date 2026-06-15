@@ -558,6 +558,28 @@ describe('OwnBlindAccessory', () => {
         }, 1200);
     });
 
+    it('init STOP timer fires even when gateway sends a premature STOP during calibration', (_t, done) => {
+        // Bug fix: endCalibration() previously cleared the safety timer, so a premature
+        // gateway STOP (e.g. blind already at bottom) prevented the final STOP from
+        // being sent. Now endCalibration() leaves the timer alone — a duplicate STOP
+        // at the end of the travel window is harmless.
+        const spy = platform.sendCommandSpy;
+        spy.calls.length = 0;
+        handler.time = 0.05;
+        handler.updateStatus();
+        spy.calls.length = 0;  // ignore the init DOWN
+        // Simulate gateway sending a premature STOP (blind already at bottom)
+        handler.onData('*2*0*23##');
+        assert.equal(handler.initPhase, false, 'initPhase must be cleared by premature STOP');
+        // The safety timer must still fire and send STOP
+        setTimeout(() => {
+            const stopSent = spy.calls.some((c: unknown[]) => (c[0] as { command: string }).command === '*2*0*23##');
+            assert.ok(stopSent, 'safety STOP must be sent after travel time even after premature STOP');
+            handler.destroy();
+            done();
+        }, 1200);
+    });
+
     it('init STOP timer accounts for timeSlat (venetian blinds)', (_t, done) => {
         const spy = platform.sendCommandSpy;
         spy.calls.length = 0;
