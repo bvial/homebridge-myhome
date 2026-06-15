@@ -1,7 +1,7 @@
 {
   "name": "homebridge-myhome-unik",
   "displayName": "MyHome (Legrand / BTicino)",
-  "version": "0.4.5",
+  "version": "0.4.6",
   "description": "MyHome Legrand plugin for homebridge",
   "license": "ISC",
   "keywords": [
