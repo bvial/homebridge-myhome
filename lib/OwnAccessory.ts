@@ -13,7 +13,6 @@ import {
     BLIND_MOVE_RETRY_INTERVAL_MS,
     BLIND_MAX_MOVE_RETRIES,
     BLIND_COMMAND_ECHO_TIMEOUT_MS,
-    BLIND_ECHO_GRACE_WINDOW_MS,
     BLIND_INIT_CALIBRATION_MARGIN_MS,
     BLIND_QUEUE_BUSY_THRESHOLD,
     BLIND_MIN_TICK_MS,
@@ -41,12 +40,17 @@ export interface BaseConfig {
 
 export interface LightConfig extends BaseConfig {
     dimmer?: boolean;
+    /** Custom OpenWebNet WHERE address (e.g. "68#4#01" for group/special relays). Defaults to id. */
+    where?: string;
 }
 
 export interface BlindConfig extends BaseConfig {
     time: number;
     timeSlat?: number;
     slatPercent?: number;
+    /** Re-calibrate (move fully down) on first Homebridge start to establish a known position.
+     *  Set to false to restore the last cached position without moving the blind (default: true). */
+    calibrateOnStart?: boolean;
 }
 
 export interface ThermostatConfig extends BaseConfig {
@@ -206,8 +210,7 @@ class OwnAccessory {
     }
 
     checkWhere(where: string): boolean {
-        const id = parseInt(where, 10);
-        return this.id === id;
+        return where === String(this.id);
     }
 
     /**
@@ -238,10 +241,16 @@ export class OwnLightAccessory extends OwnAccessory {
     value: boolean;
     dimmer: boolean;
     brightness: number;
+    /** OWN WHERE address — may differ from id for special relay configurations (e.g. "68#4#01"). */
+    readonly where: string;
     private lightbulbService: InstanceType<typeof Service>;
     private identifyTimeout: ReturnType<typeof setTimeout> | undefined;
 
     get who(): number { return WHO.light; }
+
+    checkWhere(where: string): boolean {
+        return where === this.where;
+    }
 
     constructor(platform: OwnPlatformLike, accessory: PlatformAccessory, config: LightConfig) {
         if (!config.name) config.name = `light-${config.id}`;
@@ -250,17 +259,18 @@ export class OwnLightAccessory extends OwnAccessory {
         this.value = false;
         this.dimmer = config.dimmer ?? false;
         this.brightness = 100;
+        this.where = config.where ?? String(this.id);
         this.identifyTimeout = undefined;
 
         this.accessory.removeAllListeners('identify');
         this.accessory.on('identify', () => {
             this.log.info(`[${this.id}] Identify — blink`);
             const wasOn = this.value;
-            this.controller.sendCommand({ command: `*1*0*${this.id}##`, log: this.log });
+            this.controller.sendCommand({ command: `*1*0*${this.where}##`, log: this.log });
             clearTimeout(this.identifyTimeout);
             this.identifyTimeout = setTimeout(() => {
                 this.identifyTimeout = undefined;
-                if (wasOn) this.controller.sendCommand({ command: `*1*1*${this.id}##`, log: this.log });
+                if (wasOn) this.controller.sendCommand({ command: `*1*1*${this.where}##`, log: this.log });
             }, IDENTIFY_BLINK_MS);
         });
 
@@ -272,9 +282,9 @@ export class OwnLightAccessory extends OwnAccessory {
                 this.log.info(`[${this.id}] Setting power state to ${value ? 'on' : 'off'}`);
                 if (value && this.dimmer) {
                     const level = brightnessToOwnLevel(this.brightness);
-                    this.sendOrThrow(`*1*${level}*${this.id}##`);
+                    this.sendOrThrow(`*1*${level}*${this.where}##`);
                 } else {
-                    this.sendOrThrow(`*1*${value ? '1' : '0'}*${this.id}##`);
+                    this.sendOrThrow(`*1*${value ? '1' : '0'}*${this.where}##`);
                 }
                 this.value = value as boolean;
             });
@@ -285,13 +295,13 @@ export class OwnLightAccessory extends OwnAccessory {
                 .onSet((value: CharacteristicValue) => {
                     this.log.info(`[${this.id}] Setting brightness to ${value}`);
                     if (value === 0) {
-                        this.sendOrThrow(`*1*0*${this.id}##`);
+                        this.sendOrThrow(`*1*0*${this.where}##`);
                         this.brightness = 0;
                         this.value = false;
                         this.lightbulbService.updateCharacteristic(this.Characteristic.On, false);
                     } else {
                         const level = brightnessToOwnLevel(value as number);
-                        this.sendOrThrow(`*1*${level}*${this.id}##`);
+                        this.sendOrThrow(`*1*${level}*${this.where}##`);
                         this.brightness = value as number;
                     }
                 });
@@ -305,19 +315,19 @@ export class OwnLightAccessory extends OwnAccessory {
     updateStatus(): void {
         this.log.info(`[${this.id}] Light updateStatus`);
         this.controller.sendCommand({
-            command: `*#1*${this.id}##`,
+            command: `*#1*${this.where}##`,
             log: this.log,
             packet: (pkt: string) => {
-                const m = pkt.match(/^\*#1\*\d+\*1\*(\d+)##$/);
-                if (m) this.onData(`*1*${m[1]}*${this.id}##`);
+                const m = pkt.match(/^\*#1\*[\d#]+\*1\*(\d+)##$/);
+                if (m) this.onData(`*1*${m[1]}*${this.where}##`);
             },
         });
     }
 
     onData(packet: string): void {
         // Extended scenario/automation format *1*1000#<level>*<id>## — treat sub-level as the effective level
-        const ext = packet.match(/^\*1\*1000#(\d+)\*\d+##$/);
-        const extract = ext ?? packet.match(/^\*1\*(\d+)\*\d+##$/);
+        const ext = packet.match(/^\*1\*1000#(\d+)\*[\d#]+##$/);
+        const extract = ext ?? packet.match(/^\*1\*(\d+)\*[\d#]+##$/);
         if (extract) {
             this.log.debug('id:%s onLight(%s)', this.id, packet);
             const level = parseInt(extract[1], 10);
@@ -360,6 +370,7 @@ export class OwnBlindAccessory extends OwnAccessory {
     moveRetries: number;
     initPhase: boolean;
     homeKitMovement: boolean;
+    private calibrateOnStart: boolean;
     private inStatusQuery: boolean;
     private statusQueryTimeout: ReturnType<typeof setTimeout> | undefined;
     private initTimeout: ReturnType<typeof setTimeout> | undefined;
@@ -378,13 +389,14 @@ export class OwnBlindAccessory extends OwnAccessory {
         this.time = config.time;
         this.timeSlat = config.timeSlat ?? 0;
         this.slatPercent = config.slatPercent ?? 0;
+        this.calibrateOnStart = config.calibrateOnStart ?? true;
 
         this.state = this.Characteristic.PositionState.STOPPED;
         this.expectedState = this.Characteristic.PositionState.STOPPED;
-        this.position = 0;
+        this.position = this.readCachedPosition();
+        this.target = this.position;
         this.initStartPosition = false;
         this.commandSent = false;
-        this.target = 0;
         this.moveTrackingTimeout = undefined;
         this.packetTimeout = undefined;
         this.positionTimeout = undefined;
@@ -432,11 +444,16 @@ export class OwnBlindAccessory extends OwnAccessory {
         this.accessory.removeAllListeners('identify');
         this.accessory.on('identify', () => {
             this.log.info(`[${this.id}] Identify — jog`);
+            this.stopMoveTracking();  // cancel any in-progress HomeKit movement cleanly
             this.moveUp();
             clearTimeout(this.identifyJogTimeout);
             this.identifyJogTimeout = setTimeout(() => {
                 this.identifyJogTimeout = undefined;
+                this.stopMoveTracking();  // clear position tracking before issuing STOP
                 this.moveStop();
+                // Position is now unknown — mark as unreliable so the next HomeKit
+                // command re-queries the gateway.
+                this.initStartPosition = false;
             }, IDENTIFY_JOG_MS);
         });
     }
@@ -445,31 +462,48 @@ export class OwnBlindAccessory extends OwnAccessory {
         this.setFaultOnline(this.windowCoveringService, online);
     }
 
+    private readCachedPosition(): number {
+        const raw = (this.accessory.context as Record<string, unknown>).blindPosition;
+        return typeof raw === 'number' && Number.isFinite(raw)
+            ? Math.min(100, Math.max(0, Math.round(raw)))
+            : 0;
+    }
+
+    private cachePosition(): void {
+        (this.accessory.context as Record<string, unknown>).blindPosition = this.position;
+    }
+
     updateStatus(): void {
         this.log.info(`[${this.id}] Blind updateStatus`);
         if (!this.initStartPosition) {
-            this.log.info(`[${this.id}] Initialization phase of blind: reset position to 0 and send move down`);
-            const queued = this.controller.sendCommand({ command: `*2*2*${this.id}##`, log: this.log });
-            if (!queued) {
-                this.log.warn('[%s] Blind init DOWN dropped: queue full — calibration deferred', this.id);
-                return;
-            }
-            this.position = 0;
-            this.target = 0;
-            this.initPhase = true;
-            this.initStartPosition = true;
-            // Send explicit STOP after the full travel time to terminate calibration,
-            // even if the gateway never broadcasts a STOP packet at the end-stop.
-            // For venetian blinds, full travel = linear time + slat rotation time.
-            clearTimeout(this.initTimeout);
-            this.initTimeout = setTimeout(() => {
-                this.initTimeout = undefined;
-                if (this.initPhase) {
-                    this.log.info(`[${this.id}] Init calibration timer elapsed, sending STOP`);
-                    this.initPhase = false;
-                    this.moveStop();
+            if (this.calibrateOnStart) {
+                this.log.info(`[${this.id}] Calibrating: move fully down to establish known position`);
+                const queued = this.controller.sendCommand({ command: `*2*2*${this.id}##`, log: this.log });
+                if (!queued) {
+                    this.log.warn('[%s] Blind init DOWN dropped: queue full — calibration deferred', this.id);
+                    return;
                 }
-            }, (this.time + this.timeSlat) * 1000 + BLIND_INIT_CALIBRATION_MARGIN_MS);
+                this.position = 0;
+                this.target = 0;
+                this.initPhase = true;
+                this.cachePosition();
+                // Send explicit STOP after the full travel time to terminate calibration,
+                // even if the gateway never broadcasts a STOP packet at the end-stop.
+                clearTimeout(this.initTimeout);
+                this.initTimeout = setTimeout(() => {
+                    this.initTimeout = undefined;
+                    if (this.initPhase) {
+                        this.log.info(`[${this.id}] Init calibration timer elapsed, sending STOP`);
+                        this.endCalibration();
+                        this.moveStop();
+                    }
+                }, (this.time + this.timeSlat) * 1000 + BLIND_INIT_CALIBRATION_MARGIN_MS);
+            } else {
+                this.log.info(`[${this.id}] Restoring cached position ${this.position}% (calibrateOnStart disabled)`);
+                this.windowCoveringService.updateCharacteristic(this.Characteristic.CurrentPosition, this.position);
+                this.windowCoveringService.updateCharacteristic(this.Characteristic.TargetPosition, this.position);
+            }
+            this.initStartPosition = true;
         } else {
             this.log.info(`[${this.id}] Blind fetching State :${this.state}`);
             this.inStatusQuery = true;
@@ -503,18 +537,16 @@ export class OwnBlindAccessory extends OwnAccessory {
             this.state = this.expectedState;
             this.log.warn(`[${this.id}] Blind command confirmation not received, forcing state to: ${this.expectedState}`);
             this.updateStatus();
-        } else if (this.homeKitMovement) {
-            // Absorb gateway echo packets (old-format STOP arriving after UP/DOWN confirmation)
-            this.inStatusQuery = true;
-            clearTimeout(this.statusQueryTimeout);
-            this.statusQueryTimeout = setTimeout(() => { this.inStatusQuery = false; }, BLIND_ECHO_GRACE_WINDOW_MS);
         }
         this.commandSent = false;
         clearTimeout(this.packetTimeout);
     }
 
-    commandIsPending(): boolean {
-        return this.commandSent;
+    /** End the calibration phase: clear `initPhase` and cancel the calibration safety timer. */
+    private endCalibration(): void {
+        this.initPhase = false;
+        clearTimeout(this.initTimeout);
+        this.initTimeout = undefined;
     }
 
     moveStop(): void {
@@ -577,12 +609,15 @@ export class OwnBlindAccessory extends OwnAccessory {
             if (direction === '0') {
                 const wasDecreasing = this.state === this.Characteristic.PositionState.DECREASING;
                 this.state = this.Characteristic.PositionState.STOPPED;
-                if (!this.initPhase || wasDecreasing) {
-                    this.initPhase = false;
+                // End calibration if: not in calibration, OR was actually moving down (normal end),
+                // OR position is already 0 (blind was at bottom-stop before calibration move started).
+                if (!this.initPhase || wasDecreasing || this.position === 0) {
+                    this.endCalibration();
                 }
-                if (Math.abs(this.position - this.target) <= 3) {
+                if (this.homeKitMovement && Math.abs(this.position - this.target) <= 3) {
                     this.position = this.target;
                 }
+                this.cachePosition();
             } else if (direction === '1') {
                 this.state = this.Characteristic.PositionState.INCREASING;
             } else if (direction === '2') {
@@ -594,7 +629,7 @@ export class OwnBlindAccessory extends OwnAccessory {
             this.windowCoveringService.updateCharacteristic(this.Characteristic.PositionState, this.state);
             this.log.debug(`[${this.id}] received state dir:${direction} position:${this.position} target:${this.target}`);
 
-            if (this.commandIsPending() && this.expectedState === this.state) {
+            if (this.commandSent && this.expectedState === this.state) {
                 this.log.info(`[${this.id}] expected state ${this.expectedState} reached`);
                 this.endTimerCommand();
             } else if (this.homeKitMovement && this.state !== prevState
@@ -605,8 +640,11 @@ export class OwnBlindAccessory extends OwnAccessory {
                 this.stopMoveTracking();
             }
 
-            // Skip evaluatePosition for duplicate packets that don't change state
-            if (!this.commandIsPending() && !this.positionTimeout && this.state !== prevState) {
+            // Skip evaluatePosition for duplicate packets that don't change state.
+            // For STOP (direction '0'), always evaluate even if positionTimeout is pending —
+            // it clears the timeout on entry and syncs CurrentPosition/TargetPosition to HomeKit.
+            const isStop = direction === '0';
+            if (!this.commandSent && (isStop || !this.positionTimeout) && this.state !== prevState) {
                 this.evaluatePosition();
             }
         } else {
@@ -619,8 +657,7 @@ export class OwnBlindAccessory extends OwnAccessory {
         if (this.state === this.Characteristic.PositionState.STOPPED) {
             this.log.info(`[${this.id}] Blind is STOPPED pos:${this.position} target:${this.target}`);
             // Sync TargetPosition to CurrentPosition only when no HomeKit movement is in progress
-            // and we are not absorbing a status-query response (which only reports gateway state,
-            // not HomeKit intent). Skip during active HomeKit movement to preserve the user target.
+            // and we are not absorbing a status-query response or a post-confirmation echo.
             if (!this.homeKitMovement && !this.inStatusQuery && this.target !== this.position) {
                 this.target = this.position;
                 this.windowCoveringService.updateCharacteristic(this.Characteristic.TargetPosition, this.target);
@@ -633,6 +670,7 @@ export class OwnBlindAccessory extends OwnAccessory {
                 this.moveStop();
             } else if (!this.homeKitMovement && this.position >= 100) {
                 // physical movement reached upper end-stop — wait for gateway STOP packet
+                this.cachePosition();
             } else {
                 this.startPositionTracking();
             }
@@ -646,11 +684,16 @@ export class OwnBlindAccessory extends OwnAccessory {
                 // calibration in progress — initTimeout will fire moveStop after full travel time
             } else if (!this.homeKitMovement && this.position <= 0) {
                 // physical movement reached lower end-stop — wait for gateway STOP packet
+                this.cachePosition();
             } else {
                 this.startPositionTracking();
             }
         }
         this.windowCoveringService.updateCharacteristic(this.Characteristic.CurrentPosition, this.position);
+        // Cache at 10% boundaries so position survives Homebridge crash within 10% accuracy.
+        if (this.position % 10 === 0) {
+            this.cachePosition();
+        }
     }
 
     msPerPercent(position: number): number {
@@ -666,32 +709,27 @@ export class OwnBlindAccessory extends OwnAccessory {
     }
 
     move(): void {
-        if (this.commandIsPending()) {
+        if (this.commandSent) {
             this.log.info(`[${this.id}] Blind command is still pending: wait for action`);
+            this.moveRetries++;
+            if (this.moveRetries > BLIND_MAX_MOVE_RETRIES) {
+                this.log.warn('[%s] Blind giving up: command stuck pending too long (gateway offline?)', this.id);
+                this.stopMoveTracking();
+                return;
+            }
             clearTimeout(this.moveTrackingTimeout);
             this.moveTrackingTimeout = setTimeout(this.move.bind(this), BLIND_MOVE_RETRY_INTERVAL_MS);
             return;
         }
-        if (this.target < this.position) {
-            if (this.state === this.Characteristic.PositionState.INCREASING) {
-                this.moveStop();
-            } else if (this.state !== this.Characteristic.PositionState.DECREASING &&
-                (this.state === this.Characteristic.PositionState.STOPPED || Math.abs(this.target - this.position) > 2)) {
-                this.moveDown();
-            }
-        } else if (this.target > this.position) {
-            if (this.state === this.Characteristic.PositionState.DECREASING) {
-                this.moveStop();
-            } else if (this.state !== this.Characteristic.PositionState.INCREASING &&
-                (this.state === this.Characteristic.PositionState.STOPPED || Math.abs(this.target - this.position) > 2)) {
-                this.moveUp();
-            }
-        } else {
+        if (this.target === this.position) {
             if (this.state !== this.Characteristic.PositionState.STOPPED) {
                 this.moveStop();
             }
             this.log.info(`[${this.id}] Blind position is good: stop moving ${this.position} target:${this.target}`);
             return;
+        }
+        if (this.adjustToward(this.target - this.position)) {
+            return;  // STOP issued to reverse direction — wait for echo
         }
         if (!this.commandSent && !this.positionTimeout) {
             this.startPositionTracking();
@@ -699,15 +737,41 @@ export class OwnBlindAccessory extends OwnAccessory {
         this.startMoveTracking();
     }
 
+    /**
+     * Drive the blind toward the target by `delta` percentage points.
+     * - If currently moving in the OPPOSITE direction, sends STOP and returns true (caller should wait for echo).
+     * - If currently STOPPED, sends the appropriate UP/DOWN command and returns false.
+     * - If already moving in the CORRECT direction with no command pending and no position tracking,
+     *   restores `homeKitMovement` (recovers from rapid retarget) and returns false.
+     * Returns true iff caller must return early (STOP issued).
+     */
+    private adjustToward(delta: number): boolean {
+        const goingUp = delta > 0;
+        const correctDir  = goingUp ? this.Characteristic.PositionState.INCREASING : this.Characteristic.PositionState.DECREASING;
+        const oppositeDir = goingUp ? this.Characteristic.PositionState.DECREASING : this.Characteristic.PositionState.INCREASING;
+        if (this.state === oppositeDir) {
+            this.moveStop();
+            return true;
+        }
+        if (this.state === this.Characteristic.PositionState.STOPPED) {
+            if (goingUp) this.moveUp();
+            else         this.moveDown();
+            return false;
+        }
+        // state === correctDir
+        if (!this.commandSent && !this.positionTimeout) {
+            // Position tracking was cancelled mid-flight (rapid retarget). Re-enable tracking.
+            this.homeKitMovement = true;
+        }
+        return false;
+    }
+
     startMoveTracking(): void {
         clearTimeout(this.moveTrackingTimeout);
         this.moveTrackingTimeout = undefined;
-        if (this.commandSent) {
-            this.moveRetries++;
-        }
         if (this.moveRetries > BLIND_MAX_MOVE_RETRIES) {
             this.log.warn('[%s] Blind giving up after too many move retries', this.id);
-            this.moveRetries = 0;
+            this.stopMoveTracking();
             return;
         }
         this.moveTrackingTimeout = setTimeout(this.move.bind(this), BLIND_MOVE_RETRY_INTERVAL_MS);

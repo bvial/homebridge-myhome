@@ -11,6 +11,7 @@
 
 import { OwnClient, OwnConnection, PKT, CMD, MODE } from './lib/OwnNet';
 import { errorMessage } from './lib/utils';
+import { runStatusScan, ScanFound } from './lib/scanHelper';
 import type { Logging } from 'homebridge';
 
 // ─── CLI args ─────────────────────────────────────────────────────────────────
@@ -93,48 +94,6 @@ function configScan(): Promise<ConfigDevice[]> {
 //                  means the address is not configured. A stopped blind typically
 //                  replies ACK without a data packet on F454/F455 firmware.
 
-interface Found { who: number; where: string; packets: string[] }
-
-async function statusScan(client: OwnClient): Promise<Found[]> {
-    const found: Found[] = [];
-
-    const jobs: Array<{ who: number; where: string; command: string }> = [];
-
-    for (let w = 1; w <= maxAddr; w++) {
-        jobs.push({ who: 1,  where: String(w), command: `*#1*${w}##`      });  // light
-        jobs.push({ who: 2,  where: String(w), command: `*#2*${w}##`      });  // blind
-        jobs.push({ who: 9,  where: String(w), command: `*#9*${w}##`      });  // dry contact
-        jobs.push({ who: 18, where: String(w), command: `*#18*${w}*113##` });  // energy (active power)
-    }
-    for (let w = 1; w <= 9; w++) {
-        jobs.push({ who: 4, where: String(w), command: `*#4*${w}##` });  // thermostat zone probe
-    }
-
-    const BATCH = 40; // stay safely under the 50-item queue limit
-    for (let i = 0; i < jobs.length; i += BATCH) {
-        await Promise.all(jobs.slice(i, i + BATCH).map(({ who, where, command }) =>
-            new Promise<void>(resolve => {
-                const pkts: string[] = [];
-                client.sendCommand({
-                    command,
-                    stopon: [PKT.ACK, PKT.NACK],
-                    packet: p => pkts.push(p),
-                    done: pkt => {
-                        if (pkt === PKT.NACK) { resolve(); return; }  // address not configured
-                        // WHO=2: ACK alone means the blind exists (stopped blinds send no data)
-                        if (pkt === PKT.ACK && (who === 2 || pkts.length > 0)) {
-                            found.push({ who, where, packets: pkts });
-                        }
-                        resolve();
-                    },
-                });
-            }),
-        ));
-    }
-
-    return found;
-}
-
 // ─── config generation ────────────────────────────────────────────────────────
 
 interface DraftConfig {
@@ -145,7 +104,7 @@ interface DraftConfig {
     energies:    Array<{ id: number; name: string }>;
 }
 
-function buildConfig(found: Found[]): DraftConfig {
+function buildConfig(found: ScanFound[]): DraftConfig {
     const draft: DraftConfig = { lights: [], blinds: [], thermostats: [], contacts: [], energies: [] };
 
     // Sort by WHO then address for deterministic output
@@ -184,7 +143,7 @@ async function main() {
     process.stdout.write(`Phase 2/2 — STATUS scan (addresses 1..${maxAddr}) ... `);
     const client = new OwnClient(host, String(port), password, log);
     client.maxConcurrent = 4;
-    const found = await statusScan(client);
+    const found = await runStatusScan(client, maxAddr);
     console.log(`${found.length} device(s) found\n`);
 
     // Summary table

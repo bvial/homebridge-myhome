@@ -286,7 +286,7 @@ export class OwnMonitor extends EventEmitter {
         this.nbCheck = 0;
         clearTimeout(this.reconnectTimeout);
         this.reconnectTimeout = undefined;
-        this.client.log.success('Start monitoring MyHome server');
+        this.client.log.info('Start monitoring MyHome server');
         this.closeConnection();
         this.connection = this.client.newConnection(MODE.MONITOR);
         this.connection.on('connected', () => {

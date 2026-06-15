@@ -142,16 +142,41 @@ describe('OwnLightAccessory', () => {
         platform.sendCommandSpy.calls.length = 0;
         handler.value = true;
         accessory.emit('identify', false);
-        // Initial OFF immediate
         const cmds1 = platform.sendCommandSpy.calls.map((c: unknown[]) => (c[0] as { command: string }).command);
         assert.ok(cmds1.includes('*1*0*42##'), 'initial OFF must be sent');
-        // Restore happens after IDENTIFY_BLINK_MS (500ms)
         setTimeout(() => {
             const cmds2 = platform.sendCommandSpy.calls.map((c: unknown[]) => (c[0] as { command: string }).command);
             assert.ok(cmds2.includes('*1*1*42##'), 'restore ON must be sent after blink');
             handler.destroy();
             done();
         }, 600);
+    });
+
+    it('custom where: commands use where address instead of id', () => {
+        const p = makeMockPlatform();
+        const a = makeMockAccessory();
+        a.addService('AccessoryInformation');
+        const h = new OwnLightAccessory(p as unknown as P, a as unknown as A, { id: 68, name: 'relay', where: '68#4#01' });
+        p.sendCommandSpy.calls.length = 0;
+        a.services['Lightbulb'].characteristics['On'].setter!(true);
+        const cmds = p.sendCommandSpy.calls.map((c: unknown[]) => (c[0] as { command: string }).command);
+        assert.ok(cmds.some(c => c === '*1*1*68#4#01##'), 'must use custom where in on command');
+        h.destroy();
+    });
+
+    it('custom where: checkWhere matches where string, not bare id', () => {
+        const p = makeMockPlatform();
+        const a = makeMockAccessory();
+        a.addService('AccessoryInformation');
+        const h = new OwnLightAccessory(p as unknown as P, a as unknown as A, { id: 68, name: 'relay', where: '68#4#01' });
+        assert.ok(h.checkWhere('68#4#01'), 'must match exact where string');
+        assert.ok(!h.checkWhere('68'), 'must NOT match bare id when custom where is set');
+        h.destroy();
+    });
+
+    it('no where: checkWhere matches String(id)', () => {
+        assert.ok(handler.checkWhere('42'));
+        assert.ok(!handler.checkWhere('42#4#01'));
     });
 });
 
@@ -213,11 +238,20 @@ describe('OwnBlindAccessory', () => {
         assert.equal(handler.position, 50);
     });
 
-    it('onData stop snaps position when within 3', () => {
+    it('onData stop snaps position to target when within 3 during HomeKit movement', () => {
         handler.position = 48;
         handler.target = 50;
+        handler.homeKitMovement = true;
         handler.onData('*2*0*23##');
-        assert.equal(handler.position, 50);
+        assert.equal(handler.position, 50, 'position must snap to target during HomeKit movement');
+    });
+
+    it('onData stop does NOT snap position during physical movement', () => {
+        handler.position = 48;
+        handler.target = 50;
+        handler.homeKitMovement = false;
+        handler.onData('*2*0*23##');
+        assert.equal(handler.position, 48, 'position must NOT snap during physical movement');
     });
 
     it('onData increasing', () => {
@@ -283,8 +317,7 @@ describe('OwnBlindAccessory', () => {
     });
 
     it('startMoveTracking stops scheduling when retry limit exceeded', () => {
-        handler.moveRetries = 30;
-        handler.commandSent = true;
+        handler.moveRetries = 31; // one past BLIND_MAX_MOVE_RETRIES (30)
         handler.startMoveTracking();
         assert.strictEqual(handler.moveTrackingTimeout, undefined);
         assert.equal(handler.moveRetries || 0, 0);
@@ -300,6 +333,17 @@ describe('OwnBlindAccessory', () => {
         handler.moveRetries = 0;
         handler.startMoveTracking();
         assert.notEqual(handler.moveTrackingTimeout, undefined);
+        handler.destroy();
+    });
+
+    it('startMoveTracking does NOT increment moveRetries (single source of truth is move() pending path)', () => {
+        // Bug B fix: previously startMoveTracking incremented moveRetries when commandSent=true,
+        // and move()'s commandIsPending path also incremented — double-counting.
+        // Now: only move()'s pending path increments. startMoveTracking just schedules.
+        handler.moveRetries = 5;
+        handler.commandSent = true;
+        handler.startMoveTracking();
+        assert.equal(handler.moveRetries, 5, 'startMoveTracking must not bump moveRetries');
         handler.destroy();
     });
 
@@ -330,6 +374,58 @@ describe('OwnBlindAccessory', () => {
         assert.ok(cmds.some((c: string) => c === '*2*2*23##'));
     });
 
+    it('calibrateOnStart:false restores cached position without sending move-down', () => {
+        const p = makeMockPlatform();
+        const a = makeMockAccessory();
+        a.addService('AccessoryInformation');
+        a.context.blindPosition = 65;
+        const h = new OwnBlindAccessory(p as unknown as P, a as unknown as A,
+            { id: 30, name: 'test', time: 20, calibrateOnStart: false });
+        assert.equal(h.position, 65, 'position must be restored from cache');
+        assert.equal(h.target, 65, 'target must match restored position');
+        p.sendCommandSpy.calls.length = 0;
+        h.updateStatus();
+        const cmds = p.sendCommandSpy.calls.map((c: unknown[]) => (c[0] as { command: string }).command);
+        assert.ok(!cmds.some((c: string) => c.startsWith('*2*2*')), 'no calibration move-down must be sent');
+        assert.equal(h.initStartPosition, true);
+        h.destroy();
+    });
+
+    it('calibrateOnStart:true (default) still calibrates', () => {
+        const p = makeMockPlatform();
+        const a = makeMockAccessory();
+        a.addService('AccessoryInformation');
+        a.context.blindPosition = 65;
+        const h = new OwnBlindAccessory(p as unknown as P, a as unknown as A,
+            { id: 31, name: 'test', time: 20 }); // calibrateOnStart defaults to true
+        p.sendCommandSpy.calls.length = 0;
+        h.updateStatus();
+        const cmds = p.sendCommandSpy.calls.map((c: unknown[]) => (c[0] as { command: string }).command);
+        assert.ok(cmds.some((c: string) => c === '*2*2*31##'), 'move-down must be sent for calibration');
+        h.destroy();
+    });
+
+    it('position is cached in context on STOP', () => {
+        handler.position = 72;
+        handler.onData('*2*0*23##');
+        assert.equal(accessory.context.blindPosition, 72, 'position must be saved to context on STOP');
+    });
+
+    it('position is cached in context on STOP (not on mid-movement ticks)', () => {
+        handler.state = POSITION_STATE.INCREASING;
+        handler.position = 50;
+        handler.target = 80;
+        // Before STOP: evaluatePosition tick should NOT write to cache
+        accessory.context.blindPosition = 0;
+        handler.evaluatePosition();
+        assert.equal(accessory.context.blindPosition, 0, 'cache must NOT be updated on mid-movement tick');
+        // STOP packet: cache must be written (position far from target → no snap)
+        handler.position = 60;
+        handler.onData('*2*0*23##');
+        assert.equal(accessory.context.blindPosition, 60, 'position must be cached on STOP');
+        handler.destroy();
+    });
+
     it('evaluatePosition during init does not send stop when DECREASING at target', () => {
         const spy = platform.sendCommandSpy;
         spy.calls.length = 0;
@@ -350,11 +446,20 @@ describe('OwnBlindAccessory', () => {
         assert.equal(handler.initPhase, false);
     });
 
-    it('onData STOP does not clear _initPhase when state was STOPPED (gateway state broadcast)', () => {
+    it('onData STOP does not clear initPhase when state was STOPPED and position > 0 (gateway broadcast before DECREASING echo)', () => {
         handler.initPhase = true;
         handler.state = POSITION_STATE.STOPPED;
+        handler.position = 50; // position > 0: calibration not complete yet
         handler.onData('*2*0*23##');
         assert.equal(handler.initPhase, true, 'initPhase must survive a state broadcast before DECREASING echo');
+    });
+
+    it('onData STOP clears initPhase when position=0 (blind already at bottom at startup)', () => {
+        handler.initPhase = true;
+        handler.state = POSITION_STATE.STOPPED;
+        handler.position = 0;
+        handler.onData('*2*0*23##');
+        assert.equal(handler.initPhase, false, 'initPhase must clear when blind is already at bottom');
     });
 
     it('physical STOP syncs TargetPosition to CurrentPosition', () => {
@@ -366,6 +471,34 @@ describe('OwnBlindAccessory', () => {
         handler.onData('*2*0*23##');
         assert.equal(handler.target, 60, 'target must match position after physical stop');
         assert.equal(svc.characteristics['TargetPosition'].value, 60, 'TargetPosition characteristic must be pushed to HomeKit');
+    });
+
+    it('full manual operation flow: wall switch UP → tracking → wall switch STOP → HomeKit sync', () => {
+        const svc = accessory.services['WindowCovering'];
+        handler.position = 50;
+        handler.target = 50;
+        handler.state = POSITION_STATE.STOPPED;
+
+        // 1. User presses wall UP button — gateway broadcasts INCREASING
+        handler.onData('*2*1*23##');
+        assert.equal(handler.state, POSITION_STATE.INCREASING, 'state must reflect physical UP');
+        assert.equal(handler.homeKitMovement, false, 'homeKitMovement must remain false during physical movement');
+        assert.equal(svc.characteristics['CurrentPosition'].value, 51, 'position must increment one tick on first onData');
+        assert.notEqual(handler.positionTimeout, undefined, 'position tracking must start');
+
+        // 2. Tick a few times manually
+        handler.evaluatePosition();
+        handler.evaluatePosition();
+        assert.equal(handler.position, 53, 'ticks must advance position during physical movement');
+
+        // 3. User presses wall STOP button — gateway broadcasts STOP
+        handler.onData('*2*0*23##');
+        assert.equal(handler.state, POSITION_STATE.STOPPED);
+        assert.equal(handler.target, 53, 'target must be synced to physical position');
+        assert.equal(svc.characteristics['TargetPosition'].value, 53, 'HomeKit TargetPosition must reflect new position');
+        assert.equal(svc.characteristics['CurrentPosition'].value, 53);
+        assert.equal(svc.characteristics['PositionState'].value, POSITION_STATE.STOPPED);
+        assert.equal(accessory.context.blindPosition, 53, 'position must be cached on physical STOP');
     });
 
     it('STOPPED during HomeKit movement does NOT overwrite target', () => {
@@ -540,27 +673,16 @@ describe('OwnBlindAccessory', () => {
             'inStatusQuery must be cleared after done callback');
     });
 
-    it('endTimerCommand confirmation sets grace window to absorb gateway echo STOP packets', () => {
-        // Bug: after UP confirmed (*2*1000#1*id##), the old-format *2*0*id## arrives late.
-        // With commandSent=false but homeKitMovement=true, this STOP triggers false physical override.
-        // Fix: endTimerCommand success path sets inStatusQuery=true for 300ms grace window.
+    it('STOP packet from gateway during HomeKit movement triggers physical override (real stop)', () => {
+        // *2*0*<id>## from the gateway always means a real stop (physical button, end-stop, obstacle).
+        // It must NOT be ignored — the override must fire so the blind syncs target=position to HomeKit.
         handler.homeKitMovement = true;
         handler.expectedState = POSITION_STATE.INCREASING;
-        handler.state = POSITION_STATE.INCREASING;  // command just confirmed
-        handler.commandSent = true;
-
-        handler.endTimerCommand();  // success path: state === expectedState
-
-        // Grace window must be active immediately
-        assert.equal((handler as unknown as Record<string, unknown>)['inStatusQuery'], true,
-            'inStatusQuery must be true in grace window after confirmation');
-
-        // Simulate gateway echo STOP packet (old-format, arrives late)
+        handler.state = POSITION_STATE.INCREASING;
+        handler.position = 50;
+        handler.target = 80;
         handler.onData('*2*0*23##');
-
-        // homeKitMovement must survive — no physical override during grace window
-        assert.equal(handler.homeKitMovement, true,
-            'homeKitMovement must survive echo STOP during grace window after confirmation');
+        assert.equal(handler.homeKitMovement, false, 'physical override must cancel HomeKit movement on real STOP');
     });
 
     it('physical override fires for genuine direction reversal (INCREASING→DECREASING)', () => {
@@ -585,15 +707,25 @@ describe('OwnBlindAccessory', () => {
         assert.equal(handler.positionTimeout, undefined);
     });
 
-    it('move() with pending command retries without incrementing _moveRetries', () => {
+    it('move() with pending command increments moveRetries and schedules retry', () => {
         handler.commandSent = true;
         handler.moveRetries = 5;
         handler.target = 80;
         handler.position = 20;
         handler.move();
-        assert.equal(handler.moveRetries, 5);
+        assert.equal(handler.moveRetries, 6, 'moveRetries must increment on each pending-command retry');
         assert.notEqual(handler.moveTrackingTimeout, undefined);
         handler.destroy();
+    });
+
+    it('move() with pending command gives up after BLIND_MAX_MOVE_RETRIES', () => {
+        handler.commandSent = true;
+        handler.moveRetries = 30; // at the limit
+        handler.target = 80;
+        handler.position = 20;
+        handler.move();
+        assert.equal(handler.moveTrackingTimeout, undefined, 'retry loop must be stopped after max retries');
+        assert.equal(handler.commandSent, false, 'commandSent must be reset after giving up');
     });
 
     it('move() issues moveUp when target > position', () => {
@@ -605,6 +737,20 @@ describe('OwnBlindAccessory', () => {
         handler.move();
         const cmds = spy.calls.map((c: unknown[]) => (c[0] as { command: string }).command);
         assert.ok(cmds.some((c: string) => c === '*2*1*23##'));
+        handler.destroy();
+    });
+
+    it('move() restores homeKitMovement when already moving in the right direction (rapid retarget)', () => {
+        // Simulate: user set target=50 (blind starts UP), then immediately set target=80
+        // stopMoveTracking() cleared homeKitMovement; move() should restore it
+        handler.state = POSITION_STATE.INCREASING;
+        handler.homeKitMovement = false; // cleared by stopMoveTracking
+        handler.commandSent = false;
+        handler.position = 30;
+        handler.target = 80;
+        // positionTimeout must be undefined (cleared by stopMoveTracking)
+        handler.move();
+        assert.equal(handler.homeKitMovement, true, 'homeKitMovement must be restored when already moving in right direction');
         handler.destroy();
     });
 

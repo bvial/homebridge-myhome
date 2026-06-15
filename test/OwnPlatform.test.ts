@@ -135,6 +135,10 @@ function makePlatformInstance(config: Record<string, unknown>, api: MockApi): Ow
     p.createHandler = OwnPlatform.prototype.createHandler.bind(p);
     p.onMonitor = OwnPlatform.prototype.onMonitor.bind(p);
     p.onAccessory = OwnPlatform.prototype.onAccessory.bind(p);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (p as any).buildConfiguredAddrSet = (OwnPlatform.prototype as any).buildConfiguredAddrSet.bind(p);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (p as any).registerAutoDiscoveredAccessory = (OwnPlatform.prototype as any).registerAutoDiscoveredAccessory.bind(p);
 
     return p;
 }
@@ -457,5 +461,92 @@ describe('OwnPlatform config validation', () => {
 describe('constants', () => {
     it('PLUGIN_NAME matches npm package name', () => {
         assert.equal(PLUGIN_NAME, 'homebridge-myhome-unik');
+    });
+});
+
+describe('OwnPlatform.autoDiscover', () => {
+    it('registerAutoDiscoveredAccessory registers new light with placeholder name', () => {
+        const api = makeMockApi();
+        const platform = makePlatformInstance({ host: '127.0.0.1', autoDiscover: true }, api);
+        platform.discoverDevices();
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        (platform as any).registerAutoDiscoveredAccessory(1, 5);
+        assert.equal(api.registered.length, 1);
+        const acc = api.registered[0]?.[2] as Array<{ displayName: string; context: Record<string, unknown> }>;
+        assert.ok(acc?.[0]);
+        assert.equal(acc[0].displayName, 'Light 5');
+        assert.equal(acc[0].context.autoDiscovered, true);
+        assert.equal(acc[0].context.autoWho, 1);
+        assert.equal(acc[0].context.autoId, 5);
+        for (const h of platform.activeHandlers) h.destroy();
+    });
+
+    it('registerAutoDiscoveredAccessory skips unknown WHO', () => {
+        const api = makeMockApi();
+        const platform = makePlatformInstance({ host: '127.0.0.1', autoDiscover: true }, api);
+        platform.discoverDevices();
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        (platform as any).registerAutoDiscoveredAccessory(99, 5);
+        assert.equal(api.registered.length, 0);
+    });
+
+    it('buildConfiguredAddrSet maps WHO to configured ids', () => {
+        const api = makeMockApi();
+        const platform = makePlatformInstance({
+            host: '127.0.0.1',
+            lights: [{ id: 3 }, { id: 7 }],
+            blinds: [{ id: 2, time: 20 }],
+        }, api);
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const addrSet: Map<number, Set<number>> = (platform as any).buildConfiguredAddrSet();
+        assert.ok(addrSet.get(1)?.has(3));
+        assert.ok(addrSet.get(1)?.has(7));
+        assert.ok(addrSet.get(2)?.has(2));
+        assert.ok(!addrSet.get(1)?.has(10));
+    });
+
+    it('discoverDevices preserves auto-discovered cached accessory when autoDiscover:true', () => {
+        const api = makeMockApi();
+        const autoUuid = api.hap.uuid.generate('myhome-auto-1-10');
+        const autoAcc = makeAccessoryStub('Light 10', autoUuid);
+        (autoAcc.context as Record<string, unknown>).autoDiscovered = true;
+        (autoAcc.context as Record<string, unknown>).autoWho = 1;
+        (autoAcc.context as Record<string, unknown>).autoId = 10;
+        const platform = makePlatformInstance({ host: '127.0.0.1', autoDiscover: true }, api);
+        platform.cachedAccessories.push(autoAcc);
+        platform.discoverDevices();
+        assert.ok(platform.cachedAccessories.includes(autoAcc), 'auto-discovered must be preserved');
+        assert.equal(api.unregistered.length, 0);
+    });
+
+    it('discoverDevices removes auto-discovered cached accessory when autoDiscover:false', () => {
+        const api = makeMockApi();
+        const autoUuid = api.hap.uuid.generate('myhome-auto-1-10');
+        const autoAcc = makeAccessoryStub('Light 10', autoUuid);
+        (autoAcc.context as Record<string, unknown>).autoDiscovered = true;
+        const platform = makePlatformInstance({ host: '127.0.0.1', autoDiscover: false }, api);
+        platform.cachedAccessories.push(autoAcc);
+        platform.discoverDevices();
+        assert.ok(!platform.cachedAccessories.includes(autoAcc), 'auto-discovered must be removed when autoDiscover:false');
+        assert.equal(api.unregistered.length, 1);
+    });
+
+    it('registerAutoDiscoveredAccessory re-attaches cached auto-discovered accessory', () => {
+        const api = makeMockApi();
+        const autoUuid = api.hap.uuid.generate('myhome-auto-1-5');
+        const cachedAcc = makeAccessoryStub('Light 5', autoUuid);
+        (cachedAcc.context as Record<string, unknown>).autoDiscovered = true;
+        (cachedAcc.context as Record<string, unknown>).autoWho = 1;
+        (cachedAcc.context as Record<string, unknown>).autoId = 5;
+        const platform = makePlatformInstance({ host: '127.0.0.1', autoDiscover: true }, api);
+        platform.cachedAccessories.push(cachedAcc);
+        platform.discoverDevices();
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const isNew: boolean = (platform as any).registerAutoDiscoveredAccessory(1, 5);
+        assert.equal(isNew, false, 'must return false for re-attached cached accessory');
+        assert.equal(api.registered.length, 0, 'must not register again');
+        assert.equal(api.updated.length, 1, 'must call updatePlatformAccessories');
+        assert.equal(platform.activeHandlers.length, 1);
+        for (const h of platform.activeHandlers) h.destroy();
     });
 });

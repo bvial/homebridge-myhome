@@ -3,6 +3,7 @@ import { PLUGIN_NAME, PLATFORM_NAME } from './constants';
 import { errorMessage, STATUS_UPDATE_STAGGER_MS, isValidConfig } from './utils';
 import { OwnClient } from './OwnNet';
 import { OwnProtcol, WHO } from './OwnProtcol';
+import { runStatusScan, ScanFound } from './scanHelper';
 import {
     OwnLightAccessory,
     OwnBlindAccessory,
@@ -26,6 +27,8 @@ interface MyHomeConfig extends PlatformConfig {
     port?: number;
     password?: string;
     maxConcurrent?: number;
+    autoDiscover?: boolean;
+    autoDiscoverMaxAddr?: number;
     doors?: DoorConfig[];
     lights?: LightConfig[];
     blinds?: BlindConfig[];
@@ -37,6 +40,21 @@ interface MyHomeConfig extends PlatformConfig {
 
 type AnyAccessory = OwnLightAccessory | OwnBlindAccessory | OwnThermostatAccessory
     | OwnScenarioAccessory | OwnContactAccessory | OwnEnergyAccessory | OwnDoorAccessory;
+
+// HAP category codes per accessory type for auto-discovered placeholders.
+interface AutoDiscoverTypeInfo {
+    type: string;
+    category: number;
+    makeConfig(id: number): Record<string, unknown>;
+}
+
+const AUTO_DISCOVER_TYPES: Record<number, AutoDiscoverTypeInfo> = {
+    1:  { type: 'light',      category: 5,  makeConfig: (id) => ({ id, name: `Light ${id}` }) },
+    2:  { type: 'blind',      category: 14, makeConfig: (id) => ({ id, name: `Blind ${id}`, time: 30, calibrateOnStart: false }) },
+    4:  { type: 'thermostat', category: 9,  makeConfig: (id) => ({ id, name: `Thermostat ${id}`, zone: id }) },
+    9:  { type: 'contact',    category: 10, makeConfig: (id) => ({ id, name: `Contact ${id}` }) },
+    18: { type: 'energy',     category: 10, makeConfig: (id) => ({ id, name: `Energy ${id}` }) },
+};
 
 // Model codes from *#13**15## (DIM 15 = Device Type). Codes 2–13 per OWN spec; 200 = F454 (post-2006).
 const MODEL_NAMES: Record<number, string> = {
@@ -79,6 +97,8 @@ export class OwnPlatform implements DynamicPlatformPlugin {
     ) {
         const defaultConfig: Omit<MyHomeConfig, keyof PlatformConfig> = {
             port: 20000,
+            autoDiscover: false,
+            autoDiscoverMaxAddr: 20,
             doors: [],
             lights: [],
             blinds: [],
@@ -128,7 +148,7 @@ export class OwnPlatform implements DynamicPlatformPlugin {
             this.discoverDevices();
             ctrl.on('packet', this.onMonitor.bind(this));
             ctrl.on('monitoring', () => {
-                this.log.success('Gateway connected — monitoring active');
+                this.log.info('Gateway connected — monitoring active');
                 this.setAllOnline(true);
                 this.updateAccessoriesStatus();
             });
@@ -149,7 +169,16 @@ export class OwnPlatform implements DynamicPlatformPlugin {
                 }
                 // Propagate detected gateway model to each accessory's HardwareRevision
                 for (const handler of this.activeHandlers) handler.setHardwareRevision(label);
-                ctrl.startMonitor();
+                if (this.config.autoDiscover) {
+                    this.runAutoDiscovery(ctrl)
+                        .then(() => ctrl.startMonitor())
+                        .catch(err => {
+                            this.log.error('[AutoDiscover] Scan failed: %s', errorMessage(err));
+                            ctrl.startMonitor();
+                        });
+                } else {
+                    ctrl.startMonitor();
+                }
             });
         });
 
@@ -236,7 +265,14 @@ export class OwnPlatform implements DynamicPlatformPlugin {
             }
         }
 
-        const stale = this.cachedAccessories.filter(a => !discoveredUUIDs.includes(a.UUID));
+        const stale = this.cachedAccessories.filter(a => {
+            if (discoveredUUIDs.includes(a.UUID)) return false;
+            // Preserve auto-discovered accessories when autoDiscover is active;
+            // runAutoDiscovery() will re-attach or clean them up after the scan.
+            if (this.config.autoDiscover &&
+                (a.context as Record<string, unknown>).autoDiscovered) return false;
+            return true;
+        });
         if (stale.length > 0) {
             this.log.info('Removing %d stale accessories', stale.length);
             for (const accessory of stale) {
@@ -342,5 +378,134 @@ export class OwnPlatform implements DynamicPlatformPlugin {
     /** OwnPlatformLike: notify Homebridge that an accessory's mutable state (e.g. displayName) changed. */
     updateAccessory(accessory: PlatformAccessory): void {
         this.api.updatePlatformAccessories([accessory]);
+    }
+
+    // ─── Auto-discovery ───────────────────────────────────────────────────────
+
+    private async runAutoDiscovery(ctrl: OwnClient): Promise<void> {
+        const maxAddr = (this.config as MyHomeConfig).autoDiscoverMaxAddr ?? 20;
+        this.log.info('[AutoDiscover] Starting STATUS scan (addresses 1..%d)', maxAddr);
+
+        let found: ScanFound[];
+        try {
+            found = await runStatusScan(ctrl, maxAddr);
+        } catch (err) {
+            this.log.error('[AutoDiscover] Scan failed: %s', errorMessage(err));
+            return;
+        }
+
+        this.log.info('[AutoDiscover] Scan complete — %d probe(s) responded', found.length);
+
+        const configuredAddrs = this.buildConfiguredAddrSet();
+
+        // Clean up auto-discovered accessories that have since been added to manual config
+        const promoted = this.cachedAccessories.filter(a => {
+            if (!(a.context as Record<string, unknown>).autoDiscovered) return false;
+            const m = a.UUID.match(/^[0-9a-f-]+$/i);
+            if (!m) return false;
+            // Parse who+id from the accessory context (stored during registration)
+            const ctx = a.context as Record<string, unknown>;
+            const who = typeof ctx.autoWho === 'number' ? ctx.autoWho : null;
+            const id  = typeof ctx.autoId  === 'number' ? ctx.autoId  : null;
+            if (who === null || id === null) return false;
+            return configuredAddrs.get(who)?.has(id) ?? false;
+        });
+        if (promoted.length > 0) {
+            this.log.info('[AutoDiscover] Removing %d promoted accessory(s) (now in config)', promoted.length);
+            for (const a of promoted) {
+                const idx = this.activeHandlers.findIndex(h => h.accessory === a);
+                if (idx !== -1) { this.activeHandlers[idx].destroy(); this.activeHandlers.splice(idx, 1); }
+            }
+            this.api.unregisterPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, promoted);
+            this.cachedAccessories = this.cachedAccessories.filter(a => !promoted.includes(a));
+        }
+
+        let newCount = 0;
+        for (const { who, where } of found) {
+            const id = parseInt(where, 10);
+            if (isNaN(id) || id <= 0) continue;
+            if (configuredAddrs.get(who)?.has(id)) continue;
+
+            try {
+                const isNew = this.registerAutoDiscoveredAccessory(who, id);
+                if (isNew) newCount++;
+            } catch (err) {
+                this.log.warn('[AutoDiscover] Failed to register WHO=%d WHERE=%s: %s', who, where, errorMessage(err));
+            }
+        }
+
+        if (newCount > 0) {
+            this.log.warn(
+                '[AutoDiscover] Registered %d new device(s) with placeholder names. ' +
+                'Add them to your config.json and restart Homebridge to make them permanent.',
+                newCount,
+            );
+        } else {
+            this.log.info('[AutoDiscover] No new devices found beyond existing config.');
+        }
+    }
+
+    /** Returns Map<WHO, Set<id>> for all manually configured accessories. */
+    private buildConfiguredAddrSet(): Map<number, Set<number>> {
+        const cfg = this.config as MyHomeConfig;
+        const m = new Map<number, Set<number>>();
+        const add = (who: number, items: Array<{ id: number }> | undefined) => {
+            if (!items?.length) return;
+            const s = m.get(who) ?? new Set<number>();
+            for (const item of items) s.add(item.id);
+            m.set(who, s);
+        };
+        add(1,  cfg.lights);
+        add(2,  cfg.blinds);
+        add(4,  cfg.thermostats);
+        add(9,  cfg.contacts);
+        add(18, cfg.energies);
+        return m;
+    }
+
+    /**
+     * Register a single auto-discovered device.
+     * Returns true if a brand-new accessory was created, false if an existing
+     * cached auto-discovered accessory was re-attached.
+     */
+    private registerAutoDiscoveredAccessory(who: number, id: number): boolean {
+        const typeInfo = AUTO_DISCOVER_TYPES[who];
+        if (!typeInfo) {
+            this.log.debug('[AutoDiscover] WHO=%d not in AUTO_DISCOVER_TYPES, skipping', who);
+            return false;
+        }
+
+        const uuid = this.api.hap.uuid.generate(`myhome-auto-${who}-${id}`);
+
+        // Re-attach from cache (Homebridge restart with autoDiscover still on)
+        const existing = this.cachedAccessories.find(a => a.UUID === uuid);
+        if (existing) {
+            this.log.info('[AutoDiscover] Restoring cached %s id=%d', typeInfo.type, id);
+            existing.context.device = typeInfo.makeConfig(id);
+            existing.context.type = typeInfo.type;
+            (existing.context as Record<string, unknown>).autoDiscovered = true;
+            (existing.context as Record<string, unknown>).autoWho = who;
+            (existing.context as Record<string, unknown>).autoId  = id;
+            this.api.updatePlatformAccessories([existing]);
+            if (!this.activeHandlers.find(h => h.accessory === existing)) {
+                this.createHandler(typeInfo.type, existing, existing.context.device as Record<string, unknown>);
+            }
+            return false;
+        }
+
+        const name = `${typeInfo.type.charAt(0).toUpperCase() + typeInfo.type.slice(1)} ${id}`;
+        this.log.info('[AutoDiscover] Registering new %s id=%d as "%s"', typeInfo.type, id, name);
+        const accessory = new this.api.platformAccessory(name, uuid);
+        accessory.category = (typeInfo.category ?? 1) as unknown as typeof accessory.category;
+        const deviceConfig = typeInfo.makeConfig(id);
+        accessory.context.device = deviceConfig;
+        accessory.context.type = typeInfo.type;
+        (accessory.context as Record<string, unknown>).autoDiscovered = true;
+        (accessory.context as Record<string, unknown>).autoWho = who;
+        (accessory.context as Record<string, unknown>).autoId  = id;
+
+        this.createHandler(typeInfo.type, accessory, deviceConfig);
+        this.api.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
+        return true;
     }
 }

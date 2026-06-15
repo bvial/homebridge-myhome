@@ -39,6 +39,22 @@
                 "minimum": 1,
                 "maximum": 10
             },
+            "autoDiscover": {
+                "title": "Auto-discover devices",
+                "description": "Scan the gateway for devices not in config and register them automatically as placeholder accessories. Restart Homebridge to re-run the scan.",
+                "type": "boolean",
+                "required": false,
+                "default": false
+            },
+            "autoDiscoverMaxAddr": {
+                "title": "Auto-discover max address",
+                "description": "Maximum address (1..N) probed per WHO type during auto-discovery. Higher values find more devices but take longer. Default: 20.",
+                "type": "integer",
+                "required": false,
+                "minimum": 1,
+                "maximum": 99,
+                "default": 20
+            },
             "lights": {
                 "title": "Lights",
                 "buttonText": "Add Light",
@@ -63,6 +79,12 @@
                             "type": "boolean",
                             "required": false,
                             "default": false
+                        },
+                        "where": {
+                            "title": "Custom WHERE address",
+                            "description": "Optional raw OpenWebNet WHERE address for special relay configurations (e.g. \"68#4#01\"). Defaults to id.",
+                            "type": "string",
+                            "required": false
                         }
                     }
                 }
@@ -108,6 +130,13 @@
                             "minimum": 0,
                             "maximum": 100,
                             "default": 0
+                        },
+                        "calibrateOnStart": {
+                            "title": "Calibrate on start",
+                            "description": "Move the blind fully down on first Homebridge start to establish a known position. Set to false to restore the last cached position without moving (useful if you don't want blinds to move on every restart).",
+                            "type": "boolean",
+                            "required": false,
+                            "default": true
                         }
                     }
                 }
