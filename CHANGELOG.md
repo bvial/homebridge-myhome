@@ -11,13 +11,19 @@ All notable changes to this project are documented here.
   to permanently block subsequent state updates. Symptom: after autocalibration,
   the first manual UP/STOP cycle worked, then all later wall-switch movements
   were silently ignored.
-- **Calibration STOP not always sent.** The init timer's `if (this.initPhase)`
-  guard skipped sending the safety STOP when calibration had been ended early
-  by a gateway STOP echo (e.g. blind reaches bottom-stop). The STOP is now sent
-  unconditionally at timer expiration — sending it twice is harmless.
+- **Calibration safety STOP not always sent.** The init timer is meant as a
+  safety net guaranteeing a STOP after the full travel time. `endCalibration()`
+  was clearing this timer when a premature gateway STOP arrived, defeating the
+  guarantee. Now the timer fires unconditionally — duplicate STOPs are harmless.
+- **Blind direction mapping inverted.** On BTicino installations, the gateway
+  broadcasts `*2*1*<id>##` for DOWN/closing and `*2*2*<id>##` for UP/opening.
+  Previous versions mapped these incorrectly, causing HomeKit to display
+  "closing" while the blind opened (and vice versa). Both incoming packet
+  interpretation and outgoing commands (moveUp, moveDown, calibration init)
+  are now aligned with the BTicino convention.
 
 ### Unchanged from 0.4.0
-- Blind direction interpretation: `*2*1*` → INCREASING (UP), `*2*2*` → DECREASING (DOWN).
+- Blind position tracking, caching, calibrateOnStart, all other behavior.
 
 ## [0.4.0]
 

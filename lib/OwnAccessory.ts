@@ -478,7 +478,7 @@ export class OwnBlindAccessory extends OwnAccessory {
         if (!this.initStartPosition) {
             if (this.calibrateOnStart) {
                 this.log.info(`[${this.id}] Calibrating: move fully down to establish known position`);
-                const queued = this.controller.sendCommand({ command: `*2*2*${this.id}##`, log: this.log });
+                const queued = this.controller.sendCommand({ command: `*2*1*${this.id}##`, log: this.log });
                 if (!queued) {
                     this.log.warn('[%s] Blind init DOWN dropped: queue full — calibration deferred', this.id);
                     return;
@@ -570,7 +570,7 @@ export class OwnBlindAccessory extends OwnAccessory {
         this.expectedState = this.Characteristic.PositionState.INCREASING;
         this.startTimerCommand();
         const queued = this.controller.sendCommand({
-            command: `*2*1*${this.id}##`,
+            command: `*2*2*${this.id}##`,  // BTicino: *2*2* = UP
             log: this.log,
             started: () => this.startConfirmationTimer(),
         });
@@ -587,7 +587,7 @@ export class OwnBlindAccessory extends OwnAccessory {
         this.expectedState = this.Characteristic.PositionState.DECREASING;
         this.startTimerCommand();
         const queued = this.controller.sendCommand({
-            command: `*2*2*${this.id}##`,
+            command: `*2*1*${this.id}##`,  // BTicino: *2*1* = DOWN
             log: this.log,
             started: () => this.startConfirmationTimer(),
         });
@@ -618,9 +618,11 @@ export class OwnBlindAccessory extends OwnAccessory {
                 }
                 this.cachePosition();
             } else if (direction === '1') {
-                this.state = this.Characteristic.PositionState.INCREASING;
-            } else if (direction === '2') {
+                // BTicino convention on this gateway: *2*1* = DOWN/closing
                 this.state = this.Characteristic.PositionState.DECREASING;
+            } else if (direction === '2') {
+                // BTicino convention on this gateway: *2*2* = UP/opening
+                this.state = this.Characteristic.PositionState.INCREASING;
             } else {
                 this.log.warn('[%s] Blind unknown direction byte %s in packet %s', this.id, direction, packet);
                 return;
@@ -827,7 +829,10 @@ export class OwnThermostatAccessory extends OwnAccessory {
         this.address = `#0#${this.zone}`;
 
         this.temperature = 0;
-        this.targetTemperature = 0;
+        // Default to 20°C (within the 5..30 range exposed to HomeKit) so the initial
+        // characteristic read does not produce a "value exceeded minimum" HAP warning.
+        // Real value will be overwritten by the first DIM 14 packet from the gateway.
+        this.targetTemperature = 20;
         this.localOffset = 0;
         this.heatingCoolingState = this.Characteristic.CurrentHeatingCoolingState.OFF;
         this.targetHeatingCoolingState = this.Characteristic.TargetHeatingCoolingState.OFF;
@@ -929,7 +934,10 @@ export class OwnThermostatAccessory extends OwnAccessory {
 
     updateCharacteristicTargetTemperature(temperature: number): void {
         this.log.info(`[${this.id}] update TargetTemperature (${temperature})`);
-        this.targetTemperature = temperature;
+        // Clamp to the HAP-exposed range [5, 30] to avoid characteristic warnings
+        // when the gateway reports a setpoint outside the displayable range
+        // (e.g. 0 when the zone is OFF).
+        this.targetTemperature = Math.min(30, Math.max(5, temperature));
         this.thermostatService.updateCharacteristic(this.Characteristic.TargetTemperature, this.targetTemperature);
     }
 

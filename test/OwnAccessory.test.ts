@@ -255,12 +255,12 @@ describe('OwnBlindAccessory', () => {
     });
 
     it('onData increasing', () => {
-        handler.onData('*2*1*23##');
+        handler.onData('*2*2*23##');
         assert.equal(handler.state, POSITION_STATE.INCREASING);
     });
 
     it('onData decreasing', () => {
-        handler.onData('*2*2*23##');
+        handler.onData('*2*1*23##');
         assert.equal(handler.state, POSITION_STATE.DECREASING);
     });
 
@@ -271,9 +271,9 @@ describe('OwnBlindAccessory', () => {
         assert.ok(debugs.length > 0);
     });
 
-    it('onData extended 1000#2 treated as DECREASING', () => {
+    it('onData extended 1000#2 treated as INCREASING (UP)', () => {
         handler.onData('*2*1000#2*23##');
-        assert.equal(handler.state, POSITION_STATE.DECREASING);
+        assert.equal(handler.state, POSITION_STATE.INCREASING);
     });
 
     it('onData extended 1000#0 treated as STOPPED', () => {
@@ -371,7 +371,7 @@ describe('OwnBlindAccessory', () => {
         assert.equal(handler.initPhase, true);
         assert.equal(handler.initStartPosition, true);
         const cmds = spy.calls.map((c: unknown[]) => (c[0] as { command: string }).command);
-        assert.ok(cmds.some((c: string) => c === '*2*2*23##'));
+        assert.ok(cmds.some((c: string) => c === '*2*1*23##'));
     });
 
     it('calibrateOnStart:false restores cached position without sending move-down', () => {
@@ -401,7 +401,7 @@ describe('OwnBlindAccessory', () => {
         p.sendCommandSpy.calls.length = 0;
         h.updateStatus();
         const cmds = p.sendCommandSpy.calls.map((c: unknown[]) => (c[0] as { command: string }).command);
-        assert.ok(cmds.some((c: string) => c === '*2*2*31##'), 'move-down must be sent for calibration');
+        assert.ok(cmds.some((c: string) => c === '*2*1*31##'), 'move-down must be sent for calibration');
         h.destroy();
     });
 
@@ -480,7 +480,7 @@ describe('OwnBlindAccessory', () => {
         handler.state = POSITION_STATE.STOPPED;
 
         // 1. User presses wall UP button — gateway broadcasts INCREASING
-        handler.onData('*2*1*23##');
+        handler.onData('*2*2*23##');
         assert.equal(handler.state, POSITION_STATE.INCREASING, 'state must reflect physical UP');
         assert.equal(handler.homeKitMovement, false, 'homeKitMovement must remain false during physical movement');
         assert.equal(svc.characteristics['CurrentPosition'].value, 51, 'position must increment one tick on first onData');
@@ -511,13 +511,13 @@ describe('OwnBlindAccessory', () => {
         handler.state = POSITION_STATE.STOPPED;
 
         // 1st manual cycle: UP → STOP
-        handler.onData('*2*1*23##');
+        handler.onData('*2*2*23##');
         handler.onData('*2*0*23##');
         assert.equal(handler.state, POSITION_STATE.STOPPED);
         assert.equal(handler.positionTimeout, undefined, 'positionTimeout must be undefined after STOP');
 
         // 2nd manual cycle: DOWN — must update HomeKit state
-        handler.onData('*2*2*23##');
+        handler.onData('*2*1*23##');
         assert.equal(handler.state, POSITION_STATE.DECREASING, '2nd manual movement state must be reflected');
         assert.equal(svc.characteristics['PositionState'].value, POSITION_STATE.DECREASING,
             '2nd movement PositionState must be pushed to HomeKit');
@@ -527,7 +527,7 @@ describe('OwnBlindAccessory', () => {
         assert.equal(handler.state, POSITION_STATE.STOPPED, '2nd STOP must be reflected');
 
         // 3rd manual cycle: UP again — must still update HomeKit
-        handler.onData('*2*1*23##');
+        handler.onData('*2*2*23##');
         assert.equal(handler.state, POSITION_STATE.INCREASING, '3rd manual movement state must be reflected');
         assert.equal(svc.characteristics['PositionState'].value, POSITION_STATE.INCREASING);
     });
@@ -547,7 +547,7 @@ describe('OwnBlindAccessory', () => {
         handler.time = 0.05;  // 50ms travel + 1000ms margin → ~1050ms
         handler.updateStatus();
         // Verify init DOWN was sent immediately
-        const downSent = spy.calls.some((c: unknown[]) => (c[0] as { command: string }).command === '*2*2*23##');
+        const downSent = spy.calls.some((c: unknown[]) => (c[0] as { command: string }).command === '*2*1*23##');
         assert.ok(downSent, 'init DOWN must be sent immediately');
         // Wait for the calibration timer to fire
         setTimeout(() => {
@@ -644,7 +644,7 @@ describe('OwnBlindAccessory', () => {
         let evalCalled = 0;
         const orig = handler.evaluatePosition.bind(handler);
         handler.evaluatePosition = () => { evalCalled++; orig(); };
-        handler.onData('*2*2*23##');
+        handler.onData('*2*1*23##');
         assert.equal(evalCalled, 0, 'evaluatePosition must not be called for duplicate DECREASING');
         handler.destroy();
     });
@@ -745,7 +745,7 @@ describe('OwnBlindAccessory', () => {
         handler.position = 50;
         handler.target = 80;
 
-        handler.onData('*2*2*23##');  // physical DOWN while HomeKit was going UP
+        handler.onData('*2*1*23##');  // physical DOWN while HomeKit was going UP
 
         assert.equal(handler.homeKitMovement, false, 'homeKitMovement must be cleared on real physical override');
         assert.equal(handler.state, POSITION_STATE.DECREASING);
@@ -789,7 +789,7 @@ describe('OwnBlindAccessory', () => {
         handler.target = 80;
         handler.move();
         const cmds = spy.calls.map((c: unknown[]) => (c[0] as { command: string }).command);
-        assert.ok(cmds.some((c: string) => c === '*2*1*23##'));
+        assert.ok(cmds.some((c: string) => c === '*2*2*23##'));
         handler.destroy();
     });
 
@@ -815,7 +815,7 @@ describe('OwnBlindAccessory', () => {
         handler.target = 20;
         handler.move();
         const cmds = spy.calls.map((c: unknown[]) => (c[0] as { command: string }).command);
-        assert.ok(cmds.some((c: string) => c === '*2*2*23##'));
+        assert.ok(cmds.some((c: string) => c === '*2*1*23##'));
         handler.destroy();
     });
 
@@ -851,6 +851,28 @@ describe('OwnThermostatAccessory', () => {
         a.addService('AccessoryInformation');
         const h = new OwnThermostatAccessory(p as unknown as P, a as unknown as A, { id: 2, zone: 2 });
         assert.equal(h.name, 'thermostat-2');
+    });
+
+    it('targetTemperature initial value is within HAP minValue=5 (no warning at startup)', () => {
+        const p = makeMockPlatform();
+        const a = makeMockAccessory();
+        a.addService('AccessoryInformation');
+        const h = new OwnThermostatAccessory(p as unknown as P, a as unknown as A, { id: 1, zone: 1 });
+        assert.ok(h.targetTemperature >= 5, 'initial targetTemperature must be >= HAP minValue 5');
+        assert.ok(h.targetTemperature <= 30, 'initial targetTemperature must be <= HAP maxValue 30');
+    });
+
+    it('updateCharacteristicTargetTemperature clamps below-minimum values to 5', () => {
+        const p = makeMockPlatform();
+        const a = makeMockAccessory();
+        a.addService('AccessoryInformation');
+        const h = new OwnThermostatAccessory(p as unknown as P, a as unknown as A, { id: 1, zone: 1 });
+        h.updateCharacteristicTargetTemperature(0);
+        assert.equal(h.targetTemperature, 5, '0°C must be clamped to HAP minValue 5');
+        h.updateCharacteristicTargetTemperature(50);
+        assert.equal(h.targetTemperature, 30, '50°C must be clamped to HAP maxValue 30');
+        h.updateCharacteristicTargetTemperature(22);
+        assert.equal(h.targetTemperature, 22, 'in-range values must pass through');
     });
 
     it('throws when zone is missing', () => {
