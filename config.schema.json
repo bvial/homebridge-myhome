@@ -137,6 +137,13 @@
                             "type": "boolean",
                             "required": false,
                             "default": true
+                        },
+                        "inverted": {
+                            "title": "Invert direction",
+                            "description": "Some BTicino installations have UP/DOWN OWN codes wired in reverse. Enable if HomeKit shows 'closing' when the blind opens.",
+                            "type": "boolean",
+                            "required": false,
+                            "default": false
                         }
                     }
                 }

@@ -51,6 +51,9 @@ export interface BlindConfig extends BaseConfig {
     /** Re-calibrate (move fully down) on first Homebridge start to establish a known position.
      *  Set to false to restore the last cached position without moving the blind (default: true). */
     calibrateOnStart?: boolean;
+    /** Invert UP/DOWN: some BTicino installations have the OWN direction codes wired in reverse.
+     *  When true, *2*1* is treated as DOWN/closing and *2*2* as UP/opening. Default: false. */
+    inverted?: boolean;
 }
 
 export interface ThermostatConfig extends BaseConfig {
@@ -371,6 +374,7 @@ export class OwnBlindAccessory extends OwnAccessory {
     initPhase: boolean;
     homeKitMovement: boolean;
     private calibrateOnStart: boolean;
+    private inverted: boolean;
     private inStatusQuery: boolean;
     private statusQueryTimeout: ReturnType<typeof setTimeout> | undefined;
     private initTimeout: ReturnType<typeof setTimeout> | undefined;
@@ -390,6 +394,7 @@ export class OwnBlindAccessory extends OwnAccessory {
         this.timeSlat = config.timeSlat ?? 0;
         this.slatPercent = config.slatPercent ?? 0;
         this.calibrateOnStart = config.calibrateOnStart ?? true;
+        this.inverted = config.inverted ?? false;
 
         this.state = this.Characteristic.PositionState.STOPPED;
         this.expectedState = this.Characteristic.PositionState.STOPPED;
@@ -478,7 +483,8 @@ export class OwnBlindAccessory extends OwnAccessory {
         if (!this.initStartPosition) {
             if (this.calibrateOnStart) {
                 this.log.info(`[${this.id}] Calibrating: move fully down to establish known position`);
-                const queued = this.controller.sendCommand({ command: `*2*2*${this.id}##`, log: this.log });
+                const downCode = this.inverted ? '1' : '2';
+                const queued = this.controller.sendCommand({ command: `*2*${downCode}*${this.id}##`, log: this.log });
                 if (!queued) {
                     this.log.warn('[%s] Blind init DOWN dropped: queue full — calibration deferred', this.id);
                     return;
@@ -570,8 +576,9 @@ export class OwnBlindAccessory extends OwnAccessory {
         this.homeKitMovement = true;
         this.expectedState = this.Characteristic.PositionState.INCREASING;
         this.startTimerCommand();
+        const upCode = this.inverted ? '2' : '1';
         const queued = this.controller.sendCommand({
-            command: `*2*1*${this.id}##`,
+            command: `*2*${upCode}*${this.id}##`,
             log: this.log,
             started: () => this.startConfirmationTimer(),
         });
@@ -587,8 +594,9 @@ export class OwnBlindAccessory extends OwnAccessory {
         this.homeKitMovement = true;
         this.expectedState = this.Characteristic.PositionState.DECREASING;
         this.startTimerCommand();
+        const downCode = this.inverted ? '1' : '2';
         const queued = this.controller.sendCommand({
-            command: `*2*2*${this.id}##`,
+            command: `*2*${downCode}*${this.id}##`,
             log: this.log,
             started: () => this.startConfirmationTimer(),
         });
@@ -619,9 +627,13 @@ export class OwnBlindAccessory extends OwnAccessory {
                 }
                 this.cachePosition();
             } else if (direction === '1') {
-                this.state = this.Characteristic.PositionState.INCREASING;
+                this.state = this.inverted
+                    ? this.Characteristic.PositionState.DECREASING
+                    : this.Characteristic.PositionState.INCREASING;
             } else if (direction === '2') {
-                this.state = this.Characteristic.PositionState.DECREASING;
+                this.state = this.inverted
+                    ? this.Characteristic.PositionState.INCREASING
+                    : this.Characteristic.PositionState.DECREASING;
             } else {
                 this.log.warn('[%s] Blind unknown direction byte %s in packet %s', this.id, direction, packet);
                 return;
@@ -654,6 +666,7 @@ export class OwnBlindAccessory extends OwnAccessory {
 
     evaluatePosition(): void {
         clearTimeout(this.positionTimeout);
+        this.positionTimeout = undefined;
         if (this.state === this.Characteristic.PositionState.STOPPED) {
             this.log.info(`[${this.id}] Blind is STOPPED pos:${this.position} target:${this.target}`);
             // Sync TargetPosition to CurrentPosition only when no HomeKit movement is in progress

@@ -501,6 +501,69 @@ describe('OwnBlindAccessory', () => {
         assert.equal(accessory.context.blindPosition, 53, 'position must be cached on physical STOP');
     });
 
+    it('successive manual operations after STOP all reflect in HomeKit (regression test)', () => {
+        // Bug: positionTimeout was cleared but never reset to undefined in evaluatePosition().
+        // After the first physical STOP, the variable kept its (cancelled) reference, so the
+        // onData guard `!this.positionTimeout` was false, blocking subsequent evaluatePosition() calls.
+        const svc = accessory.services['WindowCovering'];
+        handler.position = 50;
+        handler.target = 50;
+        handler.state = POSITION_STATE.STOPPED;
+
+        // 1st manual cycle: UP → STOP
+        handler.onData('*2*1*23##');
+        handler.onData('*2*0*23##');
+        assert.equal(handler.state, POSITION_STATE.STOPPED);
+        assert.equal(handler.positionTimeout, undefined, 'positionTimeout must be undefined after STOP');
+
+        // 2nd manual cycle: DOWN — must update HomeKit state
+        handler.onData('*2*2*23##');
+        assert.equal(handler.state, POSITION_STATE.DECREASING, '2nd manual movement state must be reflected');
+        assert.equal(svc.characteristics['PositionState'].value, POSITION_STATE.DECREASING,
+            '2nd movement PositionState must be pushed to HomeKit');
+
+        // 2nd STOP
+        handler.onData('*2*0*23##');
+        assert.equal(handler.state, POSITION_STATE.STOPPED, '2nd STOP must be reflected');
+
+        // 3rd manual cycle: UP again — must still update HomeKit
+        handler.onData('*2*1*23##');
+        assert.equal(handler.state, POSITION_STATE.INCREASING, '3rd manual movement state must be reflected');
+        assert.equal(svc.characteristics['PositionState'].value, POSITION_STATE.INCREASING);
+    });
+
+    it('inverted: true swaps direction codes (1↔2) in onData', () => {
+        const p = makeMockPlatform();
+        const a = makeMockAccessory();
+        a.addService('AccessoryInformation');
+        const h = new OwnBlindAccessory(p as unknown as P, a as unknown as A,
+            { id: 50, name: 'reversed', time: 20, inverted: true });
+        // Gateway sends *2*1*<id>## — with inverted, this means DOWN/closing
+        h.onData('*2*1*50##');
+        assert.equal(h.state, POSITION_STATE.DECREASING, 'inverted: *2*1* must map to DECREASING');
+        h.onData('*2*0*50##');
+        h.onData('*2*2*50##');
+        assert.equal(h.state, POSITION_STATE.INCREASING, 'inverted: *2*2* must map to INCREASING');
+        h.destroy();
+    });
+
+    it('inverted: true uses *2*2* for moveUp and *2*1* for moveDown', () => {
+        const p = makeMockPlatform();
+        const a = makeMockAccessory();
+        a.addService('AccessoryInformation');
+        const h = new OwnBlindAccessory(p as unknown as P, a as unknown as A,
+            { id: 51, name: 'reversed', time: 20, inverted: true, calibrateOnStart: false });
+        p.sendCommandSpy.calls.length = 0;
+        h.moveUp();
+        const upCmd = p.sendCommandSpy.calls.map((c: unknown[]) => (c[0] as { command: string }).command);
+        assert.ok(upCmd.includes('*2*2*51##'), 'inverted moveUp must send *2*2*');
+        p.sendCommandSpy.calls.length = 0;
+        h.moveDown();
+        const downCmd = p.sendCommandSpy.calls.map((c: unknown[]) => (c[0] as { command: string }).command);
+        assert.ok(downCmd.includes('*2*1*51##'), 'inverted moveDown must send *2*1*');
+        h.destroy();
+    });
+
     it('STOPPED during HomeKit movement does NOT overwrite target', () => {
         handler.state = POSITION_STATE.STOPPED;
         handler.homeKitMovement = true;
