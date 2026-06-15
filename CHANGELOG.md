@@ -19,11 +19,22 @@ All notable changes to this project are documented here.
   broadcasts `*2*1*<id>##` for DOWN/closing and `*2*2*<id>##` for UP/opening.
   Previous versions mapped these incorrectly, causing HomeKit to display
   "closing" while the blind opened (and vice versa). Both incoming packet
-  interpretation and outgoing commands (moveUp, moveDown, calibration init)
-  are now aligned with the BTicino convention.
+  interpretation and outgoing commands (`moveUp`, `moveDown`, calibration init)
+  are now aligned with the BTicino convention:
+    - `onData` direction `'1'` → `DECREASING`, direction `'2'` → `INCREASING`
+    - `moveUp()` sends `*2*2*<id>##`
+    - `moveDown()` sends `*2*1*<id>##`
+    - Calibration init sends `*2*1*<id>##`
+- **Thermostat HAP "value 0 exceeded minimum of 5" warning at startup.**
+  The `TargetTemperature` characteristic exposes `minValue=5/maxValue=30` but
+  the field was initialized to `0`. HomeKit's first read produced a warning.
+  Fix: initialize `targetTemperature` to `20°C` (sane default within range)
+  and clamp every `updateCharacteristicTargetTemperature()` value to
+  `[5, 30]` so gateway packets reporting out-of-range setpoints (e.g. `0`
+  when the zone is OFF) no longer trigger the warning.
 
 ### Unchanged from 0.4.0
-- Blind position tracking, caching, calibrateOnStart, all other behavior.
+- Blind position tracking, caching, `calibrateOnStart`, all other behavior.
 
 ## [0.4.0]
 

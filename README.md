@@ -101,6 +101,8 @@ Add a platform block to your Homebridge `config.json`:
 | `zone` | integer | yes | Central unit zone number |
 | `name` | string | no | Display name |
 
+Supports HEAT, COOL, OFF and AUTO modes. The target temperature characteristic is exposed to HomeKit in the range 5°C..30°C; values reported by the gateway outside this range (e.g. `0` when a zone is OFF) are clamped to avoid HAP warnings. A linked `TemperatureSensor` service is added so the Home app can graph temperature history.
+
 #### `scenarios`
 
 | Key | Type | Required | Description |
