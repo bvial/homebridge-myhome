@@ -188,7 +188,7 @@ describe('OwnBlindAccessory', () => {
         platform = makeMockPlatform();
         accessory = makeMockAccessory();
         accessory.addService('AccessoryInformation');
-        handler = new OwnBlindAccessory(platform as unknown as P, accessory as unknown as A, { id: 23, name: 'test-blind', time: 30, timeSlat: 0, slatPercent: 0 });
+        handler = new OwnBlindAccessory(platform as unknown as P, accessory as unknown as A, { id: 23, name: 'test-blind', time: 30, timeSlat: 0, slatPercent: 0, inverted: false });
     });
     afterEach(() => { handler.destroy(); });
 
@@ -397,11 +397,29 @@ describe('OwnBlindAccessory', () => {
         a.addService('AccessoryInformation');
         a.context.blindPosition = 65;
         const h = new OwnBlindAccessory(p as unknown as P, a as unknown as A,
-            { id: 31, name: 'test', time: 20 }); // calibrateOnStart defaults to true
+            { id: 31, name: 'test', time: 20, inverted: false }); // calibrateOnStart defaults to true
         p.sendCommandSpy.calls.length = 0;
         h.updateStatus();
         const cmds = p.sendCommandSpy.calls.map((c: unknown[]) => (c[0] as { command: string }).command);
         assert.ok(cmds.some((c: string) => c === '*2*2*31##'), 'move-down must be sent for calibration');
+        h.destroy();
+    });
+
+    it('default convention (inverted=true): *2*1* maps to DECREASING and moveUp sends *2*2*', () => {
+        // Default behavior: BTicino convention where *2*1* = DOWN (closing) and *2*2* = UP (opening).
+        const p = makeMockPlatform();
+        const a = makeMockAccessory();
+        a.addService('AccessoryInformation');
+        const h = new OwnBlindAccessory(p as unknown as P, a as unknown as A,
+            { id: 40, name: 'default', time: 20, calibrateOnStart: false });
+        // Gateway sends *2*1* — must be interpreted as DECREASING
+        h.onData('*2*1*40##');
+        assert.equal(h.state, POSITION_STATE.DECREASING, 'default: *2*1* must be DECREASING');
+        // moveUp must send *2*2*
+        p.sendCommandSpy.calls.length = 0;
+        h.moveUp();
+        const upCmds = p.sendCommandSpy.calls.map((c: unknown[]) => (c[0] as { command: string }).command);
+        assert.ok(upCmds.includes('*2*2*40##'), 'default moveUp must send *2*2*');
         h.destroy();
     });
 

@@ -140,10 +140,10 @@
                         },
                         "inverted": {
                             "title": "Invert direction",
-                            "description": "Some BTicino installations have UP/DOWN OWN codes wired in reverse. Enable if HomeKit shows 'closing' when the blind opens.",
+                            "description": "Default true (BTicino convention: *2*1* = DOWN, *2*2* = UP). Set to false if HomeKit shows 'opening' while the blind closes (reverse-wired installation).",
                             "type": "boolean",
                             "required": false,
-                            "default": false
+                            "default": true
                         }
                     }
                 }

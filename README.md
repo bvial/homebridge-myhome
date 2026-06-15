@@ -68,6 +68,8 @@ Add a platform block to your Homebridge `config.json`:
 | `port` | integer | `20000` | TCP port |
 | `password` | string | `""` | Numeric password (leave empty if none) |
 | `maxConcurrent` | integer | auto | Max simultaneous TCP command connections (1–10). If omitted the plugin queries the gateway model (`*#13**15##`) at startup and sets the limit automatically: F454 → 4, F452/F452V/MH200 → 3, others/unknown → 2 |
+| `autoDiscover` | boolean | `false` | Scan the gateway at startup for devices not yet in config and register them as placeholder accessories (`Light 5`, `Blind 3`, etc.). Add the discovered devices to `config.json` and restart to make them permanent — the placeholder is then automatically removed. |
+| `autoDiscoverMaxAddr` | integer | `20` | Maximum address (1..N) probed per WHO type during auto-discovery. Higher values find more devices but lengthen the startup scan. Range 1–99. |
 
 ### Accessory arrays
 
@@ -78,6 +80,7 @@ Add a platform block to your Homebridge `config.json`:
 | `id` | integer | yes | OWN `WHERE` address |
 | `name` | string | no | Display name in HomeKit |
 | `dimmer` | boolean | no | Enable brightness control (levels 2–10). When a light is triggered by a gateway scenario or automation rule, the gateway sends an extended packet (`*1*1000#X*WHERE##`) that is handled transparently. |
+| `where` | string | no | Custom raw OWN `WHERE` address for special relay configurations (e.g. `"68#4#01"` for group/sub-unit relays). Defaults to `String(id)`. |
 
 #### `blinds`
 
@@ -88,6 +91,8 @@ Add a platform block to your Homebridge `config.json`:
 | `time` | integer | yes | Seconds for full travel (up or down) |
 | `timeSlat` | integer | no | Extra seconds for slat rotation (venetian blinds only) |
 | `slatPercent` | integer | no | Position % below which slat rotation occurs (venetian blinds only) |
+| `calibrateOnStart` | boolean | no | Default `true`. When `true`, the blind moves fully down on first Homebridge start to establish a known position (0%). Set to `false` to restore the last cached position from `accessory.context.blindPosition` without moving the blind — useful if you don't want blinds to move on every Homebridge restart. The position is automatically cached on every STOP and at every 10% boundary during movement. |
+| `inverted` | boolean | no | Default `true` (BTicino convention: `*2*1*` = DOWN, `*2*2*` = UP). Set to `false` if your installation uses the reverse convention and HomeKit shows "opening" while the blind closes. |
 
 #### `thermostats`
 

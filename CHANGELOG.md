@@ -2,7 +2,33 @@
 
 All notable changes to this project are documented here.
 
-## [Unreleased]
+## [0.4.1]
+
+### Fixed
+- **CRITICAL — Blind manual operation not reflected in HomeKit after first cycle.**
+  `evaluatePosition()` cleared the position-tracking timeout but never reset
+  the field to `undefined`, causing the `!this.positionTimeout` guard in `onData`
+  to permanently block subsequent state updates. Symptom: after autocalibration,
+  the first manual UP/STOP cycle worked, then all later wall-switch movements
+  were silently ignored.
+- **Calibration STOP not always sent.** The init timer's `if (this.initPhase)`
+  guard skipped sending the safety STOP when calibration had been ended early
+  by a gateway STOP echo (e.g. blind reaches bottom-stop). The STOP is now sent
+  unconditionally at timer expiration — sending it twice is harmless.
+
+### Added
+- **`inverted` option for blinds (default `true`).** Maps the OWN direction codes
+  to HomeKit's PositionState in the BTicino default convention: `*2*1*` =
+  DOWN/closing (DECREASING), `*2*2*` = UP/opening (INCREASING). If your
+  installation uses the reverse convention (HomeKit shows "opening" while the
+  blind closes), set `"inverted": false` in the blind config.
+
+### Changed
+- Default direction interpretation now matches the BTicino convention. Previous
+  versions used `*2*1*` = INCREASING which inverted the displayed state for
+  most installations.
+
+## [0.4.0]
 
 ### Added
 - **Door / Video Door (WHO=7)** support: new `doors[]` config entry exposes a

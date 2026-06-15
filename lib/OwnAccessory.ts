@@ -394,7 +394,7 @@ export class OwnBlindAccessory extends OwnAccessory {
         this.timeSlat = config.timeSlat ?? 0;
         this.slatPercent = config.slatPercent ?? 0;
         this.calibrateOnStart = config.calibrateOnStart ?? true;
-        this.inverted = config.inverted ?? false;
+        this.inverted = config.inverted ?? true;
 
         this.state = this.Characteristic.PositionState.STOPPED;
         this.expectedState = this.Characteristic.PositionState.STOPPED;
@@ -493,16 +493,15 @@ export class OwnBlindAccessory extends OwnAccessory {
                 this.target = 0;
                 this.initPhase = true;
                 this.cachePosition();
-                // Send explicit STOP after the full travel time to terminate calibration,
-                // even if the gateway never broadcasts a STOP packet at the end-stop.
+                // Always send an explicit STOP after the full travel time to guarantee the blind
+                // is not left in a moving state. Sending STOP twice (once by the gateway when the
+                // end-stop is reached, once by us) is harmless — the motor is already off.
                 clearTimeout(this.initTimeout);
                 this.initTimeout = setTimeout(() => {
                     this.initTimeout = undefined;
-                    if (this.initPhase) {
-                        this.log.info(`[${this.id}] Init calibration timer elapsed, sending STOP`);
-                        this.endCalibration();
-                        this.moveStop();
-                    }
+                    this.log.info(`[${this.id}] Init calibration timer elapsed, sending STOP`);
+                    this.endCalibration();
+                    this.moveStop();
                 }, (this.time + this.timeSlat) * 1000 + BLIND_INIT_CALIBRATION_MARGIN_MS);
             } else {
                 this.log.info(`[${this.id}] Restoring cached position ${this.position}% (calibrateOnStart disabled)`);
