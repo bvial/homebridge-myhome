@@ -58,6 +58,21 @@ All notable changes to this project are documented here.
 - **`scan.ts --max-addr` now validates its argument** and falls back to the
   default (20) with a warning if a non-integer is passed.
 
+### Fixed (second pass)
+- **Dimmer light: brightness slider now syncs the `On` state.** Setting
+  `Brightness > 0` from HomeKit on a lamp that was `On=false` now correctly
+  updates `this.value = true` and pushes `On=true` to HomeKit — previously
+  the lamp turned on physically but the tile stayed showing "off".
+- **Monitor keep-alive: prevent parallel probes.** A `checkInFlight` guard
+  now short-circuits `checkMonitor()` if a previous `*#13**15##` probe is
+  still in flight. Under a slow gateway the previous behaviour could stack
+  two or three concurrent probes on the command queue and trigger a
+  premature reconnect while the gateway was actually responding.
+- **TCP half-close detection.** `OwnConnection` now listens for the socket
+  `end` event and tears down the connection immediately. Previously a
+  gateway that sent FIN without RST left the socket in read-only mode until
+  the 30-second monitor watchdog kicked in.
+
 ## [0.4.4] — Unreleased
 
 ### Fixed

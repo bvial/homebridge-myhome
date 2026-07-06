@@ -314,6 +314,12 @@ export class OwnLightAccessory extends OwnAccessory {
                         const level = brightnessToOwnLevel(value as number);
                         this.sendOrThrow(`*1*${level}*${this.where}##`);
                         this.brightness = value as number;
+                        // Setting brightness > 0 on an off lamp also turns it on — sync `On`
+                        // to HomeKit so the tile doesn't show "off" while the lamp is lit.
+                        if (!this.value) {
+                            this.value = true;
+                            this.lightbulbService.updateCharacteristic(this.Characteristic.On, true);
+                        }
                     }
                 });
         }

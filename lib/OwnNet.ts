@@ -125,6 +125,14 @@ export class OwnConnection extends EventEmitter {
             this.log.error('Socket error: %s', error.message);
             this.state = STATE.UNCONNECTED;
         });
+        // Peer half-close: the gateway sent FIN but not RST. Without this handler
+        // Node would leave the socket in read-only mode indefinitely, so the
+        // monitor watchdog is the only line of defense (30 s). Treat FIN as a
+        // full close and tear the socket down immediately.
+        this.conn.on('end', () => {
+            this.log.debug('conn:%s peer half-closed connection (FIN)', this.id);
+            this.end();
+        });
         this.conn.on('close', () => {
             this.state = STATE.UNCONNECTED;
             const socket = this.conn;
@@ -259,6 +267,9 @@ export class OwnMonitor extends EventEmitter {
     reconnectSeconds: number;
     reconnectAttempts: number;
     authFailed: boolean;
+    /** True while a keep-alive probe is in flight — prevents parallel probes
+     *  when a delayed `done` callback overlaps with the next checkTimeout tick. */
+    private checkInFlight: boolean;
 
     constructor(client: OwnClient) {
         super();
@@ -270,6 +281,7 @@ export class OwnMonitor extends EventEmitter {
         this.reconnectSeconds = 30;
         this.reconnectAttempts = 0;
         this.authFailed = false;
+        this.checkInFlight = false;
     }
 
     private closeConnection(): void {
@@ -282,6 +294,7 @@ export class OwnMonitor extends EventEmitter {
 
     connect(): void {
         this.nbCheck = 0;
+        this.checkInFlight = false;
         clearTimeout(this.reconnectTimeout);
         this.reconnectTimeout = undefined;
         this.client.log.info('Start monitoring MyHome server');
@@ -308,10 +321,18 @@ export class OwnMonitor extends EventEmitter {
     }
 
     checkMonitor(): void {
+        if (this.checkInFlight) {
+            // A previous probe hasn't resolved yet — skip this tick to avoid
+            // stacking parallel `*#13**15##` commands on the queue.
+            this.client.log.debug('Monitor: skipping keep-alive probe, previous one still in flight');
+            return;
+        }
+        this.checkInFlight = true;
         this.client.sendCommand({
             command: '*#13**15##',
             stopon: PKT.ACK,
             done: (pkt: string | null) => {
+                this.checkInFlight = false;
                 if (pkt !== null) {
                     const connAlive = this.connection !== null && this.connection.state === STATE.CONNECTED;
                     if (!connAlive) {
@@ -368,6 +389,7 @@ export class OwnMonitor extends EventEmitter {
         clearTimeout(this.reconnectTimeout);
         this.checkTimeout = undefined;
         this.reconnectTimeout = undefined;
+        this.checkInFlight = false;
         this.closeConnection();
         this.removeAllListeners();
     }
