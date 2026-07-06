@@ -558,6 +558,78 @@ describe('OwnBlindAccessory', () => {
             'PositionState must remain STOPPED in HomeKit despite spurious packet');
     });
 
+    it('post-STOP grace window does NOT filter a real manual command after a HomeKit STOP', () => {
+        // Bug fix: previously, if HomeKit sent a STOP (or a HomeKit-initiated move ended
+        // with an auto-STOP), the grace window would arm and swallow the next direction
+        // packet — meaning a user pressing the wall switch DOWN 100 ms after a HomeKit
+        // STOP saw the blind move but HomeKit showed STOPPED.
+        // Post-fix: grace is only armed when the STOP is a *physical* one (i.e. NOT the
+        // echo of a HomeKit command).
+        handler.position = 50;
+        handler.target = 50;
+        handler.state = POSITION_STATE.INCREASING;
+        handler.homeKitMovement = true;
+        handler.commandSent = true;
+        handler.expectedState = POSITION_STATE.STOPPED; // simulate a moveStop() just sent
+        // Echo of the HomeKit STOP command
+        handler.onData('*2*0*23##');
+        assert.equal(handler.state, POSITION_STATE.STOPPED);
+
+        // 100 ms later user presses DOWN on the wall switch — this must be processed.
+        handler.onData('*2*2*23##');
+        assert.equal(handler.state, POSITION_STATE.DECREASING,
+            'real manual DOWN after HomeKit STOP must NOT be filtered by the grace window');
+    });
+
+    it('target syncs to position while a manual movement is in progress', () => {
+        // Bug fix: previously, during a wall-switch UP/DOWN, `target` kept its stale HomeKit
+        // value while `position` advanced — HomeKit displayed TargetPosition inconsistent
+        // with the physically moving blind. Post-fix: each position tick during a manual
+        // movement updates TargetPosition to the live position.
+        const svc = accessory.services['WindowCovering'];
+        handler.position = 30;
+        handler.target = 80; // stale target from a previous HomeKit command
+        handler.state = POSITION_STATE.INCREASING;
+        handler.homeKitMovement = false;
+
+        handler.evaluatePosition(); // one manual tick UP: position 30→31
+        assert.equal(handler.position, 31);
+        assert.equal(handler.target, 31,
+            'target must be synced to live position during manual movement');
+        assert.equal(svc.characteristics['TargetPosition'].value, 31,
+            'HomeKit TargetPosition must reflect the live position during manual movement');
+    });
+
+    it('direction reversal without intervening STOP cancels stale positionTimeout', () => {
+        // Bug fix: a wall-switch UP immediately followed by DOWN (without any STOP between
+        // them) previously left the UP's positionTimeout armed, delaying the DOWN tick by
+        // one tick period. Post-fix: reversal clears the stale timeout so DOWN starts
+        // tracking immediately.
+        handler.position = 50;
+        handler.target = 50;
+        handler.state = POSITION_STATE.STOPPED;
+        handler.homeKitMovement = false;
+        // First: UP
+        handler.onData('*2*1*23##');
+        assert.equal(handler.state, POSITION_STATE.INCREASING);
+        assert.ok(handler.positionTimeout !== undefined,
+            'positionTimeout must be armed after first movement');
+        const firstTimeout = handler.positionTimeout;
+        // Second: DOWN — no STOP in between
+        handler.onData('*2*2*23##');
+        assert.equal(handler.state, POSITION_STATE.DECREASING);
+        assert.notEqual(handler.positionTimeout, firstTimeout,
+            'positionTimeout must be reset by the reversal');
+    });
+
+    it('BLIND_END_STOP_SAFETY_MS constant exists and is a positive number', () => {
+        // Simple sanity check that the safety-net timeout is defined. Full behaviour
+        // is exercised via integration since it depends on real setTimeout.
+        // eslint-disable-next-line @typescript-eslint/no-require-imports
+        const { BLIND_END_STOP_SAFETY_MS } = require('../lib/utils') as { BLIND_END_STOP_SAFETY_MS: number };
+        assert.ok(typeof BLIND_END_STOP_SAFETY_MS === 'number' && BLIND_END_STOP_SAFETY_MS > 0);
+    });
+
     it('STOPPED during HomeKit movement does NOT overwrite target', () => {
         handler.state = POSITION_STATE.STOPPED;
         handler.homeKitMovement = true;

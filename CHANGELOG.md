@@ -73,6 +73,32 @@ All notable changes to this project are documented here.
   gateway that sent FIN without RST left the socket in read-only mode until
   the 30-second monitor watchdog kicked in.
 
+### Fixed (blind synchronization)
+- **Manual command after HomeKit STOP no longer silently discarded.** The
+  F454 post-STOP grace window (150 ms during which a spurious direction
+  packet is filtered) was previously armed after **every** STOP, including
+  echoes of HomeKit-issued STOPs. As a result, a user who pressed the wall
+  switch UP/DOWN within 150 ms of a HomeKit STOP saw the blind move but
+  HomeKit stayed showing STOPPED. The grace window is now armed only for
+  physical STOPs (i.e. not the echo of a HomeKit command), which is the
+  only situation where the F454 quirk actually happens.
+- **TargetPosition now tracks live position during manual movements.**
+  Previously, while the blind moved physically (wall switch), HomeKit
+  displayed a stale `TargetPosition` inherited from the last HomeKit
+  command, so users saw `TargetPosition ≠ CurrentPosition` for the entire
+  manual movement. Each position tick during a manual movement now updates
+  `TargetPosition` to the live position so the Home app stays consistent.
+- **Rapid direction reversal (UP→DOWN without intervening STOP) tracked
+  immediately.** Previously, the position-tracking timer from the first
+  direction remained armed, delaying the tracking of the new direction by
+  up to one tick period. The reversal now cancels the stale timeout so the
+  new direction starts tracking on the very next tick.
+- **Silent end-stop safety net.** Some gateways do not emit `*2*0*` when
+  the blind reaches its natural end-of-travel — HomeKit's `PositionState`
+  would otherwise stay INCREASING/DECREASING forever. After 3 seconds at
+  position 0 or 100 without a gateway STOP, the plugin now forces the
+  state back to STOPPED and syncs `TargetPosition` to the current position.
+
 ## [0.4.4] — Unreleased
 
 ### Fixed

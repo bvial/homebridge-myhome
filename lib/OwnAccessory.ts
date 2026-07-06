@@ -15,6 +15,7 @@ import {
     BLIND_COMMAND_ECHO_TIMEOUT_MS,
     BLIND_INIT_CALIBRATION_MARGIN_MS,
     BLIND_POST_STOP_GRACE_MS,
+    BLIND_END_STOP_SAFETY_MS,
     COMMAND_QUEUE_BUSY_THRESHOLD,
     BLIND_MIN_TICK_MS,
     ENERGY_POLL_INTERVAL_MS,
@@ -396,6 +397,10 @@ export class OwnBlindAccessory extends OwnAccessory {
      *  (F454 reliably sends *2*2* a few ms after a wall-switch STOP). */
     private postStopGrace: boolean;
     private postStopGraceTimeout: ReturnType<typeof setTimeout> | undefined;
+    /** Safety timeout for silent physical end-stops — some gateways do NOT emit
+     *  `*2*0*` when the motor reaches its natural end-of-travel. Without this,
+     *  HomeKit's PositionState would stay INCREASING/DECREASING forever. */
+    private endStopSafetyTimeout: ReturnType<typeof setTimeout> | undefined;
     private identifyJogTimeout: ReturnType<typeof setTimeout> | undefined;
     private windowCoveringService: InstanceType<typeof Service>;
 
@@ -429,6 +434,7 @@ export class OwnBlindAccessory extends OwnAccessory {
         this.initTimeout = undefined;
         this.postStopGrace = false;
         this.postStopGraceTimeout = undefined;
+        this.endStopSafetyTimeout = undefined;
 
         this.windowCoveringService = this.initPrimaryService(this.Service.WindowCovering, 'WindowCovering', true);
 
@@ -648,9 +654,21 @@ export class OwnBlindAccessory extends OwnAccessory {
             }
 
             const prevState = this.state;
+            // Capture whether this incoming packet is the echo of a HomeKit STOP command
+            // BEFORE endTimerCommand() clears commandSent. Used to gate postStopGrace so it
+            // arms only on physical (wall-switch) STOPs — the ones that trigger the F454's
+            // spurious direction-packet quirk. Post-HomeKit-STOP packets never suffer that
+            // quirk, and arming the grace there would swallow a real manual command issued
+            // in the following 150 ms.
+            const isEchoOfHomeKitStop = direction === '0'
+                && this.commandSent
+                && this.expectedState === this.Characteristic.PositionState.STOPPED;
             if (direction === '0') {
                 const wasDecreasing = this.state === this.Characteristic.PositionState.DECREASING;
                 this.state = this.Characteristic.PositionState.STOPPED;
+                // Gateway did emit STOP — clear the end-stop safety net.
+                clearTimeout(this.endStopSafetyTimeout);
+                this.endStopSafetyTimeout = undefined;
                 // End calibration if: not in calibration, OR was actually moving down (normal end),
                 // OR position is already 0 (blind was at bottom-stop before calibration move started).
                 if (!this.initPhase || wasDecreasing || this.position === 0) {
@@ -660,14 +678,18 @@ export class OwnBlindAccessory extends OwnAccessory {
                     this.position = this.target;
                 }
                 this.cachePosition();
-                // Arm grace window to ignore the spurious direction packet that some
-                // BTicino gateways emit immediately after a STOP (within tens of ms).
-                this.postStopGrace = true;
-                clearTimeout(this.postStopGraceTimeout);
-                this.postStopGraceTimeout = setTimeout(() => {
-                    this.postStopGrace = false;
-                    this.postStopGraceTimeout = undefined;
-                }, BLIND_POST_STOP_GRACE_MS);
+                // Arm the F454 grace window ONLY for physical STOPs. A STOP that echoes a
+                // HomeKit command is issued by us — the gateway does not follow it with a
+                // spurious direction packet, and any direction packet arriving in the
+                // next 150 ms is a genuine manual command that must not be filtered.
+                if (!isEchoOfHomeKitStop) {
+                    this.postStopGrace = true;
+                    clearTimeout(this.postStopGraceTimeout);
+                    this.postStopGraceTimeout = setTimeout(() => {
+                        this.postStopGrace = false;
+                        this.postStopGraceTimeout = undefined;
+                    }, BLIND_POST_STOP_GRACE_MS);
+                }
             } else if (direction === '1') {
                 this.state = this.Characteristic.PositionState.INCREASING;
             } else if (direction === '2') {
@@ -693,7 +715,16 @@ export class OwnBlindAccessory extends OwnAccessory {
             // Skip evaluatePosition for duplicate packets that don't change state.
             // For STOP (direction '0'), always evaluate even if positionTimeout is pending —
             // it clears the timeout on entry and syncs CurrentPosition/TargetPosition to HomeKit.
+            // For a direction reversal (INCREASING↔DECREASING) without an intervening STOP,
+            // cancel the stale positionTimeout so the new direction is picked up immediately
+            // instead of waiting for the previous tick to expire.
             const isStop = direction === '0';
+            const isDirectionReversal = !isStop && this.state !== prevState
+                && prevState !== this.Characteristic.PositionState.STOPPED;
+            if (isDirectionReversal && this.positionTimeout !== undefined) {
+                clearTimeout(this.positionTimeout);
+                this.positionTimeout = undefined;
+            }
             if (!this.commandSent && (isStop || !this.positionTimeout) && this.state !== prevState) {
                 this.evaluatePosition();
             }
@@ -717,11 +748,19 @@ export class OwnBlindAccessory extends OwnAccessory {
             if (this.position < 100) this.position++;
             if (this.position % 10 === 0 || this.position >= this.target)
                 this.log.debug(`[${this.id}] Blind moving UP pos:${this.position} target:${this.target}`);
+            // For manual (wall-switch) movements, HomeKit still holds the previous target
+            // from the last HomeKit command. Sync it to the live position so the Home app
+            // doesn't display a stale TargetPosition while the blind is physically moving.
+            if (!this.homeKitMovement && this.target !== this.position) {
+                this.target = this.position;
+                this.windowCoveringService.updateCharacteristic(this.Characteristic.TargetPosition, this.target);
+            }
             if (this.homeKitMovement && this.position >= this.target) {
                 this.moveStop();
             } else if (!this.homeKitMovement && this.position >= 100) {
                 // physical movement reached upper end-stop — wait for gateway STOP packet
                 this.cachePosition();
+                this.armEndStopSafetyTimeout();
             } else {
                 this.startPositionTracking();
             }
@@ -729,6 +768,10 @@ export class OwnBlindAccessory extends OwnAccessory {
             if (this.position > 0) this.position--;
             if (this.position % 10 === 0 || this.position <= this.target)
                 this.log.debug(`[${this.id}] Blind moving DOWN pos:${this.position} target:${this.target}`);
+            if (!this.homeKitMovement && this.target !== this.position) {
+                this.target = this.position;
+                this.windowCoveringService.updateCharacteristic(this.Characteristic.TargetPosition, this.target);
+            }
             if (!this.initPhase && this.homeKitMovement && this.position <= this.target) {
                 this.moveStop();
             } else if (this.initPhase && this.position === 0) {
@@ -736,6 +779,7 @@ export class OwnBlindAccessory extends OwnAccessory {
             } else if (!this.homeKitMovement && this.position <= 0) {
                 // physical movement reached lower end-stop — wait for gateway STOP packet
                 this.cachePosition();
+                this.armEndStopSafetyTimeout();
             } else {
                 this.startPositionTracking();
             }
@@ -816,6 +860,26 @@ export class OwnBlindAccessory extends OwnAccessory {
         return false;
     }
 
+    /**
+     * Safety net for gateways that reach a physical end-stop without emitting `*2*0*`.
+     * When position hits 0 or 100 during a non-HomeKit movement, we wait a short window
+     * for the gateway STOP; if it never arrives, force STATE=STOPPED so HomeKit's
+     * PositionState doesn't stay INCREASING/DECREASING forever.
+     */
+    private armEndStopSafetyTimeout(): void {
+        clearTimeout(this.endStopSafetyTimeout);
+        this.endStopSafetyTimeout = setTimeout(() => {
+            this.endStopSafetyTimeout = undefined;
+            if (this.state === this.Characteristic.PositionState.STOPPED) return;
+            this.log.warn('[%s] Blind reached end-stop but gateway never emitted STOP — forcing STOPPED', this.id);
+            this.state = this.Characteristic.PositionState.STOPPED;
+            this.windowCoveringService.updateCharacteristic(this.Characteristic.PositionState, this.state);
+            this.target = this.position;
+            this.windowCoveringService.updateCharacteristic(this.Characteristic.TargetPosition, this.target);
+            this.cachePosition();
+        }, BLIND_END_STOP_SAFETY_MS);
+    }
+
     startMoveTracking(): void {
         clearTimeout(this.moveTrackingTimeout);
         this.moveTrackingTimeout = undefined;
@@ -840,6 +904,8 @@ export class OwnBlindAccessory extends OwnAccessory {
         this.initTimeout = undefined;
         clearTimeout(this.postStopGraceTimeout);
         this.postStopGraceTimeout = undefined;
+        clearTimeout(this.endStopSafetyTimeout);
+        this.endStopSafetyTimeout = undefined;
         this.postStopGrace = false;
         this.inStatusQuery = false;
         this.commandSent = false;

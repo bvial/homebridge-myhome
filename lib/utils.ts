@@ -55,6 +55,11 @@ export const BLIND_INIT_CALIBRATION_MARGIN_MS = 1000;
  *  a wall-switch STOP) is suppressed when it would otherwise be mis-interpreted
  *  as a new movement. */
 export const BLIND_POST_STOP_GRACE_MS = 150;
+/** Safety timeout for silent physical end-stops — if the blind reaches 0% or 100%
+ *  during a non-HomeKit movement and the gateway never emits a STOP packet, force
+ *  the state back to STOPPED after this delay so HomeKit's PositionState doesn't
+ *  stay INCREASING/DECREASING indefinitely. */
+export const BLIND_END_STOP_SAFETY_MS = 3000;
 /** Minimum interval between blind position ticks (slat zone floor) */
 export const BLIND_MIN_TICK_MS = 50;
 /** OwnClient command-queue busy threshold — accessories should throw RESOURCE_BUSY
