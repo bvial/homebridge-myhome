@@ -15,7 +15,7 @@ import {
     BLIND_COMMAND_ECHO_TIMEOUT_MS,
     BLIND_INIT_CALIBRATION_MARGIN_MS,
     BLIND_POST_STOP_GRACE_MS,
-    BLIND_QUEUE_BUSY_THRESHOLD,
+    COMMAND_QUEUE_BUSY_THRESHOLD,
     BLIND_MIN_TICK_MS,
     ENERGY_POLL_INTERVAL_MS,
     ENERGY_POLL_QUEUE_THRESHOLD,
@@ -59,7 +59,10 @@ export interface ThermostatConfig extends BaseConfig {
 }
 
 export interface ScenarioConfig extends BaseConfig {
-    asButton?: boolean;
+    // Note: the historical `asButton` option was removed because a HomeKit
+    // StatelessProgrammableSwitch is emit-only — it cannot receive taps from
+    // the Home app, so `asButton: true` silently disabled scenario activation.
+    // Scenarios are always exposed as an auto-reset Switch now.
 }
 export interface ContactConfig extends BaseConfig {
     sensorType?: 'contact' | 'motion' | 'occupancy' | 'leak' | 'smoke' | 'co';
@@ -87,7 +90,7 @@ class OwnAccessory {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     private charWarningListener: ((warning: any) => void) | undefined;
 
-    constructor(platform: OwnPlatformLike, accessory: PlatformAccessory, config: BaseConfig) {
+    constructor(platform: OwnPlatformLike, accessory: PlatformAccessory, config: BaseConfig, defaultType?: string) {
         this.log = platform.log;
         this.controller = platform.controller;
         this.Service = platform.Service;
@@ -96,6 +99,14 @@ class OwnAccessory {
         this.HAPStatus = platform.HAPStatus;
         this.platform = platform;
         this.accessory = accessory;
+
+        // Derive a display name if the user didn't provide one. `defaultType` is the
+        // short kind label ('light', 'blind', 'thermostat', ...) supplied by each subclass;
+        // the resulting default is `<type>-<id>`. We fall back to just the id when no
+        // defaultType is provided (older callers).
+        if (!config.name) {
+            config.name = defaultType ? `${defaultType}-${config.id}` : String(config.id);
+        }
 
         this.name = config.name ?? '';
         this.id = config.id;
@@ -192,7 +203,7 @@ class OwnAccessory {
     }
 
     protected sendOrThrow(command: string): void {
-        if (this.controller.queueSize() >= BLIND_QUEUE_BUSY_THRESHOLD) {
+        if (this.controller.queueSize() >= COMMAND_QUEUE_BUSY_THRESHOLD) {
             this.log.warn('[%s] Command dropped (queue full): %s', this.id, command);
             throw new this.HapStatusError(this.HAPStatus.RESOURCE_BUSY);
         }
@@ -254,8 +265,7 @@ export class OwnLightAccessory extends OwnAccessory {
     }
 
     constructor(platform: OwnPlatformLike, accessory: PlatformAccessory, config: LightConfig) {
-        if (!config.name) config.name = `light-${config.id}`;
-        super(platform, accessory, config);
+        super(platform, accessory, config, 'light');
 
         this.value = false;
         this.dimmer = config.dimmer ?? false;
@@ -386,8 +396,7 @@ export class OwnBlindAccessory extends OwnAccessory {
     get who(): number { return WHO.automation; }
 
     constructor(platform: OwnPlatformLike, accessory: PlatformAccessory, config: BlindConfig) {
-        if (!config.name) config.name = `blind-${config.id}`;
-        super(platform, accessory, config);
+        super(platform, accessory, config, 'blind');
 
         if (!config.time || config.time <= 0) {
             throw new Error(`homebridge-myhome: blind id=${config.id} requires a positive "time" value`);
@@ -423,7 +432,7 @@ export class OwnBlindAccessory extends OwnAccessory {
         this.windowCoveringService.getCharacteristic(this.Characteristic.TargetPosition)
             .onGet(() => this.target)
             .onSet((target: CharacteristicValue) => {
-                if (this.controller.queueSize() >= BLIND_QUEUE_BUSY_THRESHOLD) {
+                if (this.controller.queueSize() >= COMMAND_QUEUE_BUSY_THRESHOLD) {
                     throw new this.HapStatusError(this.HAPStatus.RESOURCE_BUSY);
                 }
                 this.log.info(`[${this.id}] Blind setting Target :${target}`);
@@ -440,7 +449,7 @@ export class OwnBlindAccessory extends OwnAccessory {
 
         this.windowCoveringService.getCharacteristic(this.Characteristic.HoldPosition)
             .onSet((hold: CharacteristicValue) => {
-                if (this.controller.queueSize() >= BLIND_QUEUE_BUSY_THRESHOLD) {
+                if (this.controller.queueSize() >= COMMAND_QUEUE_BUSY_THRESHOLD) {
                     throw new this.HapStatusError(this.HAPStatus.RESOURCE_BUSY);
                 }
                 this.log.info(`[${this.id}] Blind hold position :${hold}`);
@@ -783,7 +792,6 @@ export class OwnBlindAccessory extends OwnAccessory {
      */
     private adjustToward(delta: number): boolean {
         const goingUp = delta > 0;
-        const correctDir  = goingUp ? this.Characteristic.PositionState.INCREASING : this.Characteristic.PositionState.DECREASING;
         const oppositeDir = goingUp ? this.Characteristic.PositionState.DECREASING : this.Characteristic.PositionState.INCREASING;
         if (this.state === oppositeDir) {
             this.moveStop();
@@ -856,8 +864,7 @@ export class OwnThermostatAccessory extends OwnAccessory {
     get who(): number { return WHO.temperature; }
 
     constructor(platform: OwnPlatformLike, accessory: PlatformAccessory, config: ThermostatConfig) {
-        if (!config.name) config.name = `thermostat-${config.id}`;
-        super(platform, accessory, config);
+        super(platform, accessory, config, 'thermostat');
 
         if (!Number.isInteger(config.zone) || config.zone <= 0) {
             throw new Error(`homebridge-myhome: thermostat id=${config.id} requires a positive integer "zone"`);
@@ -1014,8 +1021,20 @@ export class OwnThermostatAccessory extends OwnAccessory {
             } else {
                 this.log.debug('[%s] zone[%s] local offset:%s (%s)', this.id, this.zone, decoded.offset, decoded.status);
             }
-        } else if ((extract = packet.match(/^\*#4\*[\d#]+\*14\*(\d+)\*\d+##$/))) {
+        } else if ((extract = packet.match(/^\*#4\*[\d#]+\*14\*(\d+)\*(\d+)##$/))) {
+            // DIM 14 = Setpoint temperature. Second value is the mode byte:
+            //   *1 = Heat, *2 = Cool, *3 = Generic (mode not enforced).
+            // Reconcile HomeKit's TargetHeatingCoolingState so that a setpoint received
+            // in COOL mode while HomeKit is in HEAT (or vice versa) is not silently
+            // dropped as a stale reading.
             this.updateCharacteristicTargetTemperature(OwnProtcol.decodeTemperature(extract[1]));
+            const modeByte = extract[2];
+            if (modeByte === '1') {
+                this.updateCharacteristicTargetHeatingCoolingState(this.Characteristic.TargetHeatingCoolingState.HEAT);
+            } else if (modeByte === '2') {
+                this.updateCharacteristicTargetHeatingCoolingState(this.Characteristic.TargetHeatingCoolingState.COOL);
+            }
+            // modeByte === '3' (Generic) leaves the current target state untouched.
         } else if ((extract = packet.match(/^\*#4\*[\d#]+\*19\*(\d)\*(\d)##$/))) {
             const CV = extract[1];
             const HV = extract[2];
@@ -1032,29 +1051,34 @@ export class OwnThermostatAccessory extends OwnAccessory {
                 this.updateCharacteristicCurrentHeatingCoolingState(this.Characteristic.CurrentHeatingCoolingState.OFF);
             }
         } else if ((extract = packet.match(/^\*#4\*\d+#\d+\*20\*(\d+)##$/))) {
-            let status = '';
             const value = extract[1];
-            if (value === '0') status = 'OFF';
-            else if (value === '1') status = 'ON';
-            else if (value === '4') status = 'STOP';
-            else status = `not decoded:${value}`;
+            const status = value === '0' ? 'OFF'
+                : value === '1' ? 'ON'
+                : value === '4' ? 'STOP'
+                : `not decoded:${value}`;
             this.log.debug(`[${this.id}] zone[${this.zone}] actuator status (${status})`);
         } else if ((extract = packet.match(/^\*4\*(\d+)\*\d+##$/))) {
-            let status = '';
             const value = extract[1];
+            let status: string;
             if (value === '0') status = 'Conditioning';
             else if (value === '1') status = 'Heating';
             else if (value === '102') status = 'Antifreeze';
             else if (value === '202') status = 'Thermal Protection';
             else if (value === '303') status = 'Generic OFF';
-            else this.log.error('[%s] zone[%s] operation mode (%s)', this.id, this.zone, value);
+            else if (value === '3100') status = 'AUTO Weekly Program';
+            else {
+                status = `not decoded:${value}`;
+                this.log.error('[%s] zone[%s] operation mode (%s)', this.id, this.zone, value);
+            }
             this.log.debug(`[${this.id}] zone[${this.zone}] operation mode (${status})`);
-            const hkCurrentState = (value === '1' || value === '102')
-                ? this.Characteristic.CurrentHeatingCoolingState.HEAT
-                : (value === '0')
-                    ? this.Characteristic.CurrentHeatingCoolingState.COOL
-                    : this.Characteristic.CurrentHeatingCoolingState.OFF;
-            this.updateCharacteristicCurrentHeatingCoolingState(hkCurrentState);
+            // Map to HomeKit CurrentHeatingCoolingState. Values 1101/1103/3100 (weekly/holiday
+            // programs) leave CurrentState alone — actual heating/cooling status arrives via DIM 19.
+            let hkCurrentState: number | null;
+            if (value === '1' || value === '102') hkCurrentState = this.Characteristic.CurrentHeatingCoolingState.HEAT;
+            else if (value === '0') hkCurrentState = this.Characteristic.CurrentHeatingCoolingState.COOL;
+            else if (value === '303' || value === '202') hkCurrentState = this.Characteristic.CurrentHeatingCoolingState.OFF;
+            else hkCurrentState = null;
+            if (hkCurrentState !== null) this.updateCharacteristicCurrentHeatingCoolingState(hkCurrentState);
         } else if ((extract = packet.match(/^\*4\*(\d+)\*#\d+#\d+##$/))) {
             const valInt = parseInt(extract[1], 10);
             if (valInt === 103) {
@@ -1098,54 +1122,34 @@ export class OwnThermostatAccessory extends OwnAccessory {
 
 export class OwnScenarioAccessory extends OwnAccessory {
     private resetTimeout: ReturnType<typeof setTimeout> | undefined;
-    private asButton: boolean;
     private service: InstanceType<typeof Service>;
 
     constructor(platform: OwnPlatformLike, accessory: PlatformAccessory, config: ScenarioConfig) {
-        if (!config.name) config.name = `scenario-${config.id}`;
-        super(platform, accessory, config);
+        super(platform, accessory, config, 'scenario');
 
         this.resetTimeout = undefined;
-        this.asButton = config.asButton ?? false;
 
-        if (this.asButton) {
-            // Stateless programmable switch — semantically correct for momentary scenarios.
-            // The Home app shows it as a button rather than a toggle switch.
-            this.service = this.initPrimaryService(this.Service.StatelessProgrammableSwitch, 'Scenario');
-            this.service.getCharacteristic(this.Characteristic.ProgrammableSwitchEvent)
-                .setProps({ validValues: [this.Characteristic.ProgrammableSwitchEvent.SINGLE_PRESS] });
-            // Remove any previously-registered Switch service from this accessory so the
-            // accessory presents only one primary service after a config flip.
-            const existingSwitch = this.accessory.getService(this.Service.Switch);
-            if (existingSwitch) this.accessory.removeService(existingSwitch);
-        } else {
-            // Legacy mode — Switch with auto-reset (preserved for compatibility with existing automations).
-            this.service = this.initPrimaryService(this.Service.Switch, 'Scenario');
-            this.service.getCharacteristic(this.Characteristic.On)
-                .onGet(() => false)
-                .onSet((value: CharacteristicValue) => {
-                    if (value) this.activate();
-                });
-            // Remove a previously-registered StatelessProgrammableSwitch (asButton flipped true→false)
-            const existingSPS = this.accessory.getService(this.Service.StatelessProgrammableSwitch);
-            if (existingSPS) this.accessory.removeService(existingSPS);
-        }
+        // Switch with auto-reset — preserves compatibility with existing HomeKit automations
+        // and, unlike StatelessProgrammableSwitch, actually receives taps from the Home app.
+        this.service = this.initPrimaryService(this.Service.Switch, 'Scenario');
+        this.service.getCharacteristic(this.Characteristic.On)
+            .onGet(() => false)
+            .onSet((value: CharacteristicValue) => {
+                if (value) this.activate();
+            });
+        // Remove a previously-registered StatelessProgrammableSwitch from installs
+        // that used the deprecated `asButton: true` option.
+        const existingSPS = this.accessory.getService(this.Service.StatelessProgrammableSwitch);
+        if (existingSPS) this.accessory.removeService(existingSPS);
     }
 
     private activate(): void {
         this.log.info(`[${this.id}] Scenario activate`);
         this.sendOrThrow(`*0*${this.id}*0##`);
-        if (this.asButton) {
-            this.service.updateCharacteristic(
-                this.Characteristic.ProgrammableSwitchEvent,
-                this.Characteristic.ProgrammableSwitchEvent.SINGLE_PRESS,
-            );
-        } else {
-            clearTimeout(this.resetTimeout);
-            this.resetTimeout = setTimeout(() => {
-                this.service.updateCharacteristic(this.Characteristic.On, false);
-            }, SCENARIO_RESET_MS);
-        }
+        clearTimeout(this.resetTimeout);
+        this.resetTimeout = setTimeout(() => {
+            this.service.updateCharacteristic(this.Characteristic.On, false);
+        }, SCENARIO_RESET_MS);
     }
 
     onData(_packet: string): void {}
@@ -1168,8 +1172,7 @@ export class OwnContactAccessory extends OwnAccessory {
     get who(): number { return WHO.auxiliary; }
 
     constructor(platform: OwnPlatformLike, accessory: PlatformAccessory, config: ContactConfig) {
-        if (!config.name) config.name = `contact-${config.id}`;
-        super(platform, accessory, config);
+        super(platform, accessory, config, 'contact');
 
         this.sensorType = config.sensorType ?? 'contact';
         this.contactState = this.Characteristic.ContactSensorState.CONTACT_DETECTED;
@@ -1256,8 +1259,7 @@ export class OwnEnergyAccessory extends OwnAccessory {
     get who(): number { return WHO.energy; }
 
     constructor(platform: OwnPlatformLike, accessory: PlatformAccessory, config: EnergyConfig) {
-        if (!config.name) config.name = `energy-${config.id}`;
-        super(platform, accessory, config);
+        super(platform, accessory, config, 'energy');
 
         this.watts = ENERGY_MIN_LIGHT_LEVEL;
         this.asOutlet = config.asOutlet ?? false;
@@ -1355,8 +1357,7 @@ export class OwnDoorAccessory extends OwnAccessory {
     get who(): number { return WHO.videoDoor; }
 
     constructor(platform: OwnPlatformLike, accessory: PlatformAccessory, config: DoorConfig) {
-        if (!config.name) config.name = `door-${config.id}`;
-        super(platform, accessory, config);
+        super(platform, accessory, config, 'door');
 
         this.openCommand = config.openCommand ?? `*7*19*${this.id}##`;
         this.doorbellEnabled = config.doorbell ?? false;

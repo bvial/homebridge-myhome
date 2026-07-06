@@ -1102,40 +1102,14 @@ describe('OwnScenarioAccessory', () => {
         handler.onData('*0*5*0##');
     });
 
-    it('asButton: true creates StatelessProgrammableSwitch and removes Switch', () => {
+    it('removes any pre-existing StatelessProgrammableSwitch left over from the deprecated asButton mode', () => {
         const p = makeMockPlatform();
         const a = makeMockAccessory();
         a.addService('AccessoryInformation');
-        a.addService('Switch'); // simulate previous run with asButton=false
-        const h = new OwnScenarioAccessory(p as unknown as P, a as unknown as A, { id: 7, name: 'btn', asButton: true });
-        assert.ok(a.services['StatelessProgrammableSwitch'], 'StatelessProgrammableSwitch must be created');
-        assert.ok(!a.services['Switch'], 'old Switch must be removed');
-        h.destroy();
-    });
-
-    it('asButton: true activate fires SINGLE_PRESS event and sends scenario command', () => {
-        const p = makeMockPlatform();
-        const a = makeMockAccessory();
-        a.addService('AccessoryInformation');
-        const h = new OwnScenarioAccessory(p as unknown as P, a as unknown as A, { id: 11, name: 'btn', asButton: true });
-        const svc = a.services['StatelessProgrammableSwitch'];
-        p.sendCommandSpy.calls.length = 0;
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        (h as any).activate();
-        const cmds = p.sendCommandSpy.calls.map((c: unknown[]) => (c[0] as { command: string }).command);
-        assert.ok(cmds.includes('*0*11*0##'));
-        assert.equal(svc.characteristics['ProgrammableSwitchEvent'].value, 0);
-        h.destroy();
-    });
-
-    it('asButton: false (legacy) flip removes any pre-existing StatelessProgrammableSwitch', () => {
-        const p = makeMockPlatform();
-        const a = makeMockAccessory();
-        a.addService('AccessoryInformation');
-        a.addService('StatelessProgrammableSwitch');
+        a.addService('StatelessProgrammableSwitch'); // simulate an old install with asButton: true
         const h = new OwnScenarioAccessory(p as unknown as P, a as unknown as A, { id: 13, name: 'sw' });
-        assert.ok(a.services['Switch'], 'Switch must be created in legacy mode');
-        assert.ok(!a.services['StatelessProgrammableSwitch'], 'old StatelessProgrammableSwitch must be removed');
+        assert.ok(a.services['Switch'], 'Switch must be created');
+        assert.ok(!a.services['StatelessProgrammableSwitch'], 'deprecated StatelessProgrammableSwitch must be removed');
         h.destroy();
     });
 });

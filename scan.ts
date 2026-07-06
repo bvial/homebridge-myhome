@@ -24,12 +24,17 @@ const port     = parseInt(positional[1] ?? '20000', 10);
 const password = positional[2] ?? '';
 
 const maxAddrIdx = argv.indexOf('--max-addr');
-const maxAddr    = maxAddrIdx !== -1 ? parseInt(argv[maxAddrIdx + 1], 10) : 20;
+const maxAddrRaw = maxAddrIdx !== -1 ? parseInt(argv[maxAddrIdx + 1] ?? '', 10) : NaN;
+const maxAddr    = (!isNaN(maxAddrRaw) && maxAddrRaw >= 1 && maxAddrRaw <= 999) ? maxAddrRaw : 20;
 const verbose    = argv.includes('--verbose');
 
 if (!host) {
     console.error('Usage: node dist/scan.js <host> [port] [password] [--max-addr N] [--verbose]');
     process.exit(1);
+}
+
+if (maxAddrIdx !== -1 && isNaN(maxAddrRaw)) {
+    console.error(`[warn] --max-addr requires a positive integer; falling back to default ${maxAddr}`);
 }
 
 // ─── silent logger ────────────────────────────────────────────────────────────

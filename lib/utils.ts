@@ -57,8 +57,12 @@ export const BLIND_INIT_CALIBRATION_MARGIN_MS = 1000;
 export const BLIND_POST_STOP_GRACE_MS = 150;
 /** Minimum interval between blind position ticks (slat zone floor) */
 export const BLIND_MIN_TICK_MS = 50;
-/** TargetPosition queue-full guard threshold */
-export const BLIND_QUEUE_BUSY_THRESHOLD = 50;
+/** OwnClient command-queue busy threshold — accessories should throw RESOURCE_BUSY
+ *  rather than enqueue new commands when the queue is at or above this depth.
+ *  Used by every accessory's `sendOrThrow()`, not just blinds. */
+export const COMMAND_QUEUE_BUSY_THRESHOLD = 50;
+/** @deprecated Use COMMAND_QUEUE_BUSY_THRESHOLD. Kept for external consumers. */
+export const BLIND_QUEUE_BUSY_THRESHOLD = COMMAND_QUEUE_BUSY_THRESHOLD;
 /** Hard cap on the OwnClient command queue (sendCommand returns false above this) */
 export const COMMAND_QUEUE_CAPACITY = 50;
 /** Per-command TCP connection timeout (gateway must ACK within this window) */

@@ -109,9 +109,10 @@ Supports HEAT, COOL, OFF and AUTO modes. The target temperature characteristic i
 |-----|------|----------|-------------|
 | `id` | integer | yes | Scenario number (WHO=0) |
 | `name` | string | no | Display name |
-| `asButton` | boolean | no | Expose as `StatelessProgrammableSwitch` instead of Switch (default `false`). Switch with auto-reset preserves existing automations; button is semantically correct for momentary scenarios. **Changing this flag at runtime removes the old service.** |
 
-Default mode: momentary switch — pressing it triggers the scenario, then resets to off after 500 ms. With `asButton: true` the scenario is exposed as a Stateless Programmable Switch (Home app shows it as a button rather than a toggle). Prefer gateway scenarios over HomeKit scenes when controlling many devices at once (single command vs. one command per device).
+Scenarios are exposed as an auto-reset switch — pressing it triggers the scenario, then resets to off after 500 ms. Prefer gateway scenarios over HomeKit scenes when controlling many devices at once (single command vs. one command per device).
+
+> **Note:** the historical `asButton` option (which exposed the scenario as a `StatelessProgrammableSwitch`) was removed in 0.4.7. A stateless programmable switch is emit-only in HomeKit — it could not receive taps from the Home app, so `asButton: true` silently disabled scenario activation. If you had `asButton: true` in your config, simply remove that key; the previously-registered SPS service is cleaned up automatically at next startup.
 
 #### `contacts`
 
@@ -147,7 +148,7 @@ Exposed as `LockMechanism`. Setting the lock to UNSECURED sends the open command
 ## Known Limitations
 
 - **UUID stability**: HomeKit accessory UUIDs are derived from `myhome-${type}-${id}`. Changing the `type` of a config entry (e.g. moving an `id` from `lights` to `contacts`) generates a new UUID, unregisters the old accessory, and registers a new one. HomeKit automations referencing the old accessory will need to be recreated.
-- **Tile flips**: When you toggle `asButton`, `asOutlet`, or `sensorType`, the plugin removes the old service from the accessory at next startup. HomeKit automations bound to the old service will need to be recreated.
+- **Tile flips**: When you toggle `asOutlet` or `sensorType`, the plugin removes the old service from the accessory at next startup. HomeKit automations bound to the old service will need to be recreated.
 
 ## Example configuration
 

@@ -186,13 +186,6 @@
                             "title": "Name",
                             "type": "string",
                             "required": false
-                        },
-                        "asButton": {
-                            "title": "Expose as button",
-                            "description": "Use Stateless Programmable Switch instead of Switch (better for momentary actions; may break existing automations)",
-                            "type": "boolean",
-                            "required": false,
-                            "default": false
                         }
                     }
                 }

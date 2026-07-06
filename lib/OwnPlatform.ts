@@ -12,7 +12,7 @@ import {
     OwnContactAccessory,
     OwnEnergyAccessory,
     OwnDoorAccessory,
-    OwnPlatformLike,
+    type OwnPlatformLike,
     LightConfig,
     BlindConfig,
     ThermostatConfig,
@@ -79,14 +79,17 @@ function modelLabel(code: string | null): string {
     return name ? `${name} (code ${code})` : `unknown (code ${code})`;
 }
 
-export class OwnPlatform implements DynamicPlatformPlugin {
+export class OwnPlatform implements DynamicPlatformPlugin, OwnPlatformLike {
     readonly Service: typeof Service;
     readonly Characteristic: typeof Characteristic;
     readonly HapStatusError: new (status: number) => HapStatusError;
     readonly HAPStatus: Record<string, number>;
     cachedAccessories: PlatformAccessory[];
     activeHandlers: AnyAccessory[];
-    controller: OwnClient | undefined;
+    // OwnPlatformLike requires `controller: OwnClient` (non-optional). The field is
+    // initialized in the constructor after we've verified `host` is configured, so
+    // any code path that reaches an accessory handler is guaranteed to have it set.
+    controller!: OwnClient;
     private staggerTimers: ReturnType<typeof setTimeout>[];
     private readonly config: Required<Omit<MyHomeConfig, 'host' | 'maxConcurrent' | 'password'>> & { host?: string; password?: string; maxConcurrent?: number };
 
@@ -108,11 +111,11 @@ export class OwnPlatform implements DynamicPlatformPlugin {
             energies: [],
         };
 
-        this.config = { ...defaultConfig, ...config } as Required<Omit<MyHomeConfig, 'host' | 'maxConcurrent' | 'password'>> & { host?: string; password?: string; maxConcurrent?: number };
+        this.config = { ...defaultConfig, ...config };
 
-        this.Service = api.hap.Service as typeof Service;
-        this.Characteristic = api.hap.Characteristic as typeof Characteristic;
-        this.HapStatusError = api.hap.HapStatusError as unknown as new (status: number) => HapStatusError;
+        this.Service = api.hap.Service;
+        this.Characteristic = api.hap.Characteristic;
+        this.HapStatusError = api.hap.HapStatusError;
         this.HAPStatus = {
             NOT_ALLOWED_IN_CURRENT_STATE: -70412,
             SERVICE_COMMUNICATION_FAILURE: -70402,
@@ -192,20 +195,19 @@ export class OwnPlatform implements DynamicPlatformPlugin {
     }
 
     configureAccessory(accessory: PlatformAccessory): void {
-        this.log.info('Restoring cached accessory:', accessory.displayName);
+        this.log.debug('Restoring cached accessory:', accessory.displayName);
         this.cachedAccessories.push(accessory);
         // Note: handler creation is deferred to discoverDevices() which has the up-to-date
         // config.device. Creating here with stale context.device would skip the service-flip
-        // cleanup when the user changes asButton/asOutlet/sensorType in config.
+        // cleanup when the user changes asOutlet/sensorType in config.
     }
 
     discoverDevices(): void {
         this.log.info('Discovering OpenWebNet devices from config');
 
         // HAP category codes hardcoded (Categories is a const enum — no runtime object):
-        // 5=Lightbulb, 6=DoorLock, 7=Outlet, 8=Switch, 9=Thermostat, 10=Sensor, 14=WindowCovering, 15=ProgrammableSwitch
+        // 5=Lightbulb, 6=DoorLock, 7=Outlet, 8=Switch, 9=Thermostat, 10=Sensor, 14=WindowCovering
         function deviceCategory(d: { type: string } & Record<string, unknown>): number {
-            if (d.type === 'scenario' && d.asButton) return 15;
             if (d.type === 'energy'   && d.asOutlet) return 7;
             const base: Record<string, number> = {
                 light: 5, blind: 14, thermostat: 9, scenario: 8, contact: 10, energy: 10, door: 6,
@@ -236,11 +238,11 @@ export class OwnPlatform implements DynamicPlatformPlugin {
             const existingAccessory = this.cachedAccessories.find(a => a.UUID === uuid);
 
             if (existingAccessory) {
-                this.log.info('Restoring accessory from cache:', existingAccessory.displayName);
+                this.log.debug('Restoring accessory from cache:', existingAccessory.displayName);
                 existingAccessory.context.device = device;
                 existingAccessory.context.type = device.type;
-                // Refresh category in case the user toggled asButton/asOutlet/etc. between sessions.
-                existingAccessory.category = (deviceCategory(device) ?? 1) as unknown as typeof existingAccessory.category;
+                // Refresh category in case the user toggled asOutlet/etc. between sessions.
+                existingAccessory.category = deviceCategory(device) ?? 1;
                 this.api.updatePlatformAccessories([existingAccessory]);
                 if (!this.activeHandlers.find(h => h.accessory === existingAccessory)) {
                     try {
@@ -253,7 +255,7 @@ export class OwnPlatform implements DynamicPlatformPlugin {
                 const name = device.name ?? `${device.type}-${device.id}`;
                 this.log.info('Adding new accessory:', name);
                 const accessory = new this.api.platformAccessory(name, uuid);
-                accessory.category = (deviceCategory(device) ?? 1) as unknown as typeof accessory.category;
+                accessory.category = deviceCategory(device) ?? 1;
                 accessory.context.device = device;
                 accessory.context.type = device.type;
                 try {
@@ -265,14 +267,15 @@ export class OwnPlatform implements DynamicPlatformPlugin {
             }
         }
 
-        const stale = this.cachedAccessories.filter(a => {
-            if (discoveredUUIDs.includes(a.UUID)) return false;
+        const isKeeper = (a: PlatformAccessory): boolean => {
+            if (discoveredUUIDs.includes(a.UUID)) return true;
             // Preserve auto-discovered accessories when autoDiscover is active;
             // runAutoDiscovery() will re-attach or clean them up after the scan.
             if (this.config.autoDiscover &&
-                (a.context as Record<string, unknown>).autoDiscovered) return false;
-            return true;
-        });
+                (a.context as Record<string, unknown>).autoDiscovered) return true;
+            return false;
+        };
+        const stale = this.cachedAccessories.filter(a => !isKeeper(a));
         if (stale.length > 0) {
             this.log.info('Removing %d stale accessories', stale.length);
             for (const accessory of stale) {
@@ -283,7 +286,11 @@ export class OwnPlatform implements DynamicPlatformPlugin {
                 }
             }
             this.api.unregisterPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, stale);
-            this.cachedAccessories = this.cachedAccessories.filter(a => discoveredUUIDs.includes(a.UUID));
+            // Rebuild cachedAccessories with the same keeper rule (not just discoveredUUIDs)
+            // so auto-discovered entries survive across `discoverDevices()` when autoDiscover
+            // is enabled — otherwise they would remain registered in Homebridge but be
+            // dropped from our in-memory cache, becoming "ghost" accessories.
+            this.cachedAccessories = this.cachedAccessories.filter(isKeeper);
         }
     }
 
@@ -292,16 +299,17 @@ export class OwnPlatform implements DynamicPlatformPlugin {
             this.log.warn('createHandler: invalid config for type "%s" — skipping (%j)', type, config);
             return;
         }
-        const platform = this as unknown as OwnPlatformLike;
+        // `this` satisfies OwnPlatformLike (see class declaration `implements OwnPlatformLike`),
+        // so accessory constructors can accept it directly without a local alias.
         let handler: AnyAccessory | undefined;
         switch (type) {
-            case 'light': handler = new OwnLightAccessory(platform, accessory, config as unknown as LightConfig); break;
-            case 'blind': handler = new OwnBlindAccessory(platform, accessory, config as unknown as BlindConfig); break;
-            case 'thermostat': handler = new OwnThermostatAccessory(platform, accessory, config as unknown as ThermostatConfig); break;
-            case 'scenario': handler = new OwnScenarioAccessory(platform, accessory, config as unknown as ScenarioConfig); break;
-            case 'contact': handler = new OwnContactAccessory(platform, accessory, config as unknown as ContactConfig); break;
-            case 'energy': handler = new OwnEnergyAccessory(platform, accessory, config as unknown as EnergyConfig); break;
-            case 'door': handler = new OwnDoorAccessory(platform, accessory, config as unknown as DoorConfig); break;
+            case 'light': handler = new OwnLightAccessory(this, accessory, config); break;
+            case 'blind': handler = new OwnBlindAccessory(this, accessory, config as unknown as BlindConfig); break;
+            case 'thermostat': handler = new OwnThermostatAccessory(this, accessory, config as unknown as ThermostatConfig); break;
+            case 'scenario': handler = new OwnScenarioAccessory(this, accessory, config); break;
+            case 'contact': handler = new OwnContactAccessory(this, accessory, config); break;
+            case 'energy': handler = new OwnEnergyAccessory(this, accessory, config); break;
+            case 'door': handler = new OwnDoorAccessory(this, accessory, config); break;
             default:
                 this.log.warn('createHandler: unknown device type "%s" — skipping', type);
                 return;
@@ -496,7 +504,7 @@ export class OwnPlatform implements DynamicPlatformPlugin {
         const name = `${typeInfo.type.charAt(0).toUpperCase() + typeInfo.type.slice(1)} ${id}`;
         this.log.info('[AutoDiscover] Registering new %s id=%d as "%s"', typeInfo.type, id, name);
         const accessory = new this.api.platformAccessory(name, uuid);
-        accessory.category = (typeInfo.category ?? 1) as unknown as typeof accessory.category;
+        accessory.category = typeInfo.category ?? 1;
         const deviceConfig = typeInfo.makeConfig(id);
         accessory.context.device = deviceConfig;
         accessory.context.type = typeInfo.type;

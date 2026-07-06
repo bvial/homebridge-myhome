@@ -2,6 +2,62 @@
 
 All notable changes to this project are documented here.
 
+## [0.4.7] — Unreleased
+
+### Removed
+- **`asButton` option on scenarios (BREAKING)** — a HomeKit
+  `StatelessProgrammableSwitch` is emit-only in HomeKit: it cannot receive
+  taps from the Home app, so `asButton: true` silently disabled scenario
+  activation. Scenarios are always exposed as an auto-reset Switch now.
+  Existing installs that had `asButton: true` should remove the key from
+  their `config.json`; any leftover SPS service is cleaned up automatically
+  at next startup.
+
+### Fixed
+- **Thermostat DIM 14 mode byte parsed.** Setpoint packets
+  `*#4*<zone>*14*<temp>*<mode>##` now use the second field (`*1` = Heat,
+  `*2` = Cool) to keep HomeKit's `TargetHeatingCoolingState` in sync with
+  gateway-side mode changes. Previously the mode byte was discarded, causing
+  a silent HEAT/COOL desync when the setpoint was updated externally.
+- **AUTO mode confirmation packet no longer logs as error.**
+  `*4*3100*<zone>##` (weekly-program confirmation) was falling into the
+  "not decoded" `log.error` branch, polluting logs on every AUTO switch. It
+  now decodes as "AUTO Weekly Program" at debug level.
+- **Auto-discovered accessories no longer leak as ghosts.** When
+  `discoverDevices()` ran with `autoDiscover: true`, auto-discovered entries
+  were preserved from the `stale` unregister step but then dropped from the
+  in-memory `cachedAccessories` list, leaving them registered in Homebridge
+  but invisible to the plugin. The keeper rule is now consistent between the
+  stale filter and the cache rebuild.
+- **Monitor buffer regex anchored.** The packet-splitting regex in
+  `OwnConnection.onData` now anchors to the start of the buffer (`^…$`),
+  guaranteeing O(n) parsing under all conditions.
+- **Monitor keep-alive probe timeout no longer silent.** `checkMonitor()`
+  now emits a debug log when the probe fails to receive a reply, making
+  gateway saturation visible in the logs.
+
+### Changed
+- **`BLIND_QUEUE_BUSY_THRESHOLD` → `COMMAND_QUEUE_BUSY_THRESHOLD`** in
+  `lib/utils.ts` (old name kept as a deprecated alias). The threshold applies
+  to every accessory's `sendOrThrow`, not just blinds — the new name reflects
+  that scope.
+- **`OwnPlatform` now `implements OwnPlatformLike` explicitly** and the
+  `as unknown as OwnPlatformLike` cast in `createHandler` was removed. Any
+  future divergence between the platform and the interface is now a compile-
+  time error.
+- **Default-name derivation centralized** in the `OwnAccessory` base class.
+  Sub-classes pass their type label (`'light'`, `'blind'`, …) to `super()`
+  instead of mutating `config.name` themselves — one source of truth.
+- **`Restoring cached accessory` logs downgraded from info to debug** to
+  reduce startup noise on large installations.
+
+### Tooling
+- **ESLint now runs `@typescript-eslint`.** Previously the config used only
+  `@eslint/js`, so all `// eslint-disable-next-line @typescript-eslint/...`
+  hints in the source were dead code. Run `npm run lint` to check.
+- **`scan.ts --max-addr` now validates its argument** and falls back to the
+  default (20) with a warning if a non-integer is passed.
+
 ## [0.4.4] — Unreleased
 
 ### Fixed

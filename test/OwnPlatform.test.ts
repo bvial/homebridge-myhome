@@ -190,17 +190,16 @@ describe('OwnPlatform.discoverDevices', () => {
         for (const h of platform.activeHandlers) h.destroy();
     });
 
-    it('assigns category 15 (PROGRAMMABLE_SWITCH) for asButton scenario', () => {
+    it('assigns category 8 (SWITCH) for scenario', () => {
         const api = makeMockApi();
         const platform = makePlatformInstance({
             host: '127.0.0.1',
-            scenarios: [{ id: 1, name: 'btn', asButton: true }],
+            scenarios: [{ id: 1, name: 'sw' }],
         }, api);
         platform.discoverDevices();
-        // accessory.category is set on the new accessory before register
         const registered = api.registered[0]?.[2] as Array<{ category: number }> | undefined;
         assert.ok(registered, 'expected an accessory to be registered');
-        assert.equal(registered[0].category, 15, 'asButton scenario should have category PROGRAMMABLE_SWITCH (15)');
+        assert.equal(registered[0].category, 8, 'scenario should have category SWITCH (8)');
         for (const h of platform.activeHandlers) h.destroy();
     });
 
@@ -230,20 +229,20 @@ describe('OwnPlatform.discoverDevices', () => {
         for (const h of platform.activeHandlers) h.destroy();
     });
 
-    it('refreshes category for cached accessory when asButton flag flips', () => {
+    it('refreshes category for cached accessory when asOutlet flag flips', () => {
         const api = makeMockApi();
-        const uuid = api.hap.uuid.generate('myhome-scenario-1');
-        const cached = makeAccessoryStub('btn', uuid);
-        // simulate previous run with asButton:false → category 8 (Switch)
-        (cached as unknown as { category: number }).category = 8;
+        const uuid = api.hap.uuid.generate('myhome-energy-1');
+        const cached = makeAccessoryStub('E', uuid);
+        // simulate previous run with asOutlet:false → category 10 (Sensor)
+        (cached as unknown as { category: number }).category = 10;
         const platform = makePlatformInstance({
             host: '127.0.0.1',
-            scenarios: [{ id: 1, name: 'btn', asButton: true }],
+            energies: [{ id: 1, name: 'E', asOutlet: true }],
         }, api);
         platform.cachedAccessories.push(cached);
         platform.discoverDevices();
-        assert.equal((cached as unknown as { category: number }).category, 15,
-            'cached accessory category must be refreshed to PROGRAMMABLE_SWITCH after asButton flip');
+        assert.equal((cached as unknown as { category: number }).category, 7,
+            'cached accessory category must be refreshed to OUTLET after asOutlet flip');
         for (const h of platform.activeHandlers) h.destroy();
     });
 

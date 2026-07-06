@@ -172,7 +172,7 @@ export class OwnConnection extends EventEmitter {
         this.buf += data.toString();
 
         while (this.buf.length > 0) {
-            const m = this.buf.match(/(\*.+?##)([\s\S]*)/);
+            const m = this.buf.match(/^(\*.+?##)([\s\S]*)$/);
             if (!m) {
                 if (this.buf.length > 4096) {
                     this.log.warn('conn:%s buffer overflow (%d bytes), discarding', this.id, this.buf.length);
@@ -323,6 +323,12 @@ export class OwnMonitor extends EventEmitter {
                         this.resetCheck();
                         this.resetAutoConnectTimeout();
                     }
+                } else {
+                    // Probe timed out or command queue dropped the packet: leave nbCheck as-is
+                    // so the next checkTimeout tick counts as another failed probe. Do NOT
+                    // reset the timer here — the outer resetAutoConnectTimeout() armed by
+                    // restartConnection() will fire again after reconnectSeconds.
+                    this.client.log.debug('Monitor: keep-alive probe timed out or failed to send');
                 }
             },
         });
