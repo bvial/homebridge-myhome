@@ -15,7 +15,9 @@ import {
     BLIND_COMMAND_ECHO_TIMEOUT_MS,
     BLIND_INIT_CALIBRATION_MARGIN_MS,
     BLIND_POST_STOP_GRACE_MS,
-    BLIND_QUEUE_BUSY_THRESHOLD,
+    BLIND_END_STOP_SAFETY_MIN_MS,
+    BLIND_END_STOP_SAFETY_MAX_MS,
+    COMMAND_QUEUE_BUSY_THRESHOLD,
     BLIND_MIN_TICK_MS,
     ENERGY_POLL_INTERVAL_MS,
     ENERGY_POLL_QUEUE_THRESHOLD,
@@ -59,7 +61,10 @@ export interface ThermostatConfig extends BaseConfig {
 }
 
 export interface ScenarioConfig extends BaseConfig {
-    asButton?: boolean;
+    // Note: the historical `asButton` option was removed because a HomeKit
+    // StatelessProgrammableSwitch is emit-only — it cannot receive taps from
+    // the Home app, so `asButton: true` silently disabled scenario activation.
+    // Scenarios are always exposed as an auto-reset Switch now.
 }
 export interface ContactConfig extends BaseConfig {
     sensorType?: 'contact' | 'motion' | 'occupancy' | 'leak' | 'smoke' | 'co';
@@ -87,7 +92,7 @@ class OwnAccessory {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     private charWarningListener: ((warning: any) => void) | undefined;
 
-    constructor(platform: OwnPlatformLike, accessory: PlatformAccessory, config: BaseConfig) {
+    constructor(platform: OwnPlatformLike, accessory: PlatformAccessory, config: BaseConfig, defaultType?: string) {
         this.log = platform.log;
         this.controller = platform.controller;
         this.Service = platform.Service;
@@ -96,6 +101,15 @@ class OwnAccessory {
         this.HAPStatus = platform.HAPStatus;
         this.platform = platform;
         this.accessory = accessory;
+
+        // Derive a display name if the user didn't provide one. `defaultType` is the
+        // short kind label ('light', 'blind', 'thermostat', ...) supplied by each subclass;
+        // the resulting default is `<type>-<id>`. We fall back to just the id when no
+        // defaultType is provided (older callers). Use a null/undefined check (not a falsy
+        // one) so an explicit empty-string name is left as-is rather than overwritten.
+        if (config.name == null) {
+            config.name = defaultType ? `${defaultType}-${config.id}` : String(config.id);
+        }
 
         this.name = config.name ?? '';
         this.id = config.id;
@@ -192,7 +206,7 @@ class OwnAccessory {
     }
 
     protected sendOrThrow(command: string): void {
-        if (this.controller.queueSize() >= BLIND_QUEUE_BUSY_THRESHOLD) {
+        if (this.controller.queueSize() >= COMMAND_QUEUE_BUSY_THRESHOLD) {
             this.log.warn('[%s] Command dropped (queue full): %s', this.id, command);
             throw new this.HapStatusError(this.HAPStatus.RESOURCE_BUSY);
         }
@@ -254,8 +268,7 @@ export class OwnLightAccessory extends OwnAccessory {
     }
 
     constructor(platform: OwnPlatformLike, accessory: PlatformAccessory, config: LightConfig) {
-        if (!config.name) config.name = `light-${config.id}`;
-        super(platform, accessory, config);
+        super(platform, accessory, config, 'light');
 
         this.value = false;
         this.dimmer = config.dimmer ?? false;
@@ -304,6 +317,12 @@ export class OwnLightAccessory extends OwnAccessory {
                         const level = brightnessToOwnLevel(value as number);
                         this.sendOrThrow(`*1*${level}*${this.where}##`);
                         this.brightness = value as number;
+                        // Setting brightness > 0 on an off lamp also turns it on — sync `On`
+                        // to HomeKit so the tile doesn't show "off" while the lamp is lit.
+                        if (!this.value) {
+                            this.value = true;
+                            this.lightbulbService.updateCharacteristic(this.Characteristic.On, true);
+                        }
                     }
                 });
         }
@@ -372,22 +391,33 @@ export class OwnBlindAccessory extends OwnAccessory {
     initPhase: boolean;
     homeKitMovement: boolean;
     private calibrateOnStart: boolean;
-    private inStatusQuery: boolean;
+    /** Non-private: read/asserted by the test suite. */
+    inStatusQuery: boolean;
     private statusQueryTimeout: ReturnType<typeof setTimeout> | undefined;
     private initTimeout: ReturnType<typeof setTimeout> | undefined;
     /** True for a brief grace window after a STOP packet, used to suppress the
      *  spurious post-STOP direction packet some BTicino gateways emit
-     *  (F454 reliably sends *2*2* a few ms after a wall-switch STOP). */
-    private postStopGrace: boolean;
+     *  (F454 reliably sends *2*2* a few ms after a wall-switch STOP).
+     *  Non-private: read/asserted by the test suite. */
+    postStopGrace: boolean;
     private postStopGraceTimeout: ReturnType<typeof setTimeout> | undefined;
+    /** True from the moment we send a HomeKit-originated STOP until its echo is received.
+     *  Lets onData() distinguish the echo of our own STOP (no F454 spurious-packet quirk,
+     *  grace must NOT arm) from a physical wall-switch STOP (quirk fires, grace must arm),
+     *  even when a physical STOP happens to arrive while a HomeKit STOP is still in flight.
+     *  Non-private: set by the test suite to simulate an in-flight HomeKit STOP. */
+    homeKitStopPending: boolean;
+    /** Safety timeout for silent physical end-stops — some gateways do NOT emit
+     *  `*2*0*` when the motor reaches its natural end-of-travel. Without this,
+     *  HomeKit's PositionState would stay INCREASING/DECREASING forever. */
+    private endStopSafetyTimeout: ReturnType<typeof setTimeout> | undefined;
     private identifyJogTimeout: ReturnType<typeof setTimeout> | undefined;
     private windowCoveringService: InstanceType<typeof Service>;
 
     get who(): number { return WHO.automation; }
 
     constructor(platform: OwnPlatformLike, accessory: PlatformAccessory, config: BlindConfig) {
-        if (!config.name) config.name = `blind-${config.id}`;
-        super(platform, accessory, config);
+        super(platform, accessory, config, 'blind');
 
         if (!config.time || config.time <= 0) {
             throw new Error(`homebridge-myhome: blind id=${config.id} requires a positive "time" value`);
@@ -414,6 +444,8 @@ export class OwnBlindAccessory extends OwnAccessory {
         this.initTimeout = undefined;
         this.postStopGrace = false;
         this.postStopGraceTimeout = undefined;
+        this.homeKitStopPending = false;
+        this.endStopSafetyTimeout = undefined;
 
         this.windowCoveringService = this.initPrimaryService(this.Service.WindowCovering, 'WindowCovering', true);
 
@@ -423,7 +455,7 @@ export class OwnBlindAccessory extends OwnAccessory {
         this.windowCoveringService.getCharacteristic(this.Characteristic.TargetPosition)
             .onGet(() => this.target)
             .onSet((target: CharacteristicValue) => {
-                if (this.controller.queueSize() >= BLIND_QUEUE_BUSY_THRESHOLD) {
+                if (this.controller.queueSize() >= COMMAND_QUEUE_BUSY_THRESHOLD) {
                     throw new this.HapStatusError(this.HAPStatus.RESOURCE_BUSY);
                 }
                 this.log.info(`[${this.id}] Blind setting Target :${target}`);
@@ -440,7 +472,7 @@ export class OwnBlindAccessory extends OwnAccessory {
 
         this.windowCoveringService.getCharacteristic(this.Characteristic.HoldPosition)
             .onSet((hold: CharacteristicValue) => {
-                if (this.controller.queueSize() >= BLIND_QUEUE_BUSY_THRESHOLD) {
+                if (this.controller.queueSize() >= COMMAND_QUEUE_BUSY_THRESHOLD) {
                     throw new this.HapStatusError(this.HAPStatus.RESOURCE_BUSY);
                 }
                 this.log.info(`[${this.id}] Blind hold position :${hold}`);
@@ -546,6 +578,7 @@ export class OwnBlindAccessory extends OwnAccessory {
             this.updateStatus();
         }
         this.commandSent = false;
+        this.homeKitStopPending = false;
         clearTimeout(this.packetTimeout);
     }
 
@@ -560,6 +593,7 @@ export class OwnBlindAccessory extends OwnAccessory {
         this.log.info(`[${this.id}] Blind sending stop`);
         this.homeKitMovement = false;
         this.expectedState = this.Characteristic.PositionState.STOPPED;
+        this.homeKitStopPending = true;
         this.startTimerCommand();
         const queued = this.controller.sendCommand({
             command: `*2*0*${this.id}##`,
@@ -569,6 +603,7 @@ export class OwnBlindAccessory extends OwnAccessory {
         if (!queued) {
             this.log.warn('[%s] Blind STOP dropped: queue full', this.id);
             this.commandSent = false;
+            this.homeKitStopPending = false;
         }
     }
 
@@ -633,9 +668,20 @@ export class OwnBlindAccessory extends OwnAccessory {
             }
 
             const prevState = this.state;
+            // Distinguish the echo of our own HomeKit STOP from a physical (wall-switch) STOP.
+            // Only moveStop() sets homeKitStopPending, and it is cleared the moment any STOP
+            // echo is consumed below — so it is true ONLY during the genuine in-flight window
+            // of a HomeKit STOP, not left sticky like (commandSent && expectedState) was.
+            // Our own STOP does not trigger the F454 spurious-direction quirk, so the grace
+            // window must arm only for physical STOPs (homeKitStopPending === false).
+            const isEchoOfHomeKitStop = direction === '0' && this.homeKitStopPending;
             if (direction === '0') {
+                this.homeKitStopPending = false;
                 const wasDecreasing = this.state === this.Characteristic.PositionState.DECREASING;
                 this.state = this.Characteristic.PositionState.STOPPED;
+                // Gateway did emit STOP — clear the end-stop safety net.
+                clearTimeout(this.endStopSafetyTimeout);
+                this.endStopSafetyTimeout = undefined;
                 // End calibration if: not in calibration, OR was actually moving down (normal end),
                 // OR position is already 0 (blind was at bottom-stop before calibration move started).
                 if (!this.initPhase || wasDecreasing || this.position === 0) {
@@ -645,14 +691,18 @@ export class OwnBlindAccessory extends OwnAccessory {
                     this.position = this.target;
                 }
                 this.cachePosition();
-                // Arm grace window to ignore the spurious direction packet that some
-                // BTicino gateways emit immediately after a STOP (within tens of ms).
-                this.postStopGrace = true;
-                clearTimeout(this.postStopGraceTimeout);
-                this.postStopGraceTimeout = setTimeout(() => {
-                    this.postStopGrace = false;
-                    this.postStopGraceTimeout = undefined;
-                }, BLIND_POST_STOP_GRACE_MS);
+                // Arm the F454 grace window ONLY for physical STOPs. A STOP that echoes a
+                // HomeKit command is issued by us — the gateway does not follow it with a
+                // spurious direction packet, and any direction packet arriving in the
+                // next 150 ms is a genuine manual command that must not be filtered.
+                if (!isEchoOfHomeKitStop) {
+                    this.postStopGrace = true;
+                    clearTimeout(this.postStopGraceTimeout);
+                    this.postStopGraceTimeout = setTimeout(() => {
+                        this.postStopGrace = false;
+                        this.postStopGraceTimeout = undefined;
+                    }, BLIND_POST_STOP_GRACE_MS);
+                }
             } else if (direction === '1') {
                 this.state = this.Characteristic.PositionState.INCREASING;
             } else if (direction === '2') {
@@ -678,7 +728,16 @@ export class OwnBlindAccessory extends OwnAccessory {
             // Skip evaluatePosition for duplicate packets that don't change state.
             // For STOP (direction '0'), always evaluate even if positionTimeout is pending —
             // it clears the timeout on entry and syncs CurrentPosition/TargetPosition to HomeKit.
+            // For a direction reversal (INCREASING↔DECREASING) without an intervening STOP,
+            // cancel the stale positionTimeout so the new direction is picked up immediately
+            // instead of waiting for the previous tick to expire.
             const isStop = direction === '0';
+            const isDirectionReversal = !isStop && this.state !== prevState
+                && prevState !== this.Characteristic.PositionState.STOPPED;
+            if (isDirectionReversal && this.positionTimeout !== undefined) {
+                clearTimeout(this.positionTimeout);
+                this.positionTimeout = undefined;
+            }
             if (!this.commandSent && (isStop || !this.positionTimeout) && this.state !== prevState) {
                 this.evaluatePosition();
             }
@@ -702,11 +761,16 @@ export class OwnBlindAccessory extends OwnAccessory {
             if (this.position < 100) this.position++;
             if (this.position % 10 === 0 || this.position >= this.target)
                 this.log.debug(`[${this.id}] Blind moving UP pos:${this.position} target:${this.target}`);
+            // For manual (wall-switch) movements, HomeKit still holds the previous target
+            // from the last HomeKit command. Sync it to the live position so the Home app
+            // doesn't display a stale TargetPosition while the blind is physically moving.
+            this.syncManualTarget();
             if (this.homeKitMovement && this.position >= this.target) {
                 this.moveStop();
             } else if (!this.homeKitMovement && this.position >= 100) {
                 // physical movement reached upper end-stop — wait for gateway STOP packet
                 this.cachePosition();
+                this.armEndStopSafetyTimeout();
             } else {
                 this.startPositionTracking();
             }
@@ -714,6 +778,7 @@ export class OwnBlindAccessory extends OwnAccessory {
             if (this.position > 0) this.position--;
             if (this.position % 10 === 0 || this.position <= this.target)
                 this.log.debug(`[${this.id}] Blind moving DOWN pos:${this.position} target:${this.target}`);
+            this.syncManualTarget();
             if (!this.initPhase && this.homeKitMovement && this.position <= this.target) {
                 this.moveStop();
             } else if (this.initPhase && this.position === 0) {
@@ -721,6 +786,7 @@ export class OwnBlindAccessory extends OwnAccessory {
             } else if (!this.homeKitMovement && this.position <= 0) {
                 // physical movement reached lower end-stop — wait for gateway STOP packet
                 this.cachePosition();
+                this.armEndStopSafetyTimeout();
             } else {
                 this.startPositionTracking();
             }
@@ -783,7 +849,6 @@ export class OwnBlindAccessory extends OwnAccessory {
      */
     private adjustToward(delta: number): boolean {
         const goingUp = delta > 0;
-        const correctDir  = goingUp ? this.Characteristic.PositionState.INCREASING : this.Characteristic.PositionState.DECREASING;
         const oppositeDir = goingUp ? this.Characteristic.PositionState.DECREASING : this.Characteristic.PositionState.INCREASING;
         if (this.state === oppositeDir) {
             this.moveStop();
@@ -794,12 +859,62 @@ export class OwnBlindAccessory extends OwnAccessory {
             else         this.moveDown();
             return false;
         }
-        // state === correctDir
+        // Already moving in the correct direction.
         if (!this.commandSent && !this.positionTimeout) {
             // Position tracking was cancelled mid-flight (rapid retarget). Re-enable tracking.
             this.homeKitMovement = true;
         }
         return false;
+    }
+
+    /**
+     * During a manual (wall-switch) movement HomeKit still holds the target from the last
+     * HomeKit command. Keep `target` in step with the live position so the Home app does not
+     * show a stale TargetPosition. Guarded by `!inStatusQuery` (matching the STOPPED branch)
+     * so status-query responses for an already-moving blind don't overwrite a meaningful
+     * prior target. The HomeKit characteristic push is throttled to 10% boundaries (plus the
+     * end-stops) to avoid flooding HAP with ~100 updates per full travel.
+     */
+    private syncManualTarget(): void {
+        if (this.homeKitMovement || this.inStatusQuery || this.target === this.position) return;
+        // Throttle to 10% boundaries (and the end-stops) to avoid flooding HAP with ~100
+        // updates per full travel. We update `this.target` and push the characteristic
+        // together so they stay consistent — leaving `this.target` diverged between
+        // boundaries lets the STOPPED branch perform the final authoritative sync on STOP.
+        if (this.position % 10 === 0 || this.position === 0 || this.position === 100) {
+            this.target = this.position;
+            this.windowCoveringService.updateCharacteristic(this.Characteristic.TargetPosition, this.target);
+        }
+    }
+
+    /**
+     * Safety net for gateways that reach a physical end-stop without emitting `*2*0*`.
+     * When position hits 0 or 100 during a non-HomeKit movement, we wait a short window
+     * for the gateway STOP; if it never arrives, force STATE=STOPPED so HomeKit's
+     * PositionState doesn't stay INCREASING/DECREASING forever.
+     */
+    private armEndStopSafetyTimeout(): void {
+        clearTimeout(this.endStopSafetyTimeout);
+        // Derive the wait from the blind's own tick rate: allow a few ticks' worth of grace
+        // for a delayed gateway STOP, clamped so fast blinds don't linger and slow blinds
+        // with a legitimately late STOP aren't cut off mid-travel.
+        const delay = Math.min(
+            BLIND_END_STOP_SAFETY_MAX_MS,
+            Math.max(BLIND_END_STOP_SAFETY_MIN_MS, this.msPerPercent(this.position) * 5),
+        );
+        this.endStopSafetyTimeout = setTimeout(() => {
+            this.endStopSafetyTimeout = undefined;
+            if (this.state === this.Characteristic.PositionState.STOPPED) return;
+            this.log.warn('[%s] Blind reached end-stop but gateway never emitted STOP — forcing STOPPED', this.id);
+            this.state = this.Characteristic.PositionState.STOPPED;
+            this.windowCoveringService.updateCharacteristic(this.Characteristic.PositionState, this.state);
+            this.target = this.position;
+            this.windowCoveringService.updateCharacteristic(this.Characteristic.TargetPosition, this.target);
+            // Push CurrentPosition too: if the timer fired before the position reached an exact
+            // 0/100, HomeKit could otherwise show a CurrentPosition inconsistent with STOPPED.
+            this.windowCoveringService.updateCharacteristic(this.Characteristic.CurrentPosition, this.position);
+            this.cachePosition();
+        }, delay);
     }
 
     startMoveTracking(): void {
@@ -826,7 +941,10 @@ export class OwnBlindAccessory extends OwnAccessory {
         this.initTimeout = undefined;
         clearTimeout(this.postStopGraceTimeout);
         this.postStopGraceTimeout = undefined;
+        clearTimeout(this.endStopSafetyTimeout);
+        this.endStopSafetyTimeout = undefined;
         this.postStopGrace = false;
+        this.homeKitStopPending = false;
         this.inStatusQuery = false;
         this.commandSent = false;
         this.homeKitMovement = false;
@@ -856,8 +974,7 @@ export class OwnThermostatAccessory extends OwnAccessory {
     get who(): number { return WHO.temperature; }
 
     constructor(platform: OwnPlatformLike, accessory: PlatformAccessory, config: ThermostatConfig) {
-        if (!config.name) config.name = `thermostat-${config.id}`;
-        super(platform, accessory, config);
+        super(platform, accessory, config, 'thermostat');
 
         if (!Number.isInteger(config.zone) || config.zone <= 0) {
             throw new Error(`homebridge-myhome: thermostat id=${config.id} requires a positive integer "zone"`);
@@ -1014,8 +1131,28 @@ export class OwnThermostatAccessory extends OwnAccessory {
             } else {
                 this.log.debug('[%s] zone[%s] local offset:%s (%s)', this.id, this.zone, decoded.offset, decoded.status);
             }
-        } else if ((extract = packet.match(/^\*#4\*[\d#]+\*14\*(\d+)\*\d+##$/))) {
+        } else if ((extract = packet.match(/^\*#4\*[\d#]+\*14\*(\d+)\*(\d+)##$/))) {
+            // DIM 14 = Setpoint temperature. Second value is the mode byte:
+            //   *1 = Heat, *2 = Cool, *3 = Generic (mode not enforced).
             this.updateCharacteristicTargetTemperature(OwnProtcol.decodeTemperature(extract[1]));
+            // The mode byte here rides along with a *setpoint* report, which the gateway also
+            // broadcasts passively (status refresh, reconnect) — it is NOT an authoritative
+            // mode-change event. Only adopt it when HomeKit has no explicit HEAT/COOL choice
+            // (currently OFF or AUTO); otherwise a passive broadcast could silently flip the
+            // user's deliberate HEAT↔COOL selection. Authoritative mode changes still arrive
+            // via DIM 19 and the central-unit operation-mode packets below.
+            const modeByte = extract[2];
+            const TargetState = this.Characteristic.TargetHeatingCoolingState;
+            const hasExplicitChoice = this.targetHeatingCoolingState === TargetState.HEAT
+                || this.targetHeatingCoolingState === TargetState.COOL;
+            if (!hasExplicitChoice) {
+                if (modeByte === '1') {
+                    this.updateCharacteristicTargetHeatingCoolingState(TargetState.HEAT);
+                } else if (modeByte === '2') {
+                    this.updateCharacteristicTargetHeatingCoolingState(TargetState.COOL);
+                }
+                // modeByte === '3' (Generic) leaves the current target state untouched.
+            }
         } else if ((extract = packet.match(/^\*#4\*[\d#]+\*19\*(\d)\*(\d)##$/))) {
             const CV = extract[1];
             const HV = extract[2];
@@ -1032,29 +1169,34 @@ export class OwnThermostatAccessory extends OwnAccessory {
                 this.updateCharacteristicCurrentHeatingCoolingState(this.Characteristic.CurrentHeatingCoolingState.OFF);
             }
         } else if ((extract = packet.match(/^\*#4\*\d+#\d+\*20\*(\d+)##$/))) {
-            let status = '';
             const value = extract[1];
-            if (value === '0') status = 'OFF';
-            else if (value === '1') status = 'ON';
-            else if (value === '4') status = 'STOP';
-            else status = `not decoded:${value}`;
+            const status = value === '0' ? 'OFF'
+                : value === '1' ? 'ON'
+                : value === '4' ? 'STOP'
+                : `not decoded:${value}`;
             this.log.debug(`[${this.id}] zone[${this.zone}] actuator status (${status})`);
         } else if ((extract = packet.match(/^\*4\*(\d+)\*\d+##$/))) {
-            let status = '';
             const value = extract[1];
+            let status: string;
             if (value === '0') status = 'Conditioning';
             else if (value === '1') status = 'Heating';
             else if (value === '102') status = 'Antifreeze';
             else if (value === '202') status = 'Thermal Protection';
             else if (value === '303') status = 'Generic OFF';
-            else this.log.error('[%s] zone[%s] operation mode (%s)', this.id, this.zone, value);
+            else if (value === '3100') status = 'AUTO Weekly Program';
+            else {
+                status = `not decoded:${value}`;
+                this.log.error('[%s] zone[%s] operation mode (%s)', this.id, this.zone, value);
+            }
             this.log.debug(`[${this.id}] zone[${this.zone}] operation mode (${status})`);
-            const hkCurrentState = (value === '1' || value === '102')
-                ? this.Characteristic.CurrentHeatingCoolingState.HEAT
-                : (value === '0')
-                    ? this.Characteristic.CurrentHeatingCoolingState.COOL
-                    : this.Characteristic.CurrentHeatingCoolingState.OFF;
-            this.updateCharacteristicCurrentHeatingCoolingState(hkCurrentState);
+            // Map to HomeKit CurrentHeatingCoolingState. Values 1101/1103/3100 (weekly/holiday
+            // programs) leave CurrentState alone — actual heating/cooling status arrives via DIM 19.
+            let hkCurrentState: number | null;
+            if (value === '1' || value === '102') hkCurrentState = this.Characteristic.CurrentHeatingCoolingState.HEAT;
+            else if (value === '0') hkCurrentState = this.Characteristic.CurrentHeatingCoolingState.COOL;
+            else if (value === '303' || value === '202') hkCurrentState = this.Characteristic.CurrentHeatingCoolingState.OFF;
+            else hkCurrentState = null;
+            if (hkCurrentState !== null) this.updateCharacteristicCurrentHeatingCoolingState(hkCurrentState);
         } else if ((extract = packet.match(/^\*4\*(\d+)\*#\d+#\d+##$/))) {
             const valInt = parseInt(extract[1], 10);
             if (valInt === 103) {
@@ -1098,54 +1240,34 @@ export class OwnThermostatAccessory extends OwnAccessory {
 
 export class OwnScenarioAccessory extends OwnAccessory {
     private resetTimeout: ReturnType<typeof setTimeout> | undefined;
-    private asButton: boolean;
     private service: InstanceType<typeof Service>;
 
     constructor(platform: OwnPlatformLike, accessory: PlatformAccessory, config: ScenarioConfig) {
-        if (!config.name) config.name = `scenario-${config.id}`;
-        super(platform, accessory, config);
+        super(platform, accessory, config, 'scenario');
 
         this.resetTimeout = undefined;
-        this.asButton = config.asButton ?? false;
 
-        if (this.asButton) {
-            // Stateless programmable switch — semantically correct for momentary scenarios.
-            // The Home app shows it as a button rather than a toggle switch.
-            this.service = this.initPrimaryService(this.Service.StatelessProgrammableSwitch, 'Scenario');
-            this.service.getCharacteristic(this.Characteristic.ProgrammableSwitchEvent)
-                .setProps({ validValues: [this.Characteristic.ProgrammableSwitchEvent.SINGLE_PRESS] });
-            // Remove any previously-registered Switch service from this accessory so the
-            // accessory presents only one primary service after a config flip.
-            const existingSwitch = this.accessory.getService(this.Service.Switch);
-            if (existingSwitch) this.accessory.removeService(existingSwitch);
-        } else {
-            // Legacy mode — Switch with auto-reset (preserved for compatibility with existing automations).
-            this.service = this.initPrimaryService(this.Service.Switch, 'Scenario');
-            this.service.getCharacteristic(this.Characteristic.On)
-                .onGet(() => false)
-                .onSet((value: CharacteristicValue) => {
-                    if (value) this.activate();
-                });
-            // Remove a previously-registered StatelessProgrammableSwitch (asButton flipped true→false)
-            const existingSPS = this.accessory.getService(this.Service.StatelessProgrammableSwitch);
-            if (existingSPS) this.accessory.removeService(existingSPS);
-        }
+        // Switch with auto-reset — preserves compatibility with existing HomeKit automations
+        // and, unlike StatelessProgrammableSwitch, actually receives taps from the Home app.
+        this.service = this.initPrimaryService(this.Service.Switch, 'Scenario');
+        this.service.getCharacteristic(this.Characteristic.On)
+            .onGet(() => false)
+            .onSet((value: CharacteristicValue) => {
+                if (value) this.activate();
+            });
+        // Remove a previously-registered StatelessProgrammableSwitch from installs
+        // that used the deprecated `asButton: true` option.
+        const existingSPS = this.accessory.getService(this.Service.StatelessProgrammableSwitch);
+        if (existingSPS) this.accessory.removeService(existingSPS);
     }
 
     private activate(): void {
         this.log.info(`[${this.id}] Scenario activate`);
         this.sendOrThrow(`*0*${this.id}*0##`);
-        if (this.asButton) {
-            this.service.updateCharacteristic(
-                this.Characteristic.ProgrammableSwitchEvent,
-                this.Characteristic.ProgrammableSwitchEvent.SINGLE_PRESS,
-            );
-        } else {
-            clearTimeout(this.resetTimeout);
-            this.resetTimeout = setTimeout(() => {
-                this.service.updateCharacteristic(this.Characteristic.On, false);
-            }, SCENARIO_RESET_MS);
-        }
+        clearTimeout(this.resetTimeout);
+        this.resetTimeout = setTimeout(() => {
+            this.service.updateCharacteristic(this.Characteristic.On, false);
+        }, SCENARIO_RESET_MS);
     }
 
     onData(_packet: string): void {}
@@ -1168,8 +1290,7 @@ export class OwnContactAccessory extends OwnAccessory {
     get who(): number { return WHO.auxiliary; }
 
     constructor(platform: OwnPlatformLike, accessory: PlatformAccessory, config: ContactConfig) {
-        if (!config.name) config.name = `contact-${config.id}`;
-        super(platform, accessory, config);
+        super(platform, accessory, config, 'contact');
 
         this.sensorType = config.sensorType ?? 'contact';
         this.contactState = this.Characteristic.ContactSensorState.CONTACT_DETECTED;
@@ -1256,8 +1377,7 @@ export class OwnEnergyAccessory extends OwnAccessory {
     get who(): number { return WHO.energy; }
 
     constructor(platform: OwnPlatformLike, accessory: PlatformAccessory, config: EnergyConfig) {
-        if (!config.name) config.name = `energy-${config.id}`;
-        super(platform, accessory, config);
+        super(platform, accessory, config, 'energy');
 
         this.watts = ENERGY_MIN_LIGHT_LEVEL;
         this.asOutlet = config.asOutlet ?? false;
@@ -1355,8 +1475,7 @@ export class OwnDoorAccessory extends OwnAccessory {
     get who(): number { return WHO.videoDoor; }
 
     constructor(platform: OwnPlatformLike, accessory: PlatformAccessory, config: DoorConfig) {
-        if (!config.name) config.name = `door-${config.id}`;
-        super(platform, accessory, config);
+        super(platform, accessory, config, 'door');
 
         this.openCommand = config.openCommand ?? `*7*19*${this.id}##`;
         this.doorbellEnabled = config.doorbell ?? false;

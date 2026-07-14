@@ -1,7 +1,7 @@
 {
   "name": "homebridge-myhome-unik",
   "displayName": "MyHome (Legrand / BTicino)",
-  "version": "0.4.6",
+  "version": "0.4.7",
   "description": "MyHome Legrand plugin for homebridge",
   "license": "ISC",
   "keywords": [
@@ -28,7 +28,8 @@
     "@types/node": "^25.8.0",
     "eslint": "^10.3.0",
     "homebridge": "^2.0.0",
-    "typescript": "^6.0.3"
+    "typescript": "^6.0.3",
+    "typescript-eslint": "^8.62.1"
   },
   "homepage": "https://github.com/bvial/homebridge-myhome#readme",
   "main": "dist/index.js",
@@ -48,6 +49,7 @@
   },
   "scripts": {
     "build": "tsc",
+    "lint": "eslint 'lib/**/*.ts' 'test/**/*.ts' 'index.ts' 'scan.ts'",
     "scan": "npm run build && node dist/scan.js",
     "test": "npm run build && node --test 'dist/test/*.test.js'",
     "prepare": "npm run build"

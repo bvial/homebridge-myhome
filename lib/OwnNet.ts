@@ -108,6 +108,7 @@ export class OwnConnection extends EventEmitter {
             this.conn.on('error', () => {});
             this.conn.destroy();
             this.conn = null;
+            this.state = STATE.UNCONNECTED;
         }
     }
 
@@ -124,6 +125,16 @@ export class OwnConnection extends EventEmitter {
         this.conn.on('error', (error: Error) => {
             this.log.error('Socket error: %s', error.message);
             this.state = STATE.UNCONNECTED;
+        });
+        // Peer half-close: the gateway sent FIN but not RST. Without this handler Node would
+        // leave the socket in read-only mode indefinitely. Tear the socket down AND notify
+        // subscribers via 'close' — routing through this.end()/destroyConn() alone would strip
+        // the 'close' listener before destroy() fires, swallowing the disconnect notification
+        // and preventing OwnMonitor from reconnecting.
+        this.conn.on('end', () => {
+            this.log.debug('conn:%s peer half-closed connection (FIN)', this.id);
+            this.destroyConn();
+            this.emit('close');
         });
         this.conn.on('close', () => {
             this.state = STATE.UNCONNECTED;
@@ -172,7 +183,7 @@ export class OwnConnection extends EventEmitter {
         this.buf += data.toString();
 
         while (this.buf.length > 0) {
-            const m = this.buf.match(/(\*.+?##)([\s\S]*)/);
+            const m = this.buf.match(/^(\*.+?##)([\s\S]*)$/);
             if (!m) {
                 if (this.buf.length > 4096) {
                     this.log.warn('conn:%s buffer overflow (%d bytes), discarding', this.id, this.buf.length);
@@ -259,6 +270,10 @@ export class OwnMonitor extends EventEmitter {
     reconnectSeconds: number;
     reconnectAttempts: number;
     authFailed: boolean;
+    /** True while a keep-alive probe is in flight — prevents parallel probes
+     *  when a delayed `done` callback overlaps with the next checkTimeout tick.
+     *  Non-private: asserted by the test suite. */
+    checkInFlight: boolean;
 
     constructor(client: OwnClient) {
         super();
@@ -270,6 +285,7 @@ export class OwnMonitor extends EventEmitter {
         this.reconnectSeconds = 30;
         this.reconnectAttempts = 0;
         this.authFailed = false;
+        this.checkInFlight = false;
     }
 
     private closeConnection(): void {
@@ -282,6 +298,7 @@ export class OwnMonitor extends EventEmitter {
 
     connect(): void {
         this.nbCheck = 0;
+        this.checkInFlight = false;
         clearTimeout(this.reconnectTimeout);
         this.reconnectTimeout = undefined;
         this.client.log.info('Start monitoring MyHome server');
@@ -307,11 +324,22 @@ export class OwnMonitor extends EventEmitter {
         this.resetAutoConnectTimeout();
     }
 
-    checkMonitor(): void {
-        this.client.sendCommand({
+    /** Dispatch a keep-alive probe. Returns true if a probe was actually sent this tick,
+     *  false if it was skipped (previous probe still in flight) or dropped (queue full) —
+     *  the caller uses this to avoid counting a non-dispatched tick as a failed check. */
+    checkMonitor(): boolean {
+        if (this.checkInFlight) {
+            // A previous probe hasn't resolved yet — skip this tick to avoid
+            // stacking parallel `*#13**15##` commands on the queue.
+            this.client.log.debug('Monitor: skipping keep-alive probe, previous one still in flight');
+            return false;
+        }
+        this.checkInFlight = true;
+        const queued = this.client.sendCommand({
             command: '*#13**15##',
             stopon: PKT.ACK,
             done: (pkt: string | null) => {
+                this.checkInFlight = false;
                 if (pkt !== null) {
                     const connAlive = this.connection !== null && this.connection.state === STATE.CONNECTED;
                     if (!connAlive) {
@@ -323,9 +351,24 @@ export class OwnMonitor extends EventEmitter {
                         this.resetCheck();
                         this.resetAutoConnectTimeout();
                     }
+                } else {
+                    // Probe timed out or command queue dropped the packet: leave nbCheck as-is
+                    // so the next checkTimeout tick counts as another failed probe. Do NOT
+                    // reset the timer here — the outer resetAutoConnectTimeout() armed by
+                    // restartConnection() will fire again after reconnectSeconds.
+                    this.client.log.debug('Monitor: keep-alive probe timed out or failed to send');
                 }
             },
         });
+        if (!queued) {
+            // Queue was full: sendCommand dropped the probe and will never invoke `done`.
+            // Reset the in-flight flag now, otherwise every future checkMonitor() tick would
+            // short-circuit at the guard above and keep-alive probes would stop forever.
+            this.checkInFlight = false;
+            this.client.log.debug('Monitor: keep-alive probe not queued (queue full)');
+            return false;
+        }
+        return true;
     }
 
     resetCheck(): void {
@@ -344,8 +387,12 @@ export class OwnMonitor extends EventEmitter {
             return;
         }
         if (this.nbCheck < 3) {
-            this.nbCheck++;
-            this.checkMonitor();
+            // Only count a tick toward the dead-connection threshold if a probe was actually
+            // dispatched. A tick skipped because the previous probe is still in flight (slow
+            // gateway) must not push us toward a spurious reconnect.
+            if (this.checkMonitor()) {
+                this.nbCheck++;
+            }
             this.resetAutoConnectTimeout();
         } else {
             clearTimeout(this.checkTimeout);
@@ -362,6 +409,7 @@ export class OwnMonitor extends EventEmitter {
         clearTimeout(this.reconnectTimeout);
         this.checkTimeout = undefined;
         this.reconnectTimeout = undefined;
+        this.checkInFlight = false;
         this.closeConnection();
         this.removeAllListeners();
     }

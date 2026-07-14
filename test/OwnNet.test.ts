@@ -317,20 +317,24 @@ describe('OwnMonitor reconnect logic', () => {
         const commands: CommandParams[] = [];
         return {
             log: { info: function () {}, debug: function () {}, warn: function () {}, error: function () {}, success: function () {} } as unknown as import('homebridge').Logging,
-            sendCommand: function (params: CommandParams) { commands.push(params); },
+            sendCommand: function (params: CommandParams) { commands.push(params); return true; },
             newConnection: function () { return null as unknown as OwnConnection; },
             commands: commands,
         };
     }
 
-    it('nbCheck increments on each restartConnection call when < 3', () => {
+    it('nbCheck increments on each restartConnection call when < 3 (probe resolved between ticks)', () => {
         const client = makeMockClient();
         const monitor = new OwnMonitor(client as unknown as OwnClient);
         assert.equal(monitor.nbCheck, 0);
+        // Each tick dispatches a probe and increments; resolve it (failure) so the next tick
+        // is not skipped as "still in flight". Failure keeps nbCheck as-is (does not reset).
         monitor.restartConnection();
         assert.equal(monitor.nbCheck, 1);
+        client.commands[client.commands.length - 1].done!(null, -1);
         monitor.restartConnection();
         assert.equal(monitor.nbCheck, 2);
+        client.commands[client.commands.length - 1].done!(null, -1);
         clearTimeout(monitor.checkTimeout);
         clearTimeout(monitor.reconnectTimeout);
     });
@@ -396,6 +400,32 @@ describe('OwnMonitor reconnect logic', () => {
         const captured = client.commands[client.commands.length - 1];
         captured.done!(null, -1);
         assert.equal(monitor.nbCheck, 3);
+        clearTimeout(monitor.checkTimeout);
+        clearTimeout(monitor.reconnectTimeout);
+    });
+
+    it('a dropped keep-alive probe (queue full) resets checkInFlight so probes are not deadlocked', () => {
+        const client = makeMockClient();
+        // Simulate a full command queue: sendCommand drops the probe and returns false.
+        client.sendCommand = function () { return false; };
+        const monitor = new OwnMonitor(client as unknown as OwnClient);
+        monitor.checkMonitor();
+        assert.equal(monitor.checkInFlight, false,
+            'checkInFlight must be reset when the probe is not queued, else all future probes are skipped');
+        clearTimeout(monitor.checkTimeout);
+        clearTimeout(monitor.reconnectTimeout);
+    });
+
+    it('a skipped tick (previous probe still in flight) does not count toward the dead-connection threshold', () => {
+        const client = makeMockClient();
+        // sendCommand enqueues but never resolves `done`, so the probe stays in flight.
+        const monitor = new OwnMonitor(client as unknown as OwnClient);
+        monitor.nbCheck = 0;
+        monitor.restartConnection();      // dispatches a probe (in flight), nbCheck → 1
+        assert.equal(monitor.nbCheck, 1);
+        monitor.restartConnection();      // probe still in flight → tick skipped, nbCheck stays 1
+        assert.equal(monitor.nbCheck, 1,
+            'a skipped in-flight tick must not advance nbCheck toward a spurious reconnect');
         clearTimeout(monitor.checkTimeout);
         clearTimeout(monitor.reconnectTimeout);
     });

@@ -558,6 +558,121 @@ describe('OwnBlindAccessory', () => {
             'PositionState must remain STOPPED in HomeKit despite spurious packet');
     });
 
+    it('post-STOP grace window does NOT filter a real manual command after a HomeKit STOP', () => {
+        // Bug fix: previously, if HomeKit sent a STOP (or a HomeKit-initiated move ended
+        // with an auto-STOP), the grace window would arm and swallow the next direction
+        // packet — meaning a user pressing the wall switch DOWN 100 ms after a HomeKit
+        // STOP saw the blind move but HomeKit showed STOPPED.
+        // Post-fix: grace is only armed when the STOP is a *physical* one (i.e. NOT the
+        // echo of a HomeKit command).
+        handler.position = 50;
+        handler.target = 50;
+        handler.state = POSITION_STATE.INCREASING;
+        handler.homeKitMovement = true;
+        handler.commandSent = true;
+        handler.expectedState = POSITION_STATE.STOPPED; // simulate a moveStop() just sent
+        handler.homeKitStopPending = true;              // moveStop() marks its STOP in flight
+        // Echo of the HomeKit STOP command
+        handler.onData('*2*0*23##');
+        assert.equal(handler.state, POSITION_STATE.STOPPED);
+
+        // 100 ms later user presses DOWN on the wall switch — this must be processed.
+        handler.onData('*2*2*23##');
+        assert.equal(handler.state, POSITION_STATE.DECREASING,
+            'real manual DOWN after HomeKit STOP must NOT be filtered by the grace window');
+    });
+
+    it('a physical STOP (no HomeKit STOP in flight) arms the post-STOP grace window', () => {
+        // Complement to the test above: when homeKitStopPending is false the STOP is physical,
+        // so the F454 grace window MUST arm and swallow exactly one spurious direction packet.
+        handler.position = 50;
+        handler.target = 50;
+        handler.state = POSITION_STATE.DECREASING;
+        handler.homeKitMovement = false;
+        handler.commandSent = false;
+        handler.homeKitStopPending = false;
+        // Physical wall-switch STOP
+        handler.onData('*2*0*23##');
+        assert.equal(handler.state, POSITION_STATE.STOPPED);
+        assert.equal(handler.postStopGrace, true, 'grace window must arm for a physical STOP');
+        // The spurious F454 direction packet within the grace window is ignored.
+        handler.onData('*2*2*23##');
+        assert.equal(handler.state, POSITION_STATE.STOPPED,
+            'spurious post-STOP direction packet must be filtered by the grace window');
+    });
+
+    it('target syncs to position while a manual movement is in progress', () => {
+        // Bug fix: previously, during a wall-switch UP/DOWN, `target` kept its stale HomeKit
+        // value while `position` advanced — HomeKit displayed TargetPosition inconsistent
+        // with the physically moving blind. Post-fix: `target` and the HomeKit characteristic
+        // are synced together at 10% boundaries (throttled to avoid HAP flooding); between
+        // boundaries `target` stays put so the STOP branch can do the final authoritative sync.
+        const svc = accessory.services['WindowCovering'];
+        handler.position = 30;
+        handler.target = 80; // stale target from a previous HomeKit command
+        handler.state = POSITION_STATE.INCREASING;
+        handler.homeKitMovement = false;
+
+        handler.evaluatePosition(); // one manual tick UP: position 30→31 (not a boundary)
+        assert.equal(handler.position, 31);
+        assert.equal(handler.target, 80,
+            'between boundaries target is left diverged so the STOP branch can finalise it');
+
+        // Advance to a 10% boundary (position 40) where target + characteristic sync fires.
+        for (let i = 0; i < 9; i++) handler.evaluatePosition();
+        assert.equal(handler.position, 40);
+        assert.equal(handler.target, 40,
+            'target must be synced to live position at a 10% boundary');
+        assert.equal(svc.characteristics['TargetPosition'].value, 40,
+            'HomeKit TargetPosition must be pushed at 10% boundaries during manual movement');
+    });
+
+    it('manual target sync is suppressed during a status query', () => {
+        // Regression guard: the INCREASING/DECREASING branches must honour !inStatusQuery
+        // (like the STOPPED branch) so a status-query response for an already-moving blind
+        // does not overwrite a meaningful prior HomeKit target.
+        handler.position = 40;
+        handler.target = 80; // meaningful prior HomeKit target
+        handler.state = POSITION_STATE.INCREASING;
+        handler.homeKitMovement = false;
+        handler.inStatusQuery = true;
+
+        handler.evaluatePosition(); // status-query tick: position 40→41
+        assert.equal(handler.position, 41);
+        assert.equal(handler.target, 80,
+            'target must NOT be clobbered by a status-query response while moving');
+    });
+
+    it('direction reversal without intervening STOP cancels stale positionTimeout', () => {
+        // Bug fix: a wall-switch UP immediately followed by DOWN (without any STOP between
+        // them) previously left the UP's positionTimeout armed, delaying the DOWN tick by
+        // one tick period. Post-fix: reversal clears the stale timeout so DOWN starts
+        // tracking immediately.
+        handler.position = 50;
+        handler.target = 50;
+        handler.state = POSITION_STATE.STOPPED;
+        handler.homeKitMovement = false;
+        // First: UP
+        handler.onData('*2*1*23##');
+        assert.equal(handler.state, POSITION_STATE.INCREASING);
+        assert.ok(handler.positionTimeout !== undefined,
+            'positionTimeout must be armed after first movement');
+        const firstTimeout = handler.positionTimeout;
+        // Second: DOWN — no STOP in between
+        handler.onData('*2*2*23##');
+        assert.equal(handler.state, POSITION_STATE.DECREASING);
+        assert.notEqual(handler.positionTimeout, firstTimeout,
+            'positionTimeout must be reset by the reversal');
+    });
+
+    it('BLIND_END_STOP_SAFETY_MS constant exists and is a positive number', () => {
+        // Simple sanity check that the safety-net timeout is defined. Full behaviour
+        // is exercised via integration since it depends on real setTimeout.
+        // eslint-disable-next-line @typescript-eslint/no-require-imports
+        const { BLIND_END_STOP_SAFETY_MS } = require('../lib/utils') as { BLIND_END_STOP_SAFETY_MS: number };
+        assert.ok(typeof BLIND_END_STOP_SAFETY_MS === 'number' && BLIND_END_STOP_SAFETY_MS > 0);
+    });
+
     it('STOPPED during HomeKit movement does NOT overwrite target', () => {
         handler.state = POSITION_STATE.STOPPED;
         handler.homeKitMovement = true;
@@ -941,6 +1056,25 @@ describe('OwnThermostatAccessory', () => {
         assert.equal(handler.targetTemperature, 18);
     });
 
+    it('DIM 14 mode byte adopts HEAT/COOL only when no explicit choice is set', () => {
+        // From OFF (no explicit user choice) a DIM 14 setpoint in Heat mode adopts HEAT.
+        handler.targetHeatingCoolingState = HEATING_COOLING_TARGET.OFF;
+        handler.onData('*#4*1*14*0210*1##');
+        assert.equal(handler.targetHeatingCoolingState, HEATING_COOLING_TARGET.HEAT,
+            'DIM 14 Heat mode should set HEAT when starting from OFF');
+    });
+
+    it('DIM 14 mode byte does NOT override an explicit HEAT/COOL choice', () => {
+        // Regression: a passive setpoint broadcast in Heat mode must not flip a user who
+        // deliberately selected COOL in HomeKit.
+        handler.targetHeatingCoolingState = HEATING_COOLING_TARGET.COOL;
+        handler.onData('*#4*1*14*0210*1##');
+        assert.equal(handler.targetHeatingCoolingState, HEATING_COOLING_TARGET.COOL,
+            'DIM 14 Heat setpoint must not override the user\'s explicit COOL choice');
+        assert.equal(handler.targetTemperature, 21,
+            'the setpoint temperature is still applied even when the mode is not adopted');
+    });
+
     it('onData valve status sets heating', () => {
         handler.onData('*#4*1*19*0*1##');
         assert.equal(handler.heatingCoolingState, HEATING_COOLING_CURRENT.HEAT);
@@ -1102,40 +1236,14 @@ describe('OwnScenarioAccessory', () => {
         handler.onData('*0*5*0##');
     });
 
-    it('asButton: true creates StatelessProgrammableSwitch and removes Switch', () => {
+    it('removes any pre-existing StatelessProgrammableSwitch left over from the deprecated asButton mode', () => {
         const p = makeMockPlatform();
         const a = makeMockAccessory();
         a.addService('AccessoryInformation');
-        a.addService('Switch'); // simulate previous run with asButton=false
-        const h = new OwnScenarioAccessory(p as unknown as P, a as unknown as A, { id: 7, name: 'btn', asButton: true });
-        assert.ok(a.services['StatelessProgrammableSwitch'], 'StatelessProgrammableSwitch must be created');
-        assert.ok(!a.services['Switch'], 'old Switch must be removed');
-        h.destroy();
-    });
-
-    it('asButton: true activate fires SINGLE_PRESS event and sends scenario command', () => {
-        const p = makeMockPlatform();
-        const a = makeMockAccessory();
-        a.addService('AccessoryInformation');
-        const h = new OwnScenarioAccessory(p as unknown as P, a as unknown as A, { id: 11, name: 'btn', asButton: true });
-        const svc = a.services['StatelessProgrammableSwitch'];
-        p.sendCommandSpy.calls.length = 0;
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        (h as any).activate();
-        const cmds = p.sendCommandSpy.calls.map((c: unknown[]) => (c[0] as { command: string }).command);
-        assert.ok(cmds.includes('*0*11*0##'));
-        assert.equal(svc.characteristics['ProgrammableSwitchEvent'].value, 0);
-        h.destroy();
-    });
-
-    it('asButton: false (legacy) flip removes any pre-existing StatelessProgrammableSwitch', () => {
-        const p = makeMockPlatform();
-        const a = makeMockAccessory();
-        a.addService('AccessoryInformation');
-        a.addService('StatelessProgrammableSwitch');
+        a.addService('StatelessProgrammableSwitch'); // simulate an old install with asButton: true
         const h = new OwnScenarioAccessory(p as unknown as P, a as unknown as A, { id: 13, name: 'sw' });
-        assert.ok(a.services['Switch'], 'Switch must be created in legacy mode');
-        assert.ok(!a.services['StatelessProgrammableSwitch'], 'old StatelessProgrammableSwitch must be removed');
+        assert.ok(a.services['Switch'], 'Switch must be created');
+        assert.ok(!a.services['StatelessProgrammableSwitch'], 'deprecated StatelessProgrammableSwitch must be removed');
         h.destroy();
     });
 });

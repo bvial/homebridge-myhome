@@ -2,6 +2,103 @@
 
 All notable changes to this project are documented here.
 
+## [0.4.7] — Unreleased
+
+### Removed
+- **`asButton` option on scenarios (BREAKING)** — a HomeKit
+  `StatelessProgrammableSwitch` is emit-only in HomeKit: it cannot receive
+  taps from the Home app, so `asButton: true` silently disabled scenario
+  activation. Scenarios are always exposed as an auto-reset Switch now.
+  Existing installs that had `asButton: true` should remove the key from
+  their `config.json`; any leftover SPS service is cleaned up automatically
+  at next startup.
+
+### Fixed
+- **Thermostat DIM 14 mode byte parsed.** Setpoint packets
+  `*#4*<zone>*14*<temp>*<mode>##` now use the second field (`*1` = Heat,
+  `*2` = Cool) to keep HomeKit's `TargetHeatingCoolingState` in sync with
+  gateway-side mode changes. Previously the mode byte was discarded, causing
+  a silent HEAT/COOL desync when the setpoint was updated externally.
+- **AUTO mode confirmation packet no longer logs as error.**
+  `*4*3100*<zone>##` (weekly-program confirmation) was falling into the
+  "not decoded" `log.error` branch, polluting logs on every AUTO switch. It
+  now decodes as "AUTO Weekly Program" at debug level.
+- **Auto-discovered accessories no longer leak as ghosts.** When
+  `discoverDevices()` ran with `autoDiscover: true`, auto-discovered entries
+  were preserved from the `stale` unregister step but then dropped from the
+  in-memory `cachedAccessories` list, leaving them registered in Homebridge
+  but invisible to the plugin. The keeper rule is now consistent between the
+  stale filter and the cache rebuild.
+- **Monitor buffer regex anchored.** The packet-splitting regex in
+  `OwnConnection.onData` now anchors to the start of the buffer (`^…$`),
+  guaranteeing O(n) parsing under all conditions.
+- **Monitor keep-alive probe timeout no longer silent.** `checkMonitor()`
+  now emits a debug log when the probe fails to receive a reply, making
+  gateway saturation visible in the logs.
+
+### Changed
+- **`BLIND_QUEUE_BUSY_THRESHOLD` → `COMMAND_QUEUE_BUSY_THRESHOLD`** in
+  `lib/utils.ts` (old name kept as a deprecated alias). The threshold applies
+  to every accessory's `sendOrThrow`, not just blinds — the new name reflects
+  that scope.
+- **`OwnPlatform` now `implements OwnPlatformLike` explicitly** and the
+  `as unknown as OwnPlatformLike` cast in `createHandler` was removed. Any
+  future divergence between the platform and the interface is now a compile-
+  time error.
+- **Default-name derivation centralized** in the `OwnAccessory` base class.
+  Sub-classes pass their type label (`'light'`, `'blind'`, …) to `super()`
+  instead of mutating `config.name` themselves — one source of truth.
+- **`Restoring cached accessory` logs downgraded from info to debug** to
+  reduce startup noise on large installations.
+
+### Tooling
+- **ESLint now runs `@typescript-eslint`.** Previously the config used only
+  `@eslint/js`, so all `// eslint-disable-next-line @typescript-eslint/...`
+  hints in the source were dead code. Run `npm run lint` to check.
+- **`scan.ts --max-addr` now validates its argument** and falls back to the
+  default (20) with a warning if a non-integer is passed.
+
+### Fixed (second pass)
+- **Dimmer light: brightness slider now syncs the `On` state.** Setting
+  `Brightness > 0` from HomeKit on a lamp that was `On=false` now correctly
+  updates `this.value = true` and pushes `On=true` to HomeKit — previously
+  the lamp turned on physically but the tile stayed showing "off".
+- **Monitor keep-alive: prevent parallel probes.** A `checkInFlight` guard
+  now short-circuits `checkMonitor()` if a previous `*#13**15##` probe is
+  still in flight. Under a slow gateway the previous behaviour could stack
+  two or three concurrent probes on the command queue and trigger a
+  premature reconnect while the gateway was actually responding.
+- **TCP half-close detection.** `OwnConnection` now listens for the socket
+  `end` event and tears down the connection immediately. Previously a
+  gateway that sent FIN without RST left the socket in read-only mode until
+  the 30-second monitor watchdog kicked in.
+
+### Fixed (blind synchronization)
+- **Manual command after HomeKit STOP no longer silently discarded.** The
+  F454 post-STOP grace window (150 ms during which a spurious direction
+  packet is filtered) was previously armed after **every** STOP, including
+  echoes of HomeKit-issued STOPs. As a result, a user who pressed the wall
+  switch UP/DOWN within 150 ms of a HomeKit STOP saw the blind move but
+  HomeKit stayed showing STOPPED. The grace window is now armed only for
+  physical STOPs (i.e. not the echo of a HomeKit command), which is the
+  only situation where the F454 quirk actually happens.
+- **TargetPosition now tracks live position during manual movements.**
+  Previously, while the blind moved physically (wall switch), HomeKit
+  displayed a stale `TargetPosition` inherited from the last HomeKit
+  command, so users saw `TargetPosition ≠ CurrentPosition` for the entire
+  manual movement. Each position tick during a manual movement now updates
+  `TargetPosition` to the live position so the Home app stays consistent.
+- **Rapid direction reversal (UP→DOWN without intervening STOP) tracked
+  immediately.** Previously, the position-tracking timer from the first
+  direction remained armed, delaying the tracking of the new direction by
+  up to one tick period. The reversal now cancels the stale timeout so the
+  new direction starts tracking on the very next tick.
+- **Silent end-stop safety net.** Some gateways do not emit `*2*0*` when
+  the blind reaches its natural end-of-travel — HomeKit's `PositionState`
+  would otherwise stay INCREASING/DECREASING forever. After 3 seconds at
+  position 0 or 100 without a gateway STOP, the plugin now forces the
+  state back to STOPPED and syncs `TargetPosition` to the current position.
+
 ## [0.4.4] — Unreleased
 
 ### Fixed
