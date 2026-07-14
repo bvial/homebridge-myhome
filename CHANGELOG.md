@@ -2,7 +2,23 @@
 
 All notable changes to this project are documented here.
 
+## [0.4.9] — 2026-07-14
+
+### Fixed
+- **Manual (wall-switch) blind operations at an end-stop are no longer ignored
+  (long-standing bug, present since ≤ 0.4.6).** This gateway emits `*2*0*`
+  (STOP) immediately before every direction packet, including manual ones. The
+  post-STOP spurious-packet filter used `position === target` as its "at rest"
+  signal — but at an end-stop (position 0 or 100) that is permanently true, so
+  every manual command issued from a fully-open/closed blind was swallowed as a
+  phantom and never reached HomeKit. The filter now suppresses only a direction
+  packet that **matches the direction the blind was last moving** (the real F454
+  phantom re-emits the same direction); a genuine manual command from an
+  end-stop is the opposite direction and passes through. New field
+  `lastMovingDirection` tracks this; three regression tests added.
+
 ## [0.4.8] — 2026-07-14
+
 
 ### Removed
 - **`asButton` option on scenarios (BREAKING)** — a HomeKit

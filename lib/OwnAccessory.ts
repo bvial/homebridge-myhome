@@ -401,6 +401,13 @@ export class OwnBlindAccessory extends OwnAccessory {
      *  Non-private: read/asserted by the test suite. */
     postStopGrace: boolean;
     private postStopGraceTimeout: ReturnType<typeof setTimeout> | undefined;
+    /** The direction ('1' = INCREASING, '2' = DECREASING) the blind was last observed
+     *  moving. Set whenever state transitions to a moving state; NEVER cleared by a STOP.
+     *  The F454 spurious packet is a phantom re-emission of the SAME direction the blind was
+     *  just moving, so the post-STOP filter suppresses only a direction matching this. A
+     *  genuine manual command from an end-stop is the OPPOSITE direction and must pass through.
+     *  Non-private: read/asserted by the test suite. */
+    lastMovingDirection: string;
     /** True from the moment we send a HomeKit-originated STOP until its echo is received.
      *  Lets onData() distinguish the echo of our own STOP (no F454 spurious-packet quirk,
      *  grace must NOT arm) from a physical wall-switch STOP (quirk fires, grace must arm),
@@ -445,6 +452,7 @@ export class OwnBlindAccessory extends OwnAccessory {
         this.postStopGrace = false;
         this.postStopGraceTimeout = undefined;
         this.homeKitStopPending = false;
+        this.lastMovingDirection = '';
         this.endStopSafetyTimeout = undefined;
 
         this.windowCoveringService = this.initPrimaryService(this.Service.WindowCovering, 'WindowCovering', true);
@@ -649,11 +657,15 @@ export class OwnBlindAccessory extends OwnAccessory {
             const direction = extract[1];
 
             // Some BTicino gateways (F454 confirmed) send a spurious *2*1* or *2*2* immediately
-            // after a wall-switch STOP that does not represent a real new movement. Suppress
-            // exactly ONE such direction packet that arrives during the post-STOP grace window
-            // when no HomeKit movement is in progress and position == target (stable rest).
+            // after a wall-switch STOP that does not represent a real new movement. The phantom
+            // always re-emits the SAME direction the blind was last moving in. Suppress exactly
+            // ONE such direction packet during the post-STOP grace window when no HomeKit movement
+            // is in progress, no command is pending, AND the incoming direction matches the last
+            // known moving direction. A genuine manual command from an end-stop is the OPPOSITE
+            // direction (the only way to leave the end-stop), so it does not match and passes
+            // through — this is what a `position === target` proxy could never distinguish.
             if (this.postStopGrace && direction !== '0' && !this.homeKitMovement
-                && !this.commandSent && this.position === this.target) {
+                && !this.commandSent && direction === this.lastMovingDirection) {
                 this.log.debug('[%s] Ignoring spurious post-STOP direction packet %s', this.id, packet);
                 this.postStopGrace = false;
                 clearTimeout(this.postStopGraceTimeout);
@@ -705,8 +717,10 @@ export class OwnBlindAccessory extends OwnAccessory {
                 }
             } else if (direction === '1') {
                 this.state = this.Characteristic.PositionState.INCREASING;
+                this.lastMovingDirection = '1';
             } else if (direction === '2') {
                 this.state = this.Characteristic.PositionState.DECREASING;
+                this.lastMovingDirection = '2';
             } else {
                 this.log.warn('[%s] Blind unknown direction byte %s in packet %s', this.id, direction, packet);
                 return;

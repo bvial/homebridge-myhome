@@ -541,21 +541,78 @@ describe('OwnBlindAccessory', () => {
     it('post-STOP spurious direction packet (BTicino F454) is suppressed', () => {
         // F454 broadcasts *2*2* (DECREASING) immediately after a wall-switch STOP, which
         // would otherwise be mis-interpreted as a new DOWN movement. The plugin must ignore
-        // this packet when received within ~150ms of the STOP and position == target.
+        // this packet when received within ~150ms of the STOP AND it re-emits the same
+        // direction the blind was just moving in (here: DECREASING).
         const svc = accessory.services['WindowCovering'];
         handler.position = 34;
         handler.target = 34;
         handler.state = POSITION_STATE.STOPPED;
+        handler.lastMovingDirection = '2'; // blind was moving DOWN before the wall-switch STOP
 
         // Simulate the exact F454 sequence observed in field logs:
         //   *2*0* (STOP) → *2*2* (spurious, immediately after)
         handler.onData('*2*0*23##');
         const stateAfterStop = handler.state;
-        handler.onData('*2*2*23##'); // spurious — must be ignored
+        handler.onData('*2*2*23##'); // spurious same-direction re-emission — must be ignored
 
         assert.equal(handler.state, stateAfterStop, 'state must remain STOPPED, not DECREASING');
         assert.equal(svc.characteristics['PositionState'].value, POSITION_STATE.STOPPED,
             'PositionState must remain STOPPED in HomeKit despite spurious packet');
+    });
+
+    it('manual command from an end-stop is NOT filtered (opposite direction to last movement)', () => {
+        // Regression (present since 0.4.6): at an end-stop position === target is permanently
+        // true, so the old `position === target` filter swallowed EVERY manual command issued
+        // from the end-stop. This gateway sends *2*0* (STOP) before every direction packet,
+        // including manual ones. The fix filters only same-direction phantoms, so a genuine
+        // manual DOWN from the top (last movement was UP) must pass through.
+        handler.position = 100;
+        handler.target = 100;
+        handler.state = POSITION_STATE.STOPPED;
+        handler.homeKitMovement = false;
+        handler.commandSent = false;
+        handler.homeKitStopPending = false;
+        handler.lastMovingDirection = '1'; // reached the top by moving UP
+
+        handler.onData('*2*0*23##');                 // gateway STOP that precedes the manual move
+        assert.equal(handler.postStopGrace, true, 'grace window arms on the physical STOP');
+        handler.onData('*2*2*23##');                 // genuine manual DOWN from the wall switch
+        assert.equal(handler.state, POSITION_STATE.DECREASING,
+            'manual DOWN from upper end-stop must NOT be filtered');
+    });
+
+    it('manual UP from lower end-stop is NOT filtered', () => {
+        handler.position = 0;
+        handler.target = 0;
+        handler.state = POSITION_STATE.STOPPED;
+        handler.homeKitMovement = false;
+        handler.commandSent = false;
+        handler.homeKitStopPending = false;
+        handler.lastMovingDirection = '2'; // reached the bottom by moving DOWN
+
+        handler.onData('*2*0*23##');
+        assert.equal(handler.postStopGrace, true);
+        handler.onData('*2*1*23##');                 // genuine manual UP from the wall switch
+        assert.equal(handler.state, POSITION_STATE.INCREASING,
+            'manual UP from lower end-stop must NOT be filtered');
+    });
+
+    it('same-direction phantom after a mid-travel STOP is still suppressed', () => {
+        // The true F454 artifact: blind was moving DOWN, stops, gateway re-emits *2*2*.
+        // Even away from an end-stop this must still be filtered.
+        handler.position = 40;
+        handler.target = 40;
+        handler.state = POSITION_STATE.STOPPED;
+        handler.homeKitMovement = false;
+        handler.commandSent = false;
+        handler.homeKitStopPending = false;
+        handler.lastMovingDirection = '2'; // was moving DOWN before the STOP
+
+        handler.onData('*2*0*23##');
+        assert.equal(handler.postStopGrace, true);
+        handler.onData('*2*2*23##');                 // same-direction phantom
+        assert.equal(handler.state, POSITION_STATE.STOPPED,
+            'same-direction phantom after a mid-travel STOP must still be suppressed');
     });
 
     it('post-STOP grace window does NOT filter a real manual command after a HomeKit STOP', () => {
@@ -591,6 +648,7 @@ describe('OwnBlindAccessory', () => {
         handler.homeKitMovement = false;
         handler.commandSent = false;
         handler.homeKitStopPending = false;
+        handler.lastMovingDirection = '2'; // was moving DOWN; the phantom re-emits DOWN
         // Physical wall-switch STOP
         handler.onData('*2*0*23##');
         assert.equal(handler.state, POSITION_STATE.STOPPED);
