@@ -2,7 +2,7 @@
 
 All notable changes to this project are documented here.
 
-## [0.4.7] — Unreleased
+## [0.4.8] — 2026-07-14
 
 ### Removed
 - **`asButton` option on scenarios (BREAKING)** — a HomeKit
@@ -98,6 +98,37 @@ All notable changes to this project are documented here.
   would otherwise stay INCREASING/DECREASING forever. After 3 seconds at
   position 0 or 100 without a gateway STOP, the plugin now forces the
   state back to STOPPED and syncs `TargetPosition` to the current position.
+
+### Fixed (third pass — code review)
+- **Monitor keep-alive deadlock fixed.** If the command queue was full when a
+  `*#13**15##` probe was sent, `sendCommand` dropped it and never invoked the
+  `done` callback, so the `checkInFlight` guard stayed stuck `true` and every
+  future probe was skipped — the reconnect watchdog silently stopped forever.
+  `checkInFlight` is now reset when the probe is not queued.
+- **TCP half-close (FIN) now actually reconnects.** The `end` handler routed
+  through `destroyConn()`, which removed the socket's `close` listener before
+  `destroy()` fired — so `OwnConnection` never emitted `close` and `OwnMonitor`
+  was never notified. The FIN handler now emits `close` after teardown.
+- **No more spurious reconnects on a slow gateway.** A keep-alive tick skipped
+  because the previous probe is still in flight no longer counts toward the
+  3-strike dead-connection threshold.
+- **Blind: status-query responses no longer clobber the HomeKit target.** The
+  manual-movement `TargetPosition` sync now honours `!inStatusQuery` (matching
+  the STOPPED branch) and is throttled to 10% boundaries to avoid flooding HAP.
+- **Blind: physical STOP during an in-flight HomeKit STOP disambiguated.** The
+  F454 grace window is now gated on a dedicated `homeKitStopPending` flag rather
+  than `commandSent && expectedState`, so a wall-switch STOP that coincides with
+  a HomeKit STOP still arms the grace window and filters the spurious packet.
+- **Blind: end-stop safety timeout derived from travel time** (bounded 1.5–5 s)
+  instead of a fixed 3 s, and it now also pushes `CurrentPosition` when it fires.
+- **Thermostat: DIM 14 mode byte no longer overrides an explicit choice.** A
+  passive setpoint broadcast in Heat/Cool mode is only adopted when HomeKit has
+  no explicit HEAT/COOL selection (OFF/AUTO); authoritative mode changes still
+  arrive via DIM 19 and the central-unit operation-mode packets.
+- **`scan.ts --max-addr` validates the range.** Out-of-range values (0 or > 999)
+  now warn and fall back to the default, not only non-numeric input.
+- **Accessory default name preserves an explicit empty string** (`== null`
+  check instead of a falsy one).
 
 ## [0.4.4] — Unreleased
 
