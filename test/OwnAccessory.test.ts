@@ -571,6 +571,7 @@ describe('OwnBlindAccessory', () => {
         handler.homeKitMovement = true;
         handler.commandSent = true;
         handler.expectedState = POSITION_STATE.STOPPED; // simulate a moveStop() just sent
+        handler.homeKitStopPending = true;              // moveStop() marks its STOP in flight
         // Echo of the HomeKit STOP command
         handler.onData('*2*0*23##');
         assert.equal(handler.state, POSITION_STATE.STOPPED);
@@ -581,23 +582,65 @@ describe('OwnBlindAccessory', () => {
             'real manual DOWN after HomeKit STOP must NOT be filtered by the grace window');
     });
 
+    it('a physical STOP (no HomeKit STOP in flight) arms the post-STOP grace window', () => {
+        // Complement to the test above: when homeKitStopPending is false the STOP is physical,
+        // so the F454 grace window MUST arm and swallow exactly one spurious direction packet.
+        handler.position = 50;
+        handler.target = 50;
+        handler.state = POSITION_STATE.DECREASING;
+        handler.homeKitMovement = false;
+        handler.commandSent = false;
+        handler.homeKitStopPending = false;
+        // Physical wall-switch STOP
+        handler.onData('*2*0*23##');
+        assert.equal(handler.state, POSITION_STATE.STOPPED);
+        assert.equal(handler.postStopGrace, true, 'grace window must arm for a physical STOP');
+        // The spurious F454 direction packet within the grace window is ignored.
+        handler.onData('*2*2*23##');
+        assert.equal(handler.state, POSITION_STATE.STOPPED,
+            'spurious post-STOP direction packet must be filtered by the grace window');
+    });
+
     it('target syncs to position while a manual movement is in progress', () => {
         // Bug fix: previously, during a wall-switch UP/DOWN, `target` kept its stale HomeKit
         // value while `position` advanced — HomeKit displayed TargetPosition inconsistent
-        // with the physically moving blind. Post-fix: each position tick during a manual
-        // movement updates TargetPosition to the live position.
+        // with the physically moving blind. Post-fix: `target` and the HomeKit characteristic
+        // are synced together at 10% boundaries (throttled to avoid HAP flooding); between
+        // boundaries `target` stays put so the STOP branch can do the final authoritative sync.
         const svc = accessory.services['WindowCovering'];
         handler.position = 30;
         handler.target = 80; // stale target from a previous HomeKit command
         handler.state = POSITION_STATE.INCREASING;
         handler.homeKitMovement = false;
 
-        handler.evaluatePosition(); // one manual tick UP: position 30→31
+        handler.evaluatePosition(); // one manual tick UP: position 30→31 (not a boundary)
         assert.equal(handler.position, 31);
-        assert.equal(handler.target, 31,
-            'target must be synced to live position during manual movement');
-        assert.equal(svc.characteristics['TargetPosition'].value, 31,
-            'HomeKit TargetPosition must reflect the live position during manual movement');
+        assert.equal(handler.target, 80,
+            'between boundaries target is left diverged so the STOP branch can finalise it');
+
+        // Advance to a 10% boundary (position 40) where target + characteristic sync fires.
+        for (let i = 0; i < 9; i++) handler.evaluatePosition();
+        assert.equal(handler.position, 40);
+        assert.equal(handler.target, 40,
+            'target must be synced to live position at a 10% boundary');
+        assert.equal(svc.characteristics['TargetPosition'].value, 40,
+            'HomeKit TargetPosition must be pushed at 10% boundaries during manual movement');
+    });
+
+    it('manual target sync is suppressed during a status query', () => {
+        // Regression guard: the INCREASING/DECREASING branches must honour !inStatusQuery
+        // (like the STOPPED branch) so a status-query response for an already-moving blind
+        // does not overwrite a meaningful prior HomeKit target.
+        handler.position = 40;
+        handler.target = 80; // meaningful prior HomeKit target
+        handler.state = POSITION_STATE.INCREASING;
+        handler.homeKitMovement = false;
+        handler.inStatusQuery = true;
+
+        handler.evaluatePosition(); // status-query tick: position 40→41
+        assert.equal(handler.position, 41);
+        assert.equal(handler.target, 80,
+            'target must NOT be clobbered by a status-query response while moving');
     });
 
     it('direction reversal without intervening STOP cancels stale positionTimeout', () => {
@@ -1011,6 +1054,25 @@ describe('OwnThermostatAccessory', () => {
     it('onData target temperature', () => {
         handler.onData('*#4*1*14*0180*3##');
         assert.equal(handler.targetTemperature, 18);
+    });
+
+    it('DIM 14 mode byte adopts HEAT/COOL only when no explicit choice is set', () => {
+        // From OFF (no explicit user choice) a DIM 14 setpoint in Heat mode adopts HEAT.
+        handler.targetHeatingCoolingState = HEATING_COOLING_TARGET.OFF;
+        handler.onData('*#4*1*14*0210*1##');
+        assert.equal(handler.targetHeatingCoolingState, HEATING_COOLING_TARGET.HEAT,
+            'DIM 14 Heat mode should set HEAT when starting from OFF');
+    });
+
+    it('DIM 14 mode byte does NOT override an explicit HEAT/COOL choice', () => {
+        // Regression: a passive setpoint broadcast in Heat mode must not flip a user who
+        // deliberately selected COOL in HomeKit.
+        handler.targetHeatingCoolingState = HEATING_COOLING_TARGET.COOL;
+        handler.onData('*#4*1*14*0210*1##');
+        assert.equal(handler.targetHeatingCoolingState, HEATING_COOLING_TARGET.COOL,
+            'DIM 14 Heat setpoint must not override the user\'s explicit COOL choice');
+        assert.equal(handler.targetTemperature, 21,
+            'the setpoint temperature is still applied even when the mode is not adopted');
     });
 
     it('onData valve status sets heating', () => {

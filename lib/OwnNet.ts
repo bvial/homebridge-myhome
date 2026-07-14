@@ -108,6 +108,7 @@ export class OwnConnection extends EventEmitter {
             this.conn.on('error', () => {});
             this.conn.destroy();
             this.conn = null;
+            this.state = STATE.UNCONNECTED;
         }
     }
 
@@ -125,13 +126,15 @@ export class OwnConnection extends EventEmitter {
             this.log.error('Socket error: %s', error.message);
             this.state = STATE.UNCONNECTED;
         });
-        // Peer half-close: the gateway sent FIN but not RST. Without this handler
-        // Node would leave the socket in read-only mode indefinitely, so the
-        // monitor watchdog is the only line of defense (30 s). Treat FIN as a
-        // full close and tear the socket down immediately.
+        // Peer half-close: the gateway sent FIN but not RST. Without this handler Node would
+        // leave the socket in read-only mode indefinitely. Tear the socket down AND notify
+        // subscribers via 'close' — routing through this.end()/destroyConn() alone would strip
+        // the 'close' listener before destroy() fires, swallowing the disconnect notification
+        // and preventing OwnMonitor from reconnecting.
         this.conn.on('end', () => {
             this.log.debug('conn:%s peer half-closed connection (FIN)', this.id);
-            this.end();
+            this.destroyConn();
+            this.emit('close');
         });
         this.conn.on('close', () => {
             this.state = STATE.UNCONNECTED;
@@ -268,8 +271,9 @@ export class OwnMonitor extends EventEmitter {
     reconnectAttempts: number;
     authFailed: boolean;
     /** True while a keep-alive probe is in flight — prevents parallel probes
-     *  when a delayed `done` callback overlaps with the next checkTimeout tick. */
-    private checkInFlight: boolean;
+     *  when a delayed `done` callback overlaps with the next checkTimeout tick.
+     *  Non-private: asserted by the test suite. */
+    checkInFlight: boolean;
 
     constructor(client: OwnClient) {
         super();
@@ -320,15 +324,18 @@ export class OwnMonitor extends EventEmitter {
         this.resetAutoConnectTimeout();
     }
 
-    checkMonitor(): void {
+    /** Dispatch a keep-alive probe. Returns true if a probe was actually sent this tick,
+     *  false if it was skipped (previous probe still in flight) or dropped (queue full) —
+     *  the caller uses this to avoid counting a non-dispatched tick as a failed check. */
+    checkMonitor(): boolean {
         if (this.checkInFlight) {
             // A previous probe hasn't resolved yet — skip this tick to avoid
             // stacking parallel `*#13**15##` commands on the queue.
             this.client.log.debug('Monitor: skipping keep-alive probe, previous one still in flight');
-            return;
+            return false;
         }
         this.checkInFlight = true;
-        this.client.sendCommand({
+        const queued = this.client.sendCommand({
             command: '*#13**15##',
             stopon: PKT.ACK,
             done: (pkt: string | null) => {
@@ -353,6 +360,15 @@ export class OwnMonitor extends EventEmitter {
                 }
             },
         });
+        if (!queued) {
+            // Queue was full: sendCommand dropped the probe and will never invoke `done`.
+            // Reset the in-flight flag now, otherwise every future checkMonitor() tick would
+            // short-circuit at the guard above and keep-alive probes would stop forever.
+            this.checkInFlight = false;
+            this.client.log.debug('Monitor: keep-alive probe not queued (queue full)');
+            return false;
+        }
+        return true;
     }
 
     resetCheck(): void {
@@ -371,8 +387,12 @@ export class OwnMonitor extends EventEmitter {
             return;
         }
         if (this.nbCheck < 3) {
-            this.nbCheck++;
-            this.checkMonitor();
+            // Only count a tick toward the dead-connection threshold if a probe was actually
+            // dispatched. A tick skipped because the previous probe is still in flight (slow
+            // gateway) must not push us toward a spurious reconnect.
+            if (this.checkMonitor()) {
+                this.nbCheck++;
+            }
             this.resetAutoConnectTimeout();
         } else {
             clearTimeout(this.checkTimeout);

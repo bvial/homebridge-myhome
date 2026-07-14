@@ -15,7 +15,8 @@ import {
     BLIND_COMMAND_ECHO_TIMEOUT_MS,
     BLIND_INIT_CALIBRATION_MARGIN_MS,
     BLIND_POST_STOP_GRACE_MS,
-    BLIND_END_STOP_SAFETY_MS,
+    BLIND_END_STOP_SAFETY_MIN_MS,
+    BLIND_END_STOP_SAFETY_MAX_MS,
     COMMAND_QUEUE_BUSY_THRESHOLD,
     BLIND_MIN_TICK_MS,
     ENERGY_POLL_INTERVAL_MS,
@@ -104,8 +105,9 @@ class OwnAccessory {
         // Derive a display name if the user didn't provide one. `defaultType` is the
         // short kind label ('light', 'blind', 'thermostat', ...) supplied by each subclass;
         // the resulting default is `<type>-<id>`. We fall back to just the id when no
-        // defaultType is provided (older callers).
-        if (!config.name) {
+        // defaultType is provided (older callers). Use a null/undefined check (not a falsy
+        // one) so an explicit empty-string name is left as-is rather than overwritten.
+        if (config.name == null) {
             config.name = defaultType ? `${defaultType}-${config.id}` : String(config.id);
         }
 
@@ -389,14 +391,22 @@ export class OwnBlindAccessory extends OwnAccessory {
     initPhase: boolean;
     homeKitMovement: boolean;
     private calibrateOnStart: boolean;
-    private inStatusQuery: boolean;
+    /** Non-private: read/asserted by the test suite. */
+    inStatusQuery: boolean;
     private statusQueryTimeout: ReturnType<typeof setTimeout> | undefined;
     private initTimeout: ReturnType<typeof setTimeout> | undefined;
     /** True for a brief grace window after a STOP packet, used to suppress the
      *  spurious post-STOP direction packet some BTicino gateways emit
-     *  (F454 reliably sends *2*2* a few ms after a wall-switch STOP). */
-    private postStopGrace: boolean;
+     *  (F454 reliably sends *2*2* a few ms after a wall-switch STOP).
+     *  Non-private: read/asserted by the test suite. */
+    postStopGrace: boolean;
     private postStopGraceTimeout: ReturnType<typeof setTimeout> | undefined;
+    /** True from the moment we send a HomeKit-originated STOP until its echo is received.
+     *  Lets onData() distinguish the echo of our own STOP (no F454 spurious-packet quirk,
+     *  grace must NOT arm) from a physical wall-switch STOP (quirk fires, grace must arm),
+     *  even when a physical STOP happens to arrive while a HomeKit STOP is still in flight.
+     *  Non-private: set by the test suite to simulate an in-flight HomeKit STOP. */
+    homeKitStopPending: boolean;
     /** Safety timeout for silent physical end-stops — some gateways do NOT emit
      *  `*2*0*` when the motor reaches its natural end-of-travel. Without this,
      *  HomeKit's PositionState would stay INCREASING/DECREASING forever. */
@@ -434,6 +444,7 @@ export class OwnBlindAccessory extends OwnAccessory {
         this.initTimeout = undefined;
         this.postStopGrace = false;
         this.postStopGraceTimeout = undefined;
+        this.homeKitStopPending = false;
         this.endStopSafetyTimeout = undefined;
 
         this.windowCoveringService = this.initPrimaryService(this.Service.WindowCovering, 'WindowCovering', true);
@@ -567,6 +578,7 @@ export class OwnBlindAccessory extends OwnAccessory {
             this.updateStatus();
         }
         this.commandSent = false;
+        this.homeKitStopPending = false;
         clearTimeout(this.packetTimeout);
     }
 
@@ -581,6 +593,7 @@ export class OwnBlindAccessory extends OwnAccessory {
         this.log.info(`[${this.id}] Blind sending stop`);
         this.homeKitMovement = false;
         this.expectedState = this.Characteristic.PositionState.STOPPED;
+        this.homeKitStopPending = true;
         this.startTimerCommand();
         const queued = this.controller.sendCommand({
             command: `*2*0*${this.id}##`,
@@ -590,6 +603,7 @@ export class OwnBlindAccessory extends OwnAccessory {
         if (!queued) {
             this.log.warn('[%s] Blind STOP dropped: queue full', this.id);
             this.commandSent = false;
+            this.homeKitStopPending = false;
         }
     }
 
@@ -654,16 +668,15 @@ export class OwnBlindAccessory extends OwnAccessory {
             }
 
             const prevState = this.state;
-            // Capture whether this incoming packet is the echo of a HomeKit STOP command
-            // BEFORE endTimerCommand() clears commandSent. Used to gate postStopGrace so it
-            // arms only on physical (wall-switch) STOPs — the ones that trigger the F454's
-            // spurious direction-packet quirk. Post-HomeKit-STOP packets never suffer that
-            // quirk, and arming the grace there would swallow a real manual command issued
-            // in the following 150 ms.
-            const isEchoOfHomeKitStop = direction === '0'
-                && this.commandSent
-                && this.expectedState === this.Characteristic.PositionState.STOPPED;
+            // Distinguish the echo of our own HomeKit STOP from a physical (wall-switch) STOP.
+            // Only moveStop() sets homeKitStopPending, and it is cleared the moment any STOP
+            // echo is consumed below — so it is true ONLY during the genuine in-flight window
+            // of a HomeKit STOP, not left sticky like (commandSent && expectedState) was.
+            // Our own STOP does not trigger the F454 spurious-direction quirk, so the grace
+            // window must arm only for physical STOPs (homeKitStopPending === false).
+            const isEchoOfHomeKitStop = direction === '0' && this.homeKitStopPending;
             if (direction === '0') {
+                this.homeKitStopPending = false;
                 const wasDecreasing = this.state === this.Characteristic.PositionState.DECREASING;
                 this.state = this.Characteristic.PositionState.STOPPED;
                 // Gateway did emit STOP — clear the end-stop safety net.
@@ -751,10 +764,7 @@ export class OwnBlindAccessory extends OwnAccessory {
             // For manual (wall-switch) movements, HomeKit still holds the previous target
             // from the last HomeKit command. Sync it to the live position so the Home app
             // doesn't display a stale TargetPosition while the blind is physically moving.
-            if (!this.homeKitMovement && this.target !== this.position) {
-                this.target = this.position;
-                this.windowCoveringService.updateCharacteristic(this.Characteristic.TargetPosition, this.target);
-            }
+            this.syncManualTarget();
             if (this.homeKitMovement && this.position >= this.target) {
                 this.moveStop();
             } else if (!this.homeKitMovement && this.position >= 100) {
@@ -768,10 +778,7 @@ export class OwnBlindAccessory extends OwnAccessory {
             if (this.position > 0) this.position--;
             if (this.position % 10 === 0 || this.position <= this.target)
                 this.log.debug(`[${this.id}] Blind moving DOWN pos:${this.position} target:${this.target}`);
-            if (!this.homeKitMovement && this.target !== this.position) {
-                this.target = this.position;
-                this.windowCoveringService.updateCharacteristic(this.Characteristic.TargetPosition, this.target);
-            }
+            this.syncManualTarget();
             if (!this.initPhase && this.homeKitMovement && this.position <= this.target) {
                 this.moveStop();
             } else if (this.initPhase && this.position === 0) {
@@ -852,12 +859,32 @@ export class OwnBlindAccessory extends OwnAccessory {
             else         this.moveDown();
             return false;
         }
-        // state === correctDir
+        // Already moving in the correct direction.
         if (!this.commandSent && !this.positionTimeout) {
             // Position tracking was cancelled mid-flight (rapid retarget). Re-enable tracking.
             this.homeKitMovement = true;
         }
         return false;
+    }
+
+    /**
+     * During a manual (wall-switch) movement HomeKit still holds the target from the last
+     * HomeKit command. Keep `target` in step with the live position so the Home app does not
+     * show a stale TargetPosition. Guarded by `!inStatusQuery` (matching the STOPPED branch)
+     * so status-query responses for an already-moving blind don't overwrite a meaningful
+     * prior target. The HomeKit characteristic push is throttled to 10% boundaries (plus the
+     * end-stops) to avoid flooding HAP with ~100 updates per full travel.
+     */
+    private syncManualTarget(): void {
+        if (this.homeKitMovement || this.inStatusQuery || this.target === this.position) return;
+        // Throttle to 10% boundaries (and the end-stops) to avoid flooding HAP with ~100
+        // updates per full travel. We update `this.target` and push the characteristic
+        // together so they stay consistent — leaving `this.target` diverged between
+        // boundaries lets the STOPPED branch perform the final authoritative sync on STOP.
+        if (this.position % 10 === 0 || this.position === 0 || this.position === 100) {
+            this.target = this.position;
+            this.windowCoveringService.updateCharacteristic(this.Characteristic.TargetPosition, this.target);
+        }
     }
 
     /**
@@ -868,6 +895,13 @@ export class OwnBlindAccessory extends OwnAccessory {
      */
     private armEndStopSafetyTimeout(): void {
         clearTimeout(this.endStopSafetyTimeout);
+        // Derive the wait from the blind's own tick rate: allow a few ticks' worth of grace
+        // for a delayed gateway STOP, clamped so fast blinds don't linger and slow blinds
+        // with a legitimately late STOP aren't cut off mid-travel.
+        const delay = Math.min(
+            BLIND_END_STOP_SAFETY_MAX_MS,
+            Math.max(BLIND_END_STOP_SAFETY_MIN_MS, this.msPerPercent(this.position) * 5),
+        );
         this.endStopSafetyTimeout = setTimeout(() => {
             this.endStopSafetyTimeout = undefined;
             if (this.state === this.Characteristic.PositionState.STOPPED) return;
@@ -876,8 +910,11 @@ export class OwnBlindAccessory extends OwnAccessory {
             this.windowCoveringService.updateCharacteristic(this.Characteristic.PositionState, this.state);
             this.target = this.position;
             this.windowCoveringService.updateCharacteristic(this.Characteristic.TargetPosition, this.target);
+            // Push CurrentPosition too: if the timer fired before the position reached an exact
+            // 0/100, HomeKit could otherwise show a CurrentPosition inconsistent with STOPPED.
+            this.windowCoveringService.updateCharacteristic(this.Characteristic.CurrentPosition, this.position);
             this.cachePosition();
-        }, BLIND_END_STOP_SAFETY_MS);
+        }, delay);
     }
 
     startMoveTracking(): void {
@@ -907,6 +944,7 @@ export class OwnBlindAccessory extends OwnAccessory {
         clearTimeout(this.endStopSafetyTimeout);
         this.endStopSafetyTimeout = undefined;
         this.postStopGrace = false;
+        this.homeKitStopPending = false;
         this.inStatusQuery = false;
         this.commandSent = false;
         this.homeKitMovement = false;
@@ -1096,17 +1134,25 @@ export class OwnThermostatAccessory extends OwnAccessory {
         } else if ((extract = packet.match(/^\*#4\*[\d#]+\*14\*(\d+)\*(\d+)##$/))) {
             // DIM 14 = Setpoint temperature. Second value is the mode byte:
             //   *1 = Heat, *2 = Cool, *3 = Generic (mode not enforced).
-            // Reconcile HomeKit's TargetHeatingCoolingState so that a setpoint received
-            // in COOL mode while HomeKit is in HEAT (or vice versa) is not silently
-            // dropped as a stale reading.
             this.updateCharacteristicTargetTemperature(OwnProtcol.decodeTemperature(extract[1]));
+            // The mode byte here rides along with a *setpoint* report, which the gateway also
+            // broadcasts passively (status refresh, reconnect) — it is NOT an authoritative
+            // mode-change event. Only adopt it when HomeKit has no explicit HEAT/COOL choice
+            // (currently OFF or AUTO); otherwise a passive broadcast could silently flip the
+            // user's deliberate HEAT↔COOL selection. Authoritative mode changes still arrive
+            // via DIM 19 and the central-unit operation-mode packets below.
             const modeByte = extract[2];
-            if (modeByte === '1') {
-                this.updateCharacteristicTargetHeatingCoolingState(this.Characteristic.TargetHeatingCoolingState.HEAT);
-            } else if (modeByte === '2') {
-                this.updateCharacteristicTargetHeatingCoolingState(this.Characteristic.TargetHeatingCoolingState.COOL);
+            const TargetState = this.Characteristic.TargetHeatingCoolingState;
+            const hasExplicitChoice = this.targetHeatingCoolingState === TargetState.HEAT
+                || this.targetHeatingCoolingState === TargetState.COOL;
+            if (!hasExplicitChoice) {
+                if (modeByte === '1') {
+                    this.updateCharacteristicTargetHeatingCoolingState(TargetState.HEAT);
+                } else if (modeByte === '2') {
+                    this.updateCharacteristicTargetHeatingCoolingState(TargetState.COOL);
+                }
+                // modeByte === '3' (Generic) leaves the current target state untouched.
             }
-            // modeByte === '3' (Generic) leaves the current target state untouched.
         } else if ((extract = packet.match(/^\*#4\*[\d#]+\*19\*(\d)\*(\d)##$/))) {
             const CV = extract[1];
             const HV = extract[2];

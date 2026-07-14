@@ -25,7 +25,8 @@ const password = positional[2] ?? '';
 
 const maxAddrIdx = argv.indexOf('--max-addr');
 const maxAddrRaw = maxAddrIdx !== -1 ? parseInt(argv[maxAddrIdx + 1] ?? '', 10) : NaN;
-const maxAddr    = (!isNaN(maxAddrRaw) && maxAddrRaw >= 1 && maxAddrRaw <= 999) ? maxAddrRaw : 20;
+const maxAddrValid = !isNaN(maxAddrRaw) && maxAddrRaw >= 1 && maxAddrRaw <= 999;
+const maxAddr    = maxAddrValid ? maxAddrRaw : 20;
 const verbose    = argv.includes('--verbose');
 
 if (!host) {
@@ -33,8 +34,8 @@ if (!host) {
     process.exit(1);
 }
 
-if (maxAddrIdx !== -1 && isNaN(maxAddrRaw)) {
-    console.error(`[warn] --max-addr requires a positive integer; falling back to default ${maxAddr}`);
+if (maxAddrIdx !== -1 && !maxAddrValid) {
+    console.error(`[warn] --max-addr requires an integer in 1..999; falling back to default ${maxAddr}`);
 }
 
 // ─── silent logger ────────────────────────────────────────────────────────────

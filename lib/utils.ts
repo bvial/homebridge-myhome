@@ -58,7 +58,14 @@ export const BLIND_POST_STOP_GRACE_MS = 150;
 /** Safety timeout for silent physical end-stops — if the blind reaches 0% or 100%
  *  during a non-HomeKit movement and the gateway never emits a STOP packet, force
  *  the state back to STOPPED after this delay so HomeKit's PositionState doesn't
- *  stay INCREASING/DECREASING indefinitely. */
+ *  stay INCREASING/DECREASING indefinitely. The effective delay is derived per-blind
+ *  from its tick rate (see `armEndStopSafetyTimeout`); these bound that derivation so
+ *  fast blinds don't linger for seconds and slow blinds with a legitimately delayed
+ *  STOP aren't cut off mid-travel. */
+export const BLIND_END_STOP_SAFETY_MIN_MS = 1500;
+export const BLIND_END_STOP_SAFETY_MAX_MS = 5000;
+/** @deprecated Superseded by the derived floor/cap above. Retained as the fallback
+ *  floor value and for the existing sanity test. */
 export const BLIND_END_STOP_SAFETY_MS = 3000;
 /** Minimum interval between blind position ticks (slat zone floor) */
 export const BLIND_MIN_TICK_MS = 50;
