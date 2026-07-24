@@ -26,10 +26,10 @@
   "devDependencies": {
     "@eslint/js": "^10.0.1",
     "@types/node": "^25.8.0",
-    "eslint": "^10.3.0",
+    "eslint": "^10.7.0",
     "homebridge": "^2.0.0",
     "typescript": "^6.0.3",
-    "typescript-eslint": "^8.62.1"
+    "typescript-eslint": "^8.65.0"
   },
   "homepage": "https://github.com/bvial/homebridge-myhome#readme",
   "main": "dist/index.js",
