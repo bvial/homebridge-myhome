@@ -210,6 +210,16 @@ describe('OwnBlindAccessory', () => {
         );
     });
 
+    it('status query does not leave inStatusQuery stuck true when queue is full', () => {
+        // Regression: updateStatus() set inStatusQuery=true then relied on the command's
+        // `done` callback to clear it. When sendCommand returns false (queue full) `done`
+        // is never invoked, so the flag stuck true forever and suppressed HomeKit sync.
+        handler.initStartPosition = true; // skip the calibration branch → take the status-query path
+        (platform.controller as unknown as { sendCommand: () => boolean }).sendCommand = () => false;
+        handler.updateStatus();
+        assert.equal(handler.inStatusQuery, false, 'inStatusQuery must be cleared when the status query is dropped');
+    });
+
     it('throws when time is missing', () => {
         const p = makeMockPlatform();
         const a = makeMockAccessory();

@@ -554,7 +554,7 @@ export class OwnBlindAccessory extends OwnAccessory {
         } else {
             this.log.info(`[${this.id}] Blind fetching State :${this.state}`);
             this.inStatusQuery = true;
-            this.controller.sendCommand({
+            const queued = this.controller.sendCommand({
                 command: `*#2*${this.id}##`,
                 log: this.log,
                 packet: (pkt: string) => {
@@ -564,6 +564,14 @@ export class OwnBlindAccessory extends OwnAccessory {
                     this.inStatusQuery = false;
                 },
             });
+            // If the queue was saturated, sendCommand dropped the command and will NEVER
+            // invoke `done` — leaving inStatusQuery stuck true forever. That flag suppresses
+            // target/position sync to HomeKit (see syncManualTarget and the STOPPED branch),
+            // so a blind operated only from the wall would silently stop syncing. Clear it now.
+            if (!queued) {
+                this.log.warn('[%s] Blind status query dropped: queue full', this.id);
+                this.inStatusQuery = false;
+            }
         }
     }
 
