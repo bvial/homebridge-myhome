@@ -19,6 +19,7 @@ import {
     BLIND_END_STOP_SAFETY_MAX_MS,
     COMMAND_QUEUE_BUSY_THRESHOLD,
     BLIND_MIN_TICK_MS,
+    BLIND_END_STOP_SNAP_PCT,
     ENERGY_POLL_INTERVAL_MS,
     ENERGY_POLL_QUEUE_THRESHOLD,
     ENERGY_OUTLET_IN_USE_THRESHOLD_W,
@@ -698,6 +699,9 @@ export class OwnBlindAccessory extends OwnAccessory {
             if (direction === '0') {
                 this.homeKitStopPending = false;
                 const wasDecreasing = this.state === this.Characteristic.PositionState.DECREASING;
+                // Capture calibration state before endCalibration() clears it below, so the
+                // manual end-stop snap does not fire on a calibration STOP (which owns position).
+                const wasCalibrating = this.initPhase;
                 this.state = this.Characteristic.PositionState.STOPPED;
                 // Gateway did emit STOP — clear the end-stop safety net.
                 clearTimeout(this.endStopSafetyTimeout);
@@ -709,6 +713,21 @@ export class OwnBlindAccessory extends OwnAccessory {
                 }
                 if (this.homeKitMovement && Math.abs(this.position - this.target) <= 3) {
                     this.position = this.target;
+                } else if (!this.homeKitMovement && !isEchoOfHomeKitStop && !wasCalibrating && !this.inStatusQuery) {
+                    // Manual (wall-switch) STOP: the gateway confirms the motor stopped. If our
+                    // timer-estimated position is already near an end-stop, treat this STOP as
+                    // physical end-of-travel and snap to the exact end value. This is the only
+                    // reliable anchor to cancel accumulated timer drift on manual movements —
+                    // HomeKit movements snap to `target` instead (branch above). We must exclude
+                    // the echo of our OWN stop (isEchoOfHomeKitStop): after a HomeKit move reaches
+                    // its target, moveStop() has already cleared homeKitMovement, so without this
+                    // guard a HomeKit move to e.g. 96% would be wrongly snapped to 100%.
+                    // The direction last observed tells us which end-stop the blind was heading toward.
+                    if (this.lastMovingDirection === '2' && this.position <= BLIND_END_STOP_SNAP_PCT) {
+                        this.position = 0;
+                    } else if (this.lastMovingDirection === '1' && this.position >= 100 - BLIND_END_STOP_SNAP_PCT) {
+                        this.position = 100;
+                    }
                 }
                 this.cachePosition();
                 // Arm the F454 grace window ONLY for physical STOPs. A STOP that echoes a
