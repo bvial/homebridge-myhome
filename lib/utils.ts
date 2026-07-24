@@ -69,6 +69,13 @@ export const BLIND_END_STOP_SAFETY_MAX_MS = 5000;
 export const BLIND_END_STOP_SAFETY_MS = 3000;
 /** Minimum interval between blind position ticks (slat zone floor) */
 export const BLIND_MIN_TICK_MS = 50;
+/** Position tolerance (percentage points) within which a manual (wall-switch) movement
+ *  that ends with a gateway STOP is snapped to the nearest end-stop (0% or 100%).
+ *  A gateway STOP arriving while the timer-estimated position is already near an end-stop
+ *  is treated as confirmation the blind physically reached that stop, so we recalibrate to
+ *  the exact end value. This is the only reliable anchor to cancel accumulated timer drift on
+ *  manual movements (HomeKit movements snap to `target` instead — see onData STOP handling). */
+export const BLIND_END_STOP_SNAP_PCT = 5;
 /** OwnClient command-queue busy threshold — accessories should throw RESOURCE_BUSY
  *  rather than enqueue new commands when the queue is at or above this depth.
  *  Used by every accessory's `sendOrThrow()`, not just blinds. */

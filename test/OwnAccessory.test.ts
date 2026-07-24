@@ -210,6 +210,16 @@ describe('OwnBlindAccessory', () => {
         );
     });
 
+    it('status query does not leave inStatusQuery stuck true when queue is full', () => {
+        // Regression: updateStatus() set inStatusQuery=true then relied on the command's
+        // `done` callback to clear it. When sendCommand returns false (queue full) `done`
+        // is never invoked, so the flag stuck true forever and suppressed HomeKit sync.
+        handler.initStartPosition = true; // skip the calibration branch → take the status-query path
+        (platform.controller as unknown as { sendCommand: () => boolean }).sendCommand = () => false;
+        handler.updateStatus();
+        assert.equal(handler.inStatusQuery, false, 'inStatusQuery must be cleared when the status query is dropped');
+    });
+
     it('throws when time is missing', () => {
         const p = makeMockPlatform();
         const a = makeMockAccessory();
@@ -252,6 +262,82 @@ describe('OwnBlindAccessory', () => {
         handler.homeKitMovement = false;
         handler.onData('*2*0*23##');
         assert.equal(handler.position, 48, 'position must NOT snap during physical movement');
+    });
+
+    it('manual STOP near lower end-stop snaps position to 0 (drift correction)', () => {
+        // A wall-switch DOWN held to the physical bottom: the local timer may have
+        // over/under-counted, leaving position at e.g. 3%. The gateway STOP confirms the
+        // motor reached the end-stop, so we recalibrate to exactly 0% to cancel drift.
+        const svc = accessory.services['WindowCovering'];
+        handler.position = 3;
+        handler.target = 3;
+        handler.state = POSITION_STATE.DECREASING;
+        handler.homeKitMovement = false;
+        handler.lastMovingDirection = '2'; // was moving DOWN toward the lower stop
+        handler.onData('*2*0*23##');
+        assert.equal(handler.position, 0, 'position must snap to 0 at the lower end-stop');
+        assert.equal(svc.characteristics['CurrentPosition'].value, 0, 'HomeKit CurrentPosition must reflect the snap');
+        assert.equal(accessory.context.blindPosition, 0, 'cached position must be recalibrated to 0');
+    });
+
+    it('manual STOP near upper end-stop snaps position to 100 (drift correction)', () => {
+        const svc = accessory.services['WindowCovering'];
+        handler.position = 97;
+        handler.target = 97;
+        handler.state = POSITION_STATE.INCREASING;
+        handler.homeKitMovement = false;
+        handler.lastMovingDirection = '1'; // was moving UP toward the upper stop
+        handler.onData('*2*0*23##');
+        assert.equal(handler.position, 100, 'position must snap to 100 at the upper end-stop');
+        assert.equal(svc.characteristics['CurrentPosition'].value, 100, 'HomeKit CurrentPosition must reflect the snap');
+    });
+
+    it('manual STOP mid-travel does NOT snap (only end-stops recalibrate)', () => {
+        handler.position = 45;
+        handler.target = 45;
+        handler.state = POSITION_STATE.DECREASING;
+        handler.homeKitMovement = false;
+        handler.lastMovingDirection = '2';
+        handler.onData('*2*0*23##');
+        assert.equal(handler.position, 45, 'a mid-travel manual STOP must leave the estimated position untouched');
+    });
+
+    it('manual STOP near lower stop but last movement was UP does NOT snap', () => {
+        // Guard: only snap toward the stop the blind was actually heading for. A STOP near
+        // 0% after an UP movement is not an end-stop arrival, so position must not jump.
+        handler.position = 4;
+        handler.target = 4;
+        handler.state = POSITION_STATE.INCREASING;
+        handler.homeKitMovement = false;
+        handler.lastMovingDirection = '1'; // was moving UP, away from the lower stop
+        handler.onData('*2*0*23##');
+        assert.equal(handler.position, 4, 'position must not snap to a stop the blind was not heading toward');
+    });
+
+    it('end-stop snap does not apply during calibration (initPhase)', () => {
+        handler.position = 3;
+        handler.target = 3;
+        handler.state = POSITION_STATE.DECREASING;
+        handler.homeKitMovement = false;
+        handler.initPhase = true;
+        handler.lastMovingDirection = '2';
+        handler.onData('*2*0*23##');
+        assert.equal(handler.position, 3, 'calibration flow owns the position — end-stop snap must not interfere');
+    });
+
+    it('HomeKit move ending near an end-stop is NOT snapped to the end (respects target)', () => {
+        // Regression guard: after a HomeKit move reaches its target, moveStop() clears
+        // homeKitMovement BEFORE the STOP echo arrives, so the manual-snap branch would
+        // otherwise fire. isEchoOfHomeKitStop must exclude it — a HomeKit move to 97% must
+        // stay at 97%, not jump to 100%.
+        handler.position = 97;
+        handler.target = 97;
+        handler.state = POSITION_STATE.INCREASING;
+        handler.homeKitMovement = false;   // moveStop() already cleared this
+        handler.homeKitStopPending = true; // moveStop() marked its STOP in flight
+        handler.lastMovingDirection = '1';
+        handler.onData('*2*0*23##');       // echo of our own STOP
+        assert.equal(handler.position, 97, 'HomeKit move must not be snapped to the end-stop');
     });
 
     it('onData increasing', () => {

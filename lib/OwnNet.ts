@@ -121,6 +121,10 @@ export class OwnConnection extends EventEmitter {
         this.log.debug('conn:%s open socket host: %s, port:%s ', this.id, this.host, this.port);
         this.conn = net.connect({ host: this.host, port: this.port });
         this.conn.setKeepAlive(true, 30000);
+        // Disable Nagle's algorithm: OWN packets are tiny and latency-sensitive. A delayed
+        // STOP (*2*0*) echo lets the local position timer over-count during blind movements,
+        // so shaving the ~40 ms Nagle delay reduces manual-movement position drift.
+        this.conn.setNoDelay(true);
         this.conn.on('data', this.onData.bind(this));
         this.conn.on('error', (error: Error) => {
             this.log.error('Socket error: %s', error.message);
