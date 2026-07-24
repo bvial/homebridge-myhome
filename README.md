@@ -91,7 +91,7 @@ Add a platform block to your Homebridge `config.json`:
 | `time` | integer | yes | Seconds for full travel (up or down) |
 | `timeSlat` | integer | no | Extra seconds for slat rotation (venetian blinds only) |
 | `slatPercent` | integer | no | Position % below which slat rotation occurs (venetian blinds only) |
-| `calibrateOnStart` | boolean | no | Default `true`. When `true`, the blind moves fully down on first Homebridge start to establish a known position (0%). Set to `false` to restore the last cached position from `accessory.context.blindPosition` without moving the blind — useful if you don't want blinds to move on every Homebridge restart. The position is automatically cached on every STOP and at every 10% boundary during movement. |
+| `calibrateOnStart` | boolean | no | Default `true`. When `true`, the blind moves fully down on first Homebridge start to establish a known position (0%). Set to `false` to restore the last cached position from `accessory.context.blindPosition` without moving the blind — useful if you don't want blinds to move on every Homebridge restart. The position is automatically cached on every STOP and at every 10% boundary during movement. Manual (wall-switch) movements that reach a physical end-stop automatically recalibrate the position to 0% or 100%, cancelling any timer drift accumulated over time. |
 
 #### `thermostats`
 

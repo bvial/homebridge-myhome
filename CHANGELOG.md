@@ -2,6 +2,34 @@
 
 All notable changes to this project are documented here.
 
+## [0.4.10] — 2026-07-24
+
+### Fixed
+- **Manual (wall-switch) blind position no longer drifts over time.** Position
+  during a movement is estimated from a local timer against the configured
+  `time`, which never perfectly matches the real motor — so every manual
+  operation accumulated a small error that was never corrected. A gateway STOP
+  (`*2*0*`) arriving while the timer-estimated position is already near an
+  end-stop is now treated as confirmation the blind physically reached that
+  stop, and the position is snapped to the exact end value (0% or 100%),
+  cancelling accumulated drift. The snap is guarded to fire only for genuine
+  manual STOPs (not HomeKit-command echoes, calibration, or status queries) and
+  only toward the end-stop the blind was actually heading. New constant
+  `BLIND_END_STOP_SNAP_PCT`; six regression tests added.
+- **Blind status query no longer leaves `inStatusQuery` stuck.** When the
+  command queue was saturated, `sendCommand` dropped the status query without
+  invoking its `done` callback, leaving the `inStatusQuery` flag `true`
+  indefinitely and permanently suppressing HomeKit position/target sync for a
+  blind operated only from the wall. The flag is now cleared when the query is
+  dropped.
+
+### Changed
+- **Nagle's algorithm disabled on the gateway socket (`setNoDelay`).** OWN
+  packets are tiny and latency-sensitive; delaying the STOP echo by ~40 ms let
+  the local position timer over-count during blind movements.
+- **TypeScript toolchain upgraded** (compiler, `@types/node`, homebridge dev
+  dependency, and linting tools).
+
 ## [0.4.9] — 2026-07-14
 
 ### Fixed
