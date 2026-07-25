@@ -2,6 +2,21 @@
 
 All notable changes to this project are documented here.
 
+## [0.4.11] — 2026-07-24
+
+### Fixed
+- **Manual blind re-presses in the same direction no longer swallowed.** When
+  closing (or opening) a blind in several successive wall-switch taps, the
+  second and further taps in the same direction were silently discarded as
+  "spurious F454 phantoms" and never tracked by HomeKit. Root cause: the
+  post-STOP grace window was re-armed on every `*2*0*` STOP packet, including
+  the redundant STOPs the F454 emits while the blind is already at rest. A
+  manual re-press with the same direction as the last movement matched
+  `lastMovingDirection` and was rejected. The grace window now arms only on a
+  genuine MOTION→STOP transition; a STOP received while already STOPPED does
+  not re-arm it. The F454 phantom filter (0.4.9) still works for its intended
+  case (the spurious packet that immediately follows a real stop).
+
 ## [0.4.10] — 2026-07-24
 
 ### Fixed
