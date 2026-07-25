@@ -632,7 +632,7 @@ describe('OwnBlindAccessory', () => {
         const svc = accessory.services['WindowCovering'];
         handler.position = 34;
         handler.target = 34;
-        handler.state = POSITION_STATE.STOPPED;
+        handler.state = POSITION_STATE.DECREASING; // blind was actively moving DOWN when the STOP arrived
         handler.lastMovingDirection = '2'; // blind was moving DOWN before the wall-switch STOP
 
         // Simulate the exact F454 sequence observed in field logs:
@@ -654,7 +654,7 @@ describe('OwnBlindAccessory', () => {
         // manual DOWN from the top (last movement was UP) must pass through.
         handler.position = 100;
         handler.target = 100;
-        handler.state = POSITION_STATE.STOPPED;
+        handler.state = POSITION_STATE.INCREASING; // reached the top by actively moving UP
         handler.homeKitMovement = false;
         handler.commandSent = false;
         handler.homeKitStopPending = false;
@@ -670,7 +670,7 @@ describe('OwnBlindAccessory', () => {
     it('manual UP from lower end-stop is NOT filtered', () => {
         handler.position = 0;
         handler.target = 0;
-        handler.state = POSITION_STATE.STOPPED;
+        handler.state = POSITION_STATE.DECREASING; // reached the bottom by actively moving DOWN
         handler.homeKitMovement = false;
         handler.commandSent = false;
         handler.homeKitStopPending = false;
@@ -688,7 +688,7 @@ describe('OwnBlindAccessory', () => {
         // Even away from an end-stop this must still be filtered.
         handler.position = 40;
         handler.target = 40;
-        handler.state = POSITION_STATE.STOPPED;
+        handler.state = POSITION_STATE.DECREASING; // was actively moving DOWN when the STOP arrived
         handler.homeKitMovement = false;
         handler.commandSent = false;
         handler.homeKitStopPending = false;
@@ -743,6 +743,31 @@ describe('OwnBlindAccessory', () => {
         handler.onData('*2*2*23##');
         assert.equal(handler.state, POSITION_STATE.STOPPED,
             'spurious post-STOP direction packet must be filtered by the grace window');
+    });
+
+    it('redundant STOP while already stopped does NOT re-arm grace — manual same-direction re-press passes (field bug)', () => {
+        // Field log (0.4.10, blind 88): a user closed a blind in several DOWN taps. After the
+        // first DOWN+STOP, the gateway emitted redundant "*2*0*" STOPs while already stopped,
+        // which re-armed postStopGrace, so the next manual "*2*2*" (same direction as the last
+        // movement) was swallowed as a phantom. The grace window must arm ONLY on a genuine
+        // MOTION→STOP transition, not on a STOP received while already STOPPED.
+        handler.position = 42;
+        handler.target = 42;
+        handler.state = POSITION_STATE.STOPPED;      // blind is already at rest
+        handler.homeKitMovement = false;
+        handler.commandSent = false;
+        handler.homeKitStopPending = false;
+        handler.lastMovingDirection = '2';           // last real movement was DOWN
+
+        // Redundant STOP broadcast while already stopped — must NOT re-arm the grace window.
+        handler.onData('*2*0*23##');
+        assert.equal(handler.postStopGrace, false,
+            'a STOP received while already STOPPED must not arm the grace window');
+
+        // Genuine manual DOWN re-press (same direction as last movement) — must be processed.
+        handler.onData('*2*2*23##');
+        assert.equal(handler.state, POSITION_STATE.DECREASING,
+            'manual same-direction re-press after a redundant STOP must NOT be filtered');
     });
 
     it('target syncs to position while a manual movement is in progress', () => {

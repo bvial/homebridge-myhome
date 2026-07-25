@@ -730,11 +730,16 @@ export class OwnBlindAccessory extends OwnAccessory {
                     }
                 }
                 this.cachePosition();
-                // Arm the F454 grace window ONLY for physical STOPs. A STOP that echoes a
-                // HomeKit command is issued by us — the gateway does not follow it with a
-                // spurious direction packet, and any direction packet arriving in the
-                // next 150 ms is a genuine manual command that must not be filtered.
-                if (!isEchoOfHomeKitStop) {
+                // Arm the F454 grace window ONLY for a genuine MOTION→STOP transition. The
+                // spurious F454 direction packet is emitted only right after the blind was
+                // actually moving; a redundant STOP received while already STOPPED must NOT
+                // re-arm the window. Otherwise a manual re-press in the SAME direction as the
+                // last movement (e.g. continuing to close in several taps) would be mistaken
+                // for the phantom and swallowed — the field bug this fixes. Also skip the echo
+                // of our own HomeKit STOP (the gateway does not follow it with a phantom).
+                const wasMoving = prevState === this.Characteristic.PositionState.INCREASING
+                    || prevState === this.Characteristic.PositionState.DECREASING;
+                if (!isEchoOfHomeKitStop && wasMoving) {
                     this.postStopGrace = true;
                     clearTimeout(this.postStopGraceTimeout);
                     this.postStopGraceTimeout = setTimeout(() => {
