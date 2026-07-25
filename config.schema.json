@@ -29,7 +29,8 @@
                 "type": "string",
                 "required": false,
                 "default": "",
-                "description": "Numeric password for OWN authentication (decimal integer; leave empty if no password)"
+                "description": "Numeric password for OWN authentication (decimal integer; leave empty if no password)",
+                "pattern": "^$|^[0-9]+$"
             },
             "maxConcurrent": {
                 "title": "Max concurrent commands",

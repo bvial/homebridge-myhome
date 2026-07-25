@@ -41,7 +41,7 @@ export async function runStatusScan(client: OwnClient, maxAddr: number): Promise
         await Promise.all(jobs.slice(i, i + SCAN_BATCH).map(({ who, where, command }) =>
             new Promise<void>(resolve => {
                 const pkts: string[] = [];
-                client.sendCommand({
+                const queued = client.sendCommand({
                     command,
                     stopon: [PKT.ACK, PKT.NACK],
                     packet: p => pkts.push(p),
@@ -53,6 +53,9 @@ export async function runStatusScan(client: OwnClient, maxAddr: number): Promise
                         resolve();
                     },
                 });
+                if (!queued) {
+                    resolve();
+                }
             }),
         ));
     }
