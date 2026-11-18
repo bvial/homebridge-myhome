@@ -1,7 +1,10 @@
 import { describe, it, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
+import { Socket } from 'node:net';
 import { OwnConnection, OwnClient, OwnMonitor, calcPass, MODE, PKT, CMD, STATE } from '../lib/OwnNet';
 import type { CommandParams } from '../lib/OwnNet';
+import { COMMAND_TIMEOUT_MS } from '../lib/utils';
+import { runStatusScan } from '../lib/scanHelper';
 
 describe('calcPass', () => {
     it('returns 0 for password 0 and nonce 0', () => {
@@ -204,6 +207,11 @@ describe('TCP fragmentation', () => {
         conn.onData(Buffer.from('*1*1*42##'));
         assert.deepEqual(packets, ['*1*1*42##']);
     });
+
+    it('discards leading non-* junk characters and processes packet immediately', () => {
+        conn.onData(Buffer.from('junk\r\n*1*1*42##'));
+        assert.deepEqual(packets, ['*1*1*42##']);
+    });
 });
 
 describe('OwnClient command queue', () => {
@@ -309,6 +317,418 @@ describe('OwnClient command failure callback', () => {
         });
 
         closeCb();
+    });
+
+    it('calls done with null and -1 and releases slot on auth-failed', (_t: unknown, done: () => void) => {
+        const client = new OwnClient('127.0.0.1', '20000', '12345', {
+            info: () => {}, debug: () => {}, warn: () => {}, error: () => {}, success: () => {},
+        } as unknown as import('homebridge').Logging);
+        client.maxConcurrent = 1;
+
+        let authFailedCb!: () => void;
+        (client as unknown as { newConnection: () => unknown }).newConnection = () => {
+            const fakeConn: { handlers: Record<string, () => void>; on: (ev: string, cb: () => void) => void; emit: (ev: string) => void; connect: () => void; setTimeout: () => void; end: () => void } = {
+                handlers: {},
+                on: (ev, cb) => { fakeConn.handlers[ev] = cb; },
+                emit: (ev) => { if (fakeConn.handlers[ev]) fakeConn.handlers[ev](); },
+                connect: () => {},
+                setTimeout: () => {},
+                end: () => {},
+            };
+            authFailedCb = () => { fakeConn.handlers['auth-failed']?.(); };
+            return fakeConn;
+        };
+
+        client.sendCommand({
+            command: '*1*1*42##',
+            done: (pkt, index) => {
+                assert.equal(pkt, null);
+                assert.equal(index, -1);
+                assert.equal(client.activeCommands, 0);
+                done();
+            },
+        });
+
+        assert.equal(client.activeCommands, 1);
+        authFailedCb();
+    });
+});
+
+describe('OwnClient command lifecycle', () => {
+    function makeClient(connectImmediately = true) {
+        const client = new OwnClient('127.0.0.1', 20000, '12345', {
+            info: () => {}, debug: () => {}, warn: () => {}, error: () => {},
+        } as unknown as import('homebridge').Logging);
+        client.maxConcurrent = 1;
+        const connections: OwnConnection[] = [];
+        const sent: string[] = [];
+        client.newConnection = (mode, log) => {
+            const conn = new OwnConnection(client.host, client.port, client.password, mode, log ?? client.log);
+            // Skip TCP I/O, but exercise OwnConnection's real parser and synchronous
+            // end()/close behavior with an actual (unconnected) Node socket.
+            conn.connect = () => {
+                conn.conn = new Socket();
+                if (connectImmediately) {
+                    conn.state = STATE.CONNECTED;
+                    conn.emit('connected');
+                }
+            };
+            conn.sendPacket = packet => { sent.push(packet); };
+            connections.push(conn);
+            return conn;
+        };
+        return { client, connections, sent };
+    }
+
+    it('finishes ACK exactly once before synchronous close and advances one queued command', t => {
+        t.mock.timers.enable({ apis: ['setTimeout'] });
+        const { client, connections, sent } = makeClient();
+        t.after(() => connections.forEach(conn => conn.end()));
+        const results: Array<[string | null, number]> = [];
+        client.sendCommand({ command: '*1*1*42##', done: (pkt, index) => results.push([pkt, index]) });
+        client.sendCommand({ command: '*2*0*23##' });
+        assert.equal(connections.length, 1);
+
+        connections[0].onData(PKT.ACK);
+        assert.deepEqual(results, [[PKT.ACK, 0]]);
+        assert.equal(connections[0].conn, null);
+        assert.deepEqual(sent, ['*1*1*42##', '*2*0*23##']);
+        assert.equal(client.activeCommands, 1);
+        assert.equal(client.queueSize(), 0);
+
+        connections[0].emit('close');
+        connections[0].emit('packet', PKT.ACK);
+        assert.deepEqual(results, [[PKT.ACK, 0]]);
+        assert.equal(client.activeCommands, 1, 'late events must not release the next command');
+        connections[1].onData(PKT.ACK);
+        t.mock.timers.tick(COMMAND_TIMEOUT_MS);
+        assert.equal(client.activeCommands, 0);
+        assert.deepEqual(results, [[PKT.ACK, 0]]);
+    });
+
+    it('detectGatewayModel reports only the successful model after closing its connection', t => {
+        const { client, connections } = makeClient();
+        t.after(() => connections.forEach(conn => conn.end()));
+        const models: Array<string | null> = [];
+        client.detectGatewayModel(model => models.push(model));
+        connections[0].onData('*#13**15*200##' + PKT.ACK);
+        assert.deepEqual(models, ['200']);
+        assert.equal(client.activeCommands, 0);
+    });
+
+    it('serializes one device while allowing independent devices to use spare slots', t => {
+        const { client, connections, sent } = makeClient();
+        client.maxConcurrent = 2;
+        t.after(() => client.destroy());
+        client.sendCommand({ command: '*2*1*2##', serialKey: 'blind-2' });
+        client.sendCommand({ command: '*2*0*2##', serialKey: 'blind-2' });
+        client.sendCommand({ command: '*1*1*1##', serialKey: 'light-1' });
+        assert.deepEqual(sent, ['*2*1*2##', '*1*1*1##']);
+        connections[0].onData(PKT.NACK);
+        assert.deepEqual(sent, ['*2*1*2##', '*1*1*1##', '*2*0*2##']);
+        assert.equal(client.activeCommands, 2);
+        connections[1].onData(PKT.ACK);
+        connections[2].onData(PKT.ACK);
+        assert.equal(client.activeCommands, 0);
+    });
+
+    it('reports timeout distinctly and releases the device key for subsequent work', t => {
+        t.mock.timers.enable({ apis: ['setTimeout'] });
+        const { client, connections, sent } = makeClient();
+        t.after(() => client.destroy());
+        let failure: string | undefined;
+        client.sendCommand({ command: '*2*1*2##', serialKey: 'blind-2', done: (_pkt, _index, reason) => { failure = reason; } });
+        client.sendCommand({ command: '*2*0*2##', serialKey: 'blind-2' });
+        t.mock.timers.tick(COMMAND_TIMEOUT_MS);
+        assert.equal(failure, 'timeout');
+        assert.deepEqual(sent, ['*2*1*2##', '*2*0*2##']);
+        connections[1].onData(PKT.ACK);
+        assert.equal(client.activeCommands, 0);
+    });
+
+    it('admits a STOP into the reserved capacity and dispatches it before unrelated work', t => {
+        const { client, connections, sent } = makeClient();
+        t.after(() => client.destroy());
+        client.sendCommand({ command: 'active' });
+        for (let i = 0; i < 50; i++) assert.equal(client.sendCommand({ command: `read-${i}`, priority: 'background' }), true);
+        assert.equal(client.sendCommand({ command: 'overflow' }), false);
+        assert.equal(client.sendCommand({ command: '*2*0*2##', priority: 'stop', serialKey: 'blind-2' }), true);
+        connections[0].onData(PKT.ACK);
+        assert.deepEqual(sent, ['active', '*2*0*2##']);
+    });
+
+    it('does not reorder a STOP ahead of earlier commands for the same key', t => {
+        const { client, connections, sent } = makeClient();
+        t.after(() => client.destroy());
+        client.sendCommand({ command: 'active' });
+        client.sendCommand({ command: 'up', serialKey: 'blind-2' });
+        client.sendCommand({ command: 'stop', serialKey: 'blind-2', priority: 'stop' });
+        connections[0].onData(PKT.ACK);
+        assert.deepEqual(sent, ['active', 'up']);
+        connections[1].onData(PKT.ACK);
+        assert.deepEqual(sent, ['active', 'up', 'stop']);
+    });
+
+    it('cancels queued device commands exactly once without cancelling a written command', t => {
+        const { client, connections, sent } = makeClient();
+        t.after(() => client.destroy());
+        const failures: string[] = [];
+        client.sendCommand({ command: 'written', serialKey: 'blind-2' });
+        for (const command of ['up', 'down']) client.sendCommand({ command, serialKey: 'blind-2', done: (_p, _i, reason) => { failures.push(reason!); } });
+        client.cancelQueued('blind-2'); client.cancelQueued('blind-2');
+        assert.deepEqual(failures, ['cancelled', 'cancelled']);
+        assert.equal(client.activeCommands, 1);
+        client.sendCommand({ command: 'stop', serialKey: 'blind-2', priority: 'stop' });
+        connections[0].onData(PKT.ACK);
+        assert.deepEqual(sent, ['written', 'stop']);
+    });
+
+    it('rechecks cancellation after a delayed handshake, before sending the packet', t => {
+        const { client, connections, sent } = makeClient(false);
+        t.after(() => client.destroy());
+        let allowed = true;
+        let reason: string | undefined;
+        client.sendCommand({ command: 'up', shouldSend: () => allowed, done: (_p, _i, failure) => { reason = failure; } });
+        allowed = false;
+        connections[0].emit('connected');
+        assert.equal(reason, 'cancelled');
+        assert.deepEqual(sent, []);
+        assert.equal(client.activeCommands, 0);
+    });
+
+    it('an abort removes queued work immediately and settles it only once', t => {
+        const { client, connections, sent } = makeClient();
+        t.after(() => client.destroy());
+        const abort = new AbortController();
+        const results: unknown[] = [];
+        client.sendCommand({ command: 'blocker' });
+        client.sendCommand({ command: 'dimming', signal: abort.signal, done: (packet, index, reason) => results.push([packet, index, reason]) });
+        client.sendCommand({ command: 'next' });
+        abort.abort(); abort.abort();
+        assert.equal(client.queueSize(), 1);
+        assert.deepEqual(results, [[null, -1, 'cancelled']]);
+        connections[0].onData(PKT.ACK);
+        assert.deepEqual(sent, ['blocker', 'next']);
+        connections[1].onData(PKT.ACK);
+        assert.equal(results.length, 1);
+    });
+
+    it('an abort closes an unfinished handshake and prevents a late write', t => {
+        const { client, connections, sent } = makeClient(false);
+        t.after(() => client.destroy());
+        const abort = new AbortController();
+        const results: unknown[] = [];
+        client.sendCommand({ command: 'dimming', signal: abort.signal, done: (packet, index, reason) => results.push([packet, index, reason]) });
+        abort.abort();
+        connections[0].emit('connected');
+        connections[0].emit('close');
+        assert.deepEqual(sent, []);
+        assert.deepEqual(results, [[null, -1, 'cancelled']]);
+        assert.equal(client.activeCommands, 0);
+        assert.equal(connections[0].conn, null);
+    });
+
+    it('an abort after writing still waits for the actual gateway result', t => {
+        const { client, connections, sent } = makeClient();
+        t.after(() => client.destroy());
+        const abort = new AbortController();
+        const results: unknown[] = [];
+        client.sendCommand({ command: 'already-written', signal: abort.signal, done: (packet, index) => results.push([packet, index]) });
+        abort.abort();
+        assert.deepEqual(sent, ['already-written']);
+        assert.deepEqual(results, []);
+        assert.equal(client.activeCommands, 1);
+        connections[0].onData(PKT.ACK);
+        assert.deepEqual(results, [[PKT.ACK, 0]]);
+    });
+
+    it('handles cancellation inside the started callback before writing', t => {
+        const { client, sent } = makeClient();
+        t.after(() => client.destroy());
+        const abort = new AbortController();
+        let failure: string | undefined;
+        client.sendCommand({ command: 'cancel-before-write', signal: abort.signal, started: () => abort.abort(), done: (_p, _i, reason) => { failure = reason; } });
+        assert.deepEqual(sent, []);
+        assert.equal(failure, 'cancelled');
+        assert.equal(client.activeCommands, 0);
+    });
+
+    it('expires stale movements while other commands still occupy the queue', t => {
+        t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: 100000 });
+        const { client, connections, sent } = makeClient();
+        t.after(() => client.destroy());
+        let reason: string | undefined;
+        client.sendCommand({ command: 'active' });
+        client.sendCommand({ command: 'stale-up', expiresAt: Date.now() + 5000, done: (_p, _i, failure) => { reason = failure; } });
+        t.mock.timers.tick(5000);
+        assert.equal(reason, 'expired');
+        assert.equal(client.queueSize(), 0);
+        connections[0].onData(PKT.ACK);
+        assert.deepEqual(sent, ['active']);
+    });
+
+    for (const failure of ['close', 'auth-failed'] as const) {
+        it(`finishes ${failure} exactly once when teardown also emits close`, t => {
+            const { client, connections } = makeClient();
+            t.after(() => connections.forEach(conn => conn.end()));
+            const results: Array<[string | null, number]> = [];
+            client.sendCommand({ command: '*1*1*42##', done: (pkt, index) => results.push([pkt, index]) });
+            if (failure === 'close') connections[0].end();
+            else {
+                connections[0].state = STATE.LOGGING_IN;
+                connections[0].onData(PKT.NACK);
+            }
+            connections[0].emit('close');
+            assert.deepEqual(results, [[null, -1]]);
+            assert.equal(connections[0].conn, null);
+            assert.equal(client.activeCommands, 0);
+        });
+    }
+
+    it('times out an unfinished handshake exactly once and ignores a late connected event', t => {
+        t.mock.timers.enable({ apis: ['setTimeout'] });
+        const { client, connections, sent } = makeClient(false);
+        t.after(() => connections.forEach(conn => conn.end()));
+        const results: Array<[string | null, number]> = [];
+        client.sendCommand({ command: '*1*1*42##', done: (pkt, index) => results.push([pkt, index]) });
+        t.mock.timers.tick(COMMAND_TIMEOUT_MS);
+        connections[0].emit('connected');
+        connections[0].emit('close');
+        assert.deepEqual(results, [[null, -1]]);
+        assert.deepEqual(sent, []);
+        assert.equal(connections[0].conn, null);
+        assert.equal(client.activeCommands, 0);
+    });
+
+    it('releases the slot and reports synchronous connection setup failure once', () => {
+        const { client } = makeClient();
+        client.newConnection = () => { throw new Error('connection setup failed'); };
+        const results: Array<[string | null, number]> = [];
+        client.sendCommand({ command: '*1*1*42##', done: (pkt, index) => results.push([pkt, index]) });
+        assert.deepEqual(results, [[null, -1]]);
+        assert.equal(client.activeCommands, 0);
+    });
+
+    for (const stopon of [undefined, PKT.ACK]) {
+        it(`treats NACK as failure with stopon=${stopon ?? 'default'} and immediately sends queued STOP`, t => {
+            const { client, connections, sent } = makeClient();
+            t.after(() => connections.forEach(conn => conn.end()));
+            const results: Array<[string | null, number]> = [];
+            const packets: string[] = [];
+            client.sendCommand({
+                command: '*1*1*42##', stopon,
+                done: (pkt, index) => results.push([pkt, index]),
+                packet: pkt => packets.push(pkt),
+            });
+            client.sendCommand({ command: '*2*0*23##' });
+            connections[0].onData(PKT.NACK);
+            assert.deepEqual(results, [[null, -1]]);
+            assert.deepEqual(packets, [], 'NACK is not a data packet');
+            assert.deepEqual(sent, ['*1*1*42##', '*2*0*23##']);
+            assert.equal(client.activeCommands, 1);
+            assert.equal(client.queueSize(), 0);
+            connections[1].onData(PKT.ACK);
+            assert.equal(client.activeCommands, 0);
+        });
+    }
+
+    it('preserves explicit NACK stop-condition packet and index without forwarding it as data', t => {
+        const { client, connections } = makeClient();
+        t.after(() => connections.forEach(conn => conn.end()));
+        const results: Array<[string | null, number]> = [];
+        const packets: string[] = [];
+        client.sendCommand({
+            command: '*#1*42##', stopon: [PKT.ACK, PKT.NACK],
+            done: (pkt, index) => results.push([pkt, index]),
+            packet: pkt => packets.push(pkt),
+        });
+        connections[0].onData(PKT.NACK);
+        assert.deepEqual(results, [[PKT.NACK, 1]]);
+        assert.deepEqual(packets, []);
+        assert.equal(client.activeCommands, 0);
+    });
+
+    it('destroy closes monitor and command sockets, settles accepted work once, and rejects later work', t => {
+        t.mock.timers.enable({ apis: ['setTimeout'] });
+        const { client, connections, sent } = makeClient();
+        client.maxConcurrent = 2;
+        t.after(() => client.destroy());
+        client.startMonitor();
+        const results: Array<[number, string | null, number]> = [];
+        for (let id = 1; id <= 4; id++) {
+            assert.equal(client.sendCommand({
+                command: `*1*1*${id}##`,
+                done: (packet, index) => {
+                    results.push([id, packet, index]);
+                    assert.equal(client.sendCommand({ command: '*1*0*99##' }), false);
+                },
+            }), true);
+        }
+        assert.equal(client.queueSize(), 2);
+        const sockets = connections.map(connection => connection.conn!);
+        client.destroy();
+        client.destroy();
+        assert.equal(client.monitor, null);
+        assert.equal(client.activeCommands, 0);
+        assert.equal(client.queueSize(), 0);
+        assert.ok(sockets.every(socket => socket.destroyed));
+        assert.ok(connections.every(connection => connection.conn === null));
+        assert.deepEqual(results.sort((a, b) => a[0] - b[0]), [
+            [1, null, -1], [2, null, -1], [3, null, -1], [4, null, -1],
+        ]);
+        client.startMonitor();
+        for (const connection of connections) {
+            connection.emit('connected');
+            connection.emit('packet', PKT.ACK);
+            connection.emit('close');
+        }
+        t.mock.timers.tick(300_000);
+        assert.deepEqual(sent, ['*1*1*1##', '*1*1*2##']);
+        assert.equal(connections.length, 3);
+        assert.equal(results.length, 4);
+    });
+
+    it('destroy continues cleanup when queued and active callbacks throw', () => {
+        const { client, connections } = makeClient();
+        let settled = 0;
+        for (let id = 1; id <= 3; id++) {
+            client.sendCommand({
+                command: `*1*1*${id}##`,
+                done: () => { settled++; throw new Error('callback failed'); },
+            });
+        }
+        assert.doesNotThrow(() => client.destroy());
+        assert.equal(settled, 3);
+        assert.equal(client.activeCommands, 0);
+        assert.equal(client.queueSize(), 0);
+        assert.equal(connections[0].conn, null);
+    });
+
+    it('destroy resolves a scan in progress without opening sockets for later batches', async () => {
+        const { client, connections } = makeClient();
+        const scanning = runStatusScan(client, 30);
+        assert.equal(connections.length, 1);
+        assert.ok(client.queueSize() > 0);
+        client.destroy();
+        assert.deepEqual(await scanning, []);
+        assert.equal(client.queueSize(), 0);
+        assert.equal(client.activeCommands, 0);
+        assert.equal(connections.length, 1);
+    });
+
+    it('stopMonitor remains restartable without discarding client listeners', t => {
+        t.mock.timers.enable({ apis: ['setTimeout'] });
+        const { client, connections } = makeClient();
+        t.after(() => client.destroy());
+        let starts = 0;
+        client.on('monitoring', () => { starts++; });
+        client.startMonitor();
+        client.stopMonitor();
+        client.startMonitor();
+        assert.equal(starts, 2);
+        assert.equal(connections.length, 2);
+        assert.equal(connections[0].conn, null);
+        assert.ok(connections[1].conn);
     });
 });
 
@@ -428,5 +848,49 @@ describe('OwnMonitor reconnect logic', () => {
             'a skipped in-flight tick must not advance nbCheck toward a spurious reconnect');
         clearTimeout(monitor.checkTimeout);
         clearTimeout(monitor.reconnectTimeout);
+    });
+
+    it('stopMonitor invalidates pending probes and prevents later connections, probes, or timers', t => {
+        t.mock.timers.enable({ apis: ['setTimeout'] });
+        const mockClient = makeMockClient();
+        const client = new OwnClient('127.0.0.1', 20000, '12345', mockClient.log);
+        client.sendCommand = mockClient.sendCommand;
+        const connections: OwnConnection[] = [];
+        client.newConnection = mode => {
+            const connection = new OwnConnection(client.host, client.port, client.password, mode, client.log);
+            connection.connect = () => {
+                connection.conn = new Socket();
+                connection.state = STATE.CONNECTED;
+                connection.emit('connected');
+            };
+            connections.push(connection);
+            return connection;
+        };
+        client.startMonitor();
+        const monitor = client.monitor!;
+        t.after(() => { client.stopMonitor(); monitor.stop(); });
+        assert.equal(monitor.checkMonitor(), true);
+        const probe = mockClient.commands[0];
+
+        client.stopMonitor();
+        probe.done!(PKT.ACK, 0);
+        probe.done!(null, -1);
+        assert.equal(connections.length, 1, 'a late probe must not recreate the connection');
+        assert.equal(connections[0].conn, null);
+        assert.equal(client.monitor, null);
+        assert.equal(monitor.connection, null);
+        assert.equal(monitor.checkInFlight, false);
+        assert.equal(monitor.checkTimeout, undefined);
+        assert.equal(monitor.reconnectTimeout, undefined);
+
+        monitor.connect();
+        monitor.restartConnection();
+        monitor.resetAutoConnectTimeout();
+        assert.equal(monitor.checkMonitor(), false);
+        t.mock.timers.tick(300_000);
+        assert.equal(connections.length, 1);
+        assert.equal(mockClient.commands.length, 1);
+        assert.equal(monitor.checkTimeout, undefined);
+        assert.equal(monitor.reconnectTimeout, undefined);
     });
 });

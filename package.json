@@ -20,14 +20,14 @@
     "url": "https://github.com/bvial/homebridge-myhome/issues"
   },
   "engines": {
-    "node": "^18.20.4 || ^20.15.1 || ^22 || ^24",
-    "homebridge": "^2.0.0"
+    "node": "^22.13.0 || ^24.0.0 || ^26.0.0",
+    "homebridge": "^2.4.0"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
     "@types/node": "^26.1.1",
     "eslint": "^10.8.0",
-    "homebridge": "^2.2.1",
+    "homebridge": "^2.5.0",
     "typescript": "^6.0.3",
     "typescript-eslint": "^8.65.0"
   },
@@ -42,7 +42,9 @@
     "dist/scan.js",
     "dist/scan.js.map",
     "dist/scan.d.ts",
-    "config.schema.json"
+    "config.schema.json",
+    "docs/PROTOCOL_REVIEW.md",
+    "TESTING.md"
   ],
   "directories": {
     "lib": "lib"
@@ -55,7 +57,7 @@
     "prepare": "npm run build"
   },
   "peerDependencies": {
-    "homebridge": "^2.0.0"
+    "homebridge": "^2.4.0"
   },
   "author": "Bertrand Vial <bvial@github.com> (https://www.npmjs.com/~bvial)"
 }

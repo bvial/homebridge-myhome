@@ -23,7 +23,7 @@
             "name": "MyHome",
             "host": "192.168.1.35",
             "password": "12345",
-            "lights": [{"id": 12, "dimmer": 1}],
+            "lights": [{"id": 12, "dimmer": true}],
             "blinds": [{"id": 11, "time": 15}]
         }
     ]

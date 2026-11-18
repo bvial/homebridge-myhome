@@ -26,7 +26,24 @@ export interface PacketInfo {
     where: string | null;
 }
 
+export interface LightState {
+    where: string;
+    on: boolean;
+    brightness?: number;
+}
+
+export interface BlindReport {
+    where: string;
+    direction: 'opening' | 'closing' | 'stopped';
+    /** Present only on DIM 10; 255 is explicitly unknown. */
+    position?: number | null;
+    blocked?: boolean;
+}
+
 export class OwnProtcol {
+    static isWhere(value: unknown): value is string {
+        return typeof value === 'string' && /^#?\d+(?:#\d+)*$/.test(value);
+    }
     static getWhoType(who: string | number): WhoValue | null {
         const whoInt = parseInt(String(who), 10);
         switch (whoInt) {
@@ -54,18 +71,50 @@ export class OwnProtcol {
     }
 
     static extractPacketInfo(packet: string): PacketInfo {
-        let extract: RegExpMatchArray | null;
-        if ((extract = packet.match(/^\*(\d*)\*.+\*([\d#]+)##$/))) {
-            return { who: OwnProtcol.getWhoType(extract[1]), where: extract[2] };
+        if (!/^\*[\d#*]+##$/.test(packet)) return { who: null, where: null };
+        const fields = packet.slice(1, -2).split('*');
+        const dimension = fields[0].startsWith('#');
+        const who = dimension ? fields[0].slice(1) : fields[0];
+        if (!/^\d+$/.test(who)) return { who: null, where: null };
+        return { who: OwnProtcol.getWhoType(who), where: fields[dimension ? 1 : 2] ?? null };
+    }
+
+    /** Decode absolute light state; relative/timing WHATs must not become percentages. */
+    static decodeLightState(packet: string): LightState | null {
+        const dimension = packet.match(/^\*#1\*([\d#]+)\*1\*(\d+)\*(\d+)##$/);
+        if (dimension) {
+            const level = Number(dimension[2]);
+            if (level < 100 || level > 200 || Number(dimension[3]) > 255) return null;
+            return { where: dimension[1], on: level > 100, brightness: level - 100 };
         }
-        if ((extract = packet.match(/^\*#(\d*)\*([\d#]*)\*.+##$/))) {
-            return { who: OwnProtcol.getWhoType(extract[1]), where: extract[2] };
+        const standard = packet.match(/^\*1\*(?:1000#)?(\d+)(?:#[\d#]+)?\*([\d#]+)##$/);
+        if (!standard) return null;
+        const what = Number(standard[1]);
+        if (what === 0 || what === 1) return { where: standard[2], on: what === 1 };
+        if (what >= 2 && what <= 10) return { where: standard[2], on: true, brightness: what * 10 };
+        if ((what >= 11 && what <= 18) || (what >= 20 && what <= 29)) return { where: standard[2], on: true };
+        return null;
+    }
+
+    static decodeBlindReport(packet: string): BlindReport | null {
+        const dimension = packet.match(/^\*#2\*([\d#]+)\*10\*(\d+)\*(\d+)\*(\d+)\*(\d+)##$/);
+        if (dimension) {
+            const status = Number(dimension[2]);
+            const position = Number(dimension[3]);
+            const info = Number(dimension[5]);
+            if (status < 10 || status > 14 || (position > 100 && position !== 255)
+                || Number(dimension[4]) > 7 || ![0, 12, 13, 14, 15].includes(info)) return null;
+            return { where: dimension[1], direction: status === 10 ? 'stopped' : status === 11 || status === 13 ? 'opening' : 'closing',
+                position: position === 255 ? null : position, blocked: [12, 13, 14].includes(info) };
         }
-        return { who: null, where: null };
+        const standard = packet.match(/^\*2\*(?:1000#)?(0|1|2|10|11|12)(?:#[\d#]+)?\*([\d#]+)##$/);
+        if (!standard) return null;
+        const what = Number(standard[1]) % 10;
+        return { where: standard[2], direction: what === 0 ? 'stopped' : what === 1 ? 'opening' : 'closing' };
     }
 
     static decodeTemperature(data: string): number {
-        const m = data.match(/(\d)(\d\d)(\d)/);
+        const m = data.match(/^([01])(\d\d)(\d)$/);
         if (!m) return 0;
         let temperature = parseInt(m[2], 10) + (parseInt(m[3], 10) / 10);
         if (m[1] !== '0') {

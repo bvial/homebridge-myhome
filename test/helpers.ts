@@ -1,4 +1,6 @@
 import type { OwnPlatformLike } from '../lib/OwnAccessory';
+import { Socket } from 'node:net';
+import { OwnClient, OwnConnection, PKT, STATE, type CommandParams } from '../lib/OwnNet';
 
 export const POSITION_STATE = { DECREASING: 0, INCREASING: 1, STOPPED: 2 } as const;
 export const HEATING_COOLING_CURRENT = { OFF: 0, HEAT: 1, COOL: 2 } as const;
@@ -24,9 +26,9 @@ function makeCharacteristicStub() {
         value: unknown;
         props: unknown;
         getter?: () => unknown;
-        setter?: (v: unknown) => void;
+        setter?: (v: unknown) => void | Promise<void>;
         onGet: (fn: () => unknown) => typeof stub;
-        onSet: (fn: (v: unknown) => void) => typeof stub;
+        onSet: (fn: (v: unknown) => void | Promise<void>) => typeof stub;
         setProps: (p: unknown) => typeof stub;
         updateValue: (v: unknown) => typeof stub;
         setCharacteristic: () => typeof stub;
@@ -34,7 +36,7 @@ function makeCharacteristicStub() {
         value: undefined,
         props: undefined,
         onGet: (fn: () => unknown) => { stub.getter = fn; return stub; },
-        onSet: (fn: (v: unknown) => void) => { stub.setter = fn; return stub; },
+        onSet: (fn: (v: unknown) => void | Promise<void>) => { stub.setter = fn; return stub; },
         setProps: (p: unknown) => { stub.props = p; return stub; },
         updateValue: (v: unknown) => { stub.value = v; return stub; },
         setCharacteristic: () => stub,
@@ -96,7 +98,7 @@ export function makeMockAccessory() {
     };
 }
 
-export function makeMockPlatform() {
+export function makeMockPlatform(acknowledgeCommands = true) {
     const Service = {
         AccessoryInformation: 'AccessoryInformation',
         Lightbulb: 'Lightbulb',
@@ -156,7 +158,15 @@ export function makeMockPlatform() {
 
     return {
         log: { info: noop, debug: noop, warn: noop, error: noop, success: noop } as unknown as import('homebridge').Logging,
-        controller: { sendCommand: sendCommandSpy, commandQueue: [] as unknown[], queueSize: () => 0 },
+        controller: {
+            sendCommand: (params: CommandParams): boolean => {
+                const queued = !!sendCommandSpy(params);
+                if (queued && acknowledgeCommands && params.serialKey) { params.started?.(); params.done?.(PKT.ACK, 0); }
+                return queued;
+            },
+            cancelQueued: (_key: string) => {},
+            commandQueue: [] as unknown[], queueSize: () => 0,
+        },
         Service: Service as unknown as OwnPlatformLike['Service'],
         Characteristic: Characteristic as unknown as OwnPlatformLike['Characteristic'],
         HapStatusError: function (this: { code: number }, code: number) { this.code = code; } as unknown as new (status: number) => Error,
@@ -170,4 +180,23 @@ export function makeMockPlatform() {
         sendCommandSpy: sendCommandSpy,
         updateAccessorySpy: updateAccessorySpy,
     };
+}
+
+/** Exercise the real command queue and parser without connecting to a gateway. */
+export function makeMockClient(log: OwnPlatformLike['log'], connectImmediately = true) {
+    const client = new OwnClient('127.0.0.1', 20000, '', log);
+    const connections: OwnConnection[] = [];
+    const sent: string[] = [];
+    client.newConnection = mode => {
+        const connection = new OwnConnection(client.host, client.port, client.password, mode, log);
+        connection.connect = () => {
+            connection.conn = new Socket();
+            connection.state = STATE.CONNECTED;
+            if (connectImmediately) connection.emit('connected');
+        };
+        connection.sendPacket = packet => { sent.push(packet); };
+        connections.push(connection);
+        return connection;
+    };
+    return { client, connections, sent };
 }

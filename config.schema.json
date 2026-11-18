@@ -4,6 +4,17 @@
     "schema": {
         "type": "object",
         "properties": {
+            "expose": {
+                "title": "Expose devices through",
+                "type": "string",
+                "default": "homekit",
+                "description": "Choose HomeKit, Matter, or both. Matter must also be enabled on this Homebridge bridge. Switching protocols changes the accessories paired with your apps.",
+                "oneOf": [
+                    { "title": "HomeKit", "enum": ["homekit"] },
+                    { "title": "Matter", "enum": ["matter"] },
+                    { "title": "HomeKit and Matter", "enum": ["both"] }
+                ]
+            },
             "name": {
                 "title": "Name",
                 "type": "string",
@@ -29,8 +40,8 @@
                 "type": "string",
                 "required": false,
                 "default": "",
-                "description": "Numeric password for OWN authentication (decimal integer; leave empty if no password)",
-                "pattern": "^$|^[0-9]+$"
+                "description": "Legacy gateways use a numeric password. SHA-1/SHA-256 gateways accept up to 30 alphanumeric characters. Leave empty for a trusted IP connection.",
+                "pattern": "^[A-Za-z0-9]{0,30}$"
             },
             "maxConcurrent": {
                 "title": "Max concurrent commands",
@@ -76,7 +87,7 @@
                         },
                         "dimmer": {
                             "title": "Dimmer",
-                            "description": "Enable dimmer support (brightness levels 2-10)",
+                            "description": "Enable dimmer support (OWN levels 2-10 = 20%-100%, in 10% steps)",
                             "type": "boolean",
                             "required": false,
                             "default": false
@@ -108,19 +119,41 @@
                             "type": "string",
                             "required": false
                         },
+                        "where": {
+                            "title": "Custom WHERE address",
+                            "description": "Raw shutter address, e.g. 68#4#01 for a local bus. Defaults to id.",
+                            "type": "string",
+                            "pattern": "^#?[0-9]+(#[0-9]+)*$"
+                        },
                         "time": {
                             "title": "Travel time (s)",
-                            "description": "Time in seconds for full linear travel (up or down)",
-                            "type": "integer",
-                            "required": true,
-                            "minimum": 1
+                            "description": "Default linear travel duration for both directions. Set this, or both timeUp and timeDown. Slat rotation is added separately.",
+                            "type": "number",
+                            "required": false,
+                            "minimum": 0.1,
+                            "maximum": 3600
+                        },
+                        "timeUp": {
+                            "title": "Opening travel time (s)",
+                            "description": "Overrides time for opening; excludes slat rotation.",
+                            "type": "number",
+                            "minimum": 0.1,
+                            "maximum": 3600
+                        },
+                        "timeDown": {
+                            "title": "Closing travel time (s)",
+                            "description": "Overrides time for closing; excludes slat rotation.",
+                            "type": "number",
+                            "minimum": 0.1,
+                            "maximum": 3600
                         },
                         "timeSlat": {
                             "title": "Slat rotation time (s)",
                             "description": "Additional time in seconds for slat rotation (venetian blinds only, leave 0 for roller blinds)",
-                            "type": "integer",
+                            "type": "number",
                             "required": false,
                             "minimum": 0,
+                            "maximum": 3600,
                             "default": 0
                         },
                         "slatPercent": {
@@ -129,15 +162,39 @@
                             "type": "integer",
                             "required": false,
                             "minimum": 0,
-                            "maximum": 100,
+                            "maximum": 99,
                             "default": 0
                         },
                         "calibrateOnStart": {
                             "title": "Calibrate on start",
-                            "description": "Move the blind fully down on first Homebridge start to establish a known position. Set to false to restore the last cached position without moving (useful if you don't want blinds to move on every restart).",
+                            "description": "Legacy option, used only when calibration is unset: true = always, false = manual. Saved positions are restored with their confidence.",
                             "type": "boolean",
                             "required": false,
                             "default": true
+                        },
+                        "calibration": {
+                            "title": "Calibration policy",
+                            "description": "Overrides calibrateOnStart. Unknown partial positions require a full opening/closing or a successful calibration first.",
+                            "type": "string",
+                            "oneOf": [
+                                { "title": "At every startup", "enum": ["always"] },
+                                { "title": "At startup if position is unknown", "enum": ["whenUnknown"] },
+                                { "title": "Manual (adds a calibration control)", "enum": ["manual"] }
+                            ]
+                        },
+                        "calibrationSwitch": {
+                            "title": "Show calibration control",
+                            "description": "Adds a linked calibration switch to HomeKit and Matter. Always enabled with the explicit manual policy. Turn it off to stop calibration.",
+                            "type": "boolean",
+                            "default": false
+                        },
+                        "postStopGraceMs": {
+                            "title": "Post-STOP packet filter (ms)",
+                            "description": "Filters one repeated direction packet after a wall STOP (F454 quirk). Set to 0 to disable.",
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": 1000,
+                            "default": 150
                         }
                     }
                 }
@@ -161,6 +218,23 @@
                             "required": true,
                             "minimum": 1
                         },
+                        "where": {
+                            "title": "Central / zone WHERE address",
+                            "description": "Optional raw control address. Use #1 for zone 1 of a 99-zone central unit. Default: #0#<zone> (legacy configuration).",
+                            "type": "string",
+                            "pattern": "^#[0-9]+(#[0-9]+)?$"
+                        },
+                        "matterMode": {
+                            "title": "Thermostat capabilities in Matter",
+                            "type": "string",
+                            "default": "heat",
+                            "description": "Select the functions supported by this zone. The MyHome scheduled programme is exposed as a separate automatic-program switch.",
+                            "oneOf": [
+                                { "title": "Heating", "enum": ["heat"] },
+                                { "title": "Cooling", "enum": ["cool"] },
+                                { "title": "Heating and cooling", "enum": ["both"] }
+                            ]
+                        },
                         "name": {
                             "title": "Name",
                             "type": "string",
@@ -178,10 +252,24 @@
                     "properties": {
                         "id": {
                             "title": "id",
-                            "description": "Scenario number (WHO=0)",
+                            "description": "Stable accessory id; also the scenario number unless scenario is specified",
                             "type": "integer",
                             "required": true,
                             "minimum": 1
+                        },
+                        "scenario": {
+                            "title": "Scenario number",
+                            "description": "WHO 0 scenario number on the module; defaults to id.",
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 20
+                        },
+                        "where": {
+                            "title": "Scenario module address",
+                            "description": "Required module address (01..99), optionally on a local bus, e.g. 23 or 23#4#01. Address 0 is not a general scenario address.",
+                            "type": "string",
+                            "required": true,
+                            "pattern": "^[0-9]{1,2}(#4#[0-9]{1,2})?$"
                         },
                         "name": {
                             "title": "Name",
@@ -200,10 +288,26 @@
                     "properties": {
                         "id": {
                             "title": "id",
-                            "description": "Auxiliary/dry contact address (WHO=9)",
+                            "description": "Stable id: AUX address for legacy WHO 9, channel/ZN for standard WHO 25",
                             "type": "integer",
                             "required": true,
                             "minimum": 1
+                        },
+                        "protocol": {
+                            "title": "Input protocol",
+                            "type": "string",
+                            "default": "auxiliary",
+                            "oneOf": [
+                                { "title": "Legacy AUX (WHO 9)", "enum": ["auxiliary"] },
+                                { "title": "Dry-contact interface (WHO 25)", "enum": ["dry-contact"] },
+                                { "title": "IR detector (WHO 25)", "enum": ["ir"] }
+                            ]
+                        },
+                        "where": {
+                            "title": "Raw input WHERE address",
+                            "description": "Defaults to id for AUX or 3<id> for WHO 25. Example: channel 1 uses 31; alarm Z=1,N=1 uses 311.",
+                            "type": "string",
+                            "pattern": "^#?[0-9]+(#[0-9]+)*$"
                         },
                         "name": {
                             "title": "Name",
@@ -237,10 +341,16 @@
                     "properties": {
                         "id": {
                             "title": "id",
-                            "description": "Energy meter address (WHO=18)",
+                            "description": "Raw WHO 18 address (e.g. 51 for meter 1), or stable id when where is specified",
                             "type": "integer",
                             "required": true,
                             "minimum": 1
+                        },
+                        "where": {
+                            "title": "Raw energy WHERE address",
+                            "description": "Defaults to id. Meters use 5N (e.g. 51); energy actuators use 7N#0 (e.g. 71#0).",
+                            "type": "string",
+                            "pattern": "^#?[0-9]+(#[0-9]+)*$"
                         },
                         "name": {
                             "title": "Name",

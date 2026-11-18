@@ -1,10 +1,15 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
+import { Socket } from 'node:net';
 import { makeMockPlatform, makeSpy } from './helpers';
 import { OwnPlatform } from '../lib/OwnPlatform';
-import { PLUGIN_NAME } from '../lib/constants';
-import type { API, Logging, PlatformAccessory } from 'homebridge';
+import { OwnLightAccessory } from '../lib/OwnAccessory';
+import type { OwnClient } from '../lib/OwnNet';
+import { OwnConnection, PKT, STATE } from '../lib/OwnNet';
+import { PLUGIN_NAME, PLUGIN_VERSION } from '../lib/constants';
+import type { API, Logging, MatterAccessory, PlatformAccessory } from 'homebridge';
+import type { MatterDeviceEntry } from '../lib/OwnMatterBridge';
 
 function makeCharStub() {
     const stub: Record<string, unknown> = {
@@ -113,7 +118,7 @@ function makeMockApi(): MockApi {
 }
 
 function makePlatformInstance(config: Record<string, unknown>, api: MockApi): OwnPlatform {
-    const defaultConfig = { port: 20000, lights: [], blinds: [], thermostats: [], scenarios: [], contacts: [], energies: [] };
+    const defaultConfig = { expose: 'homekit', port: 20000, lights: [], blinds: [], thermostats: [], scenarios: [], contacts: [], energies: [] };
     const mergedConfig = { ...defaultConfig, ...config };
 
     const log: Logging = { info: () => {}, debug: () => {}, warn: () => {}, error: () => {}, success: () => {} } as unknown as Logging;
@@ -127,23 +132,54 @@ function makePlatformInstance(config: Record<string, unknown>, api: MockApi): Ow
         HapStatusError: function (this: { code: number }, code: number) { this.code = code; } as unknown as new (status: number) => Error,
         cachedAccessories: [] as PlatformAccessory[],
         activeHandlers: [],
-        controller: Object.assign(new EventEmitter(), { sendCommand: makeSpy(), startMonitor: () => {}, commandQueue: [] as unknown[], queueSize: () => 0 }),
+        virtualAccessories: new Set<string>(),
+        staggerTimers: [],
+        stopped: false,
+        pendingPersistence: new Set(),
+        controller: Object.assign(new EventEmitter(), { sendCommand: makeSpy(), cancelQueued: () => {}, startMonitor: () => {}, commandQueue: [] as unknown[], queueSize: () => 0 }),
     };
 
-    const p = platform as unknown as OwnPlatform;
-    p.discoverDevices = OwnPlatform.prototype.discoverDevices.bind(p);
-    p.createHandler = OwnPlatform.prototype.createHandler.bind(p);
-    p.onMonitor = OwnPlatform.prototype.onMonitor.bind(p);
-    p.onAccessory = OwnPlatform.prototype.onAccessory.bind(p);
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (p as any).buildConfiguredAddrSet = (OwnPlatform.prototype as any).buildConfiguredAddrSet.bind(p);
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (p as any).registerAutoDiscoveredAccessory = (OwnPlatform.prototype as any).registerAutoDiscoveredAccessory.bind(p);
-
-    return p;
+    return Object.setPrototypeOf(platform, OwnPlatform.prototype) as unknown as OwnPlatform;
 }
 
 describe('OwnPlatform.discoverDevices', () => {
+    it('skips malformed device entries before generating or registering accessories', () => {
+        const api = makeMockApi();
+        const platform = makePlatformInstance({ host: '127.0.0.1', lights: [null, {}, { id: 1, name: 'Valid' }], blinds: 'not-an-array' }, api);
+        assert.doesNotThrow(() => platform.discoverDevices());
+        assert.equal(platform.activeHandlers.length, 1);
+        assert.equal(api.registered.length, 1);
+        platform.activeHandlers.forEach(handler => handler.destroy());
+    });
+    it('routes standard WHO25 dry-contact events to the configured sensor', () => {
+        const api = makeMockApi();
+        const platform = makePlatformInstance({ host: '127.0.0.1', contacts: [{ id: 1, protocol: 'dry-contact' }] }, api);
+        platform.discoverDevices();
+        try {
+            platform.onMonitor('*25*31#1*31##');
+            assert.equal(platform.activeHandlers[0].snapshot().triggered, false);
+            platform.onMonitor('*25*32#0*31##');
+            assert.equal(platform.activeHandlers[0].snapshot().triggered, true);
+        } finally { platform.activeHandlers.forEach(handler => handler.destroy()); }
+    });
+    it('batches intermediate position persistence and flushes a STOP immediately', t => {
+        t.mock.timers.enable({ apis: ['setTimeout'] });
+        const api = makeMockApi();
+        const platform = makePlatformInstance({ host: '127.0.0.1' }, api);
+        const first = makeAccessoryStub('Blind 1', 'blind-1');
+        const second = makeAccessoryStub('Blind 2', 'blind-2');
+        platform.persistAccessory(first, false);
+        platform.persistAccessory(second, false);
+        assert.equal(api.updated.length, 0);
+        t.mock.timers.tick(1000);
+        assert.deepEqual(api.updated, [[[first, second]]]);
+        platform.persistAccessory(first, false);
+        platform.persistAccessory(second, true);
+        assert.equal(api.updated.length, 2);
+        t.mock.timers.tick(1000);
+        assert.equal(api.updated.length, 2);
+    });
+
     it('registers new light accessory', () => {
         const api = makeMockApi();
         const platform = makePlatformInstance({ host: '127.0.0.1', lights: [{ id: 42, name: 'Kitchen' }] }, api);
@@ -461,9 +497,344 @@ describe('constants', () => {
     it('PLUGIN_NAME matches npm package name', () => {
         assert.equal(PLUGIN_NAME, 'homebridge-myhome-unik');
     });
+
+    it('PLUGIN_VERSION is valid semver', () => {
+        assert.match(PLUGIN_VERSION, /^\d+\.\d+\.\d+/);
+    });
+});
+
+describe('OwnPlatform Matter lifecycle', () => {
+    const config = { host: '127.0.0.1', lights: [{ id: 42, name: 'Kitchen' }] };
+    const finish = (platform: OwnPlatform): Promise<void> => (platform as unknown as {
+        finishDiscovery(ctrl: OwnClient): Promise<void>;
+    }).finishDiscovery(platform.controller);
+
+    function matterCache(api: MockApi, type: string, id: number, extra: Record<string, unknown> = {}): MatterAccessory {
+        return {
+            UUID: api.hap.uuid.generate(`myhome-${type}-${id}`), displayName: `Cached ${type}`,
+            context: { deviceContext: { type, device: { id, ...extra }, blindPosition: 63 } },
+        } as unknown as MatterAccessory;
+    }
+
+    it('publishes both protocols through the same device controller', async () => {
+        const api = makeMockApi();
+        const platform = makePlatformInstance({ ...config, expose: 'both' }, api);
+        const reconciled: MatterDeviceEntry[][] = [];
+        Object.assign(platform, { matterBridge: { sync: async (entries: MatterDeviceEntry[]) => { reconciled.push(entries); } } });
+        platform.discoverDevices();
+        await finish(platform);
+        try {
+            assert.equal(api.registered.length, 1);
+            assert.equal(platform.activeHandlers.length, 1);
+            assert.equal(reconciled[0][0].device, platform.activeHandlers[0]);
+            platform.setAllOnline(true);
+            platform.onMonitor('*1*1*42##');
+            assert.equal(reconciled[0][0].device.snapshot().on, true);
+            assert.equal(reconciled[0][0].device.snapshot().online, true);
+        } finally {
+            for (const handler of platform.activeHandlers) handler.destroy();
+        }
+    });
+
+    it('keeps Matter-only controllers unpublished in HomeKit', async () => {
+        const api = makeMockApi();
+        const platform = makePlatformInstance({ ...config, expose: 'matter' }, api);
+        let count = 0;
+        Object.assign(platform, { matterBridge: { sync: async (entries: MatterDeviceEntry[]) => { count = entries.length; } } });
+        platform.discoverDevices();
+        await finish(platform);
+        try {
+            platform.updateAccessory(platform.activeHandlers[0].accessory);
+            platform.discoverDevices();
+            assert.equal(api.registered.length, 0);
+            assert.equal(api.updated.length, 0);
+            assert.equal(count, 1);
+            assert.equal(platform.activeHandlers.length, 1);
+        } finally {
+            for (const handler of platform.activeHandlers) handler.destroy();
+        }
+    });
+
+    it('restores blind position from the Matter cache without publishing HomeKit', () => {
+        const api = makeMockApi();
+        const platform = makePlatformInstance({
+            host: config.host, expose: 'matter', blinds: [{ id: 23, time: 20, calibrateOnStart: false }],
+        }, api);
+        platform.configureMatterAccessory(matterCache(api, 'blind', 23, { time: 20, calibrateOnStart: false }));
+        platform.discoverDevices();
+        try {
+            assert.equal(platform.activeHandlers[0].snapshot().position, 63);
+            assert.equal(api.registered.length, 0);
+        } finally {
+            for (const handler of platform.activeHandlers) handler.destroy();
+        }
+    });
+
+    it('prefers the HomeKit cache if both caches contain the same device', () => {
+        const api = makeMockApi();
+        const platform = makePlatformInstance({ ...config, expose: 'both' }, api);
+        platform.configureMatterAccessory(matterCache(api, 'light', 42));
+        const hap = makeAccessoryStub('Kitchen', api.hap.uuid.generate('myhome-light-42'));
+        platform.configureAccessory(hap);
+        platform.discoverDevices();
+        try {
+            assert.equal(platform.cachedAccessories.length, 1);
+            assert.equal(platform.activeHandlers.length, 1);
+            assert.equal(platform.activeHandlers[0].accessory, hap);
+            assert.equal(api.registered.length, 0);
+        } finally {
+            for (const handler of platform.activeHandlers) handler.destroy();
+        }
+    });
+
+    it('publishes a cached Matter device once when switching to HomeKit', async () => {
+        const api = makeMockApi();
+        const platform = makePlatformInstance(config, api);
+        const reconciled: MatterDeviceEntry[][] = [];
+        Object.assign(platform, { matterBridge: {
+            configureAccessory: () => {},
+            sync: async (entries: MatterDeviceEntry[]) => { reconciled.push(entries); },
+        } });
+        platform.configureMatterAccessory(matterCache(api, 'light', 42));
+        platform.discoverDevices();
+        await finish(platform);
+        try {
+            platform.discoverDevices();
+            assert.equal(api.registered.length, 1);
+            assert.deepEqual(reconciled, [[]], 'previous Matter endpoints must be removed');
+        } finally {
+            for (const handler of platform.activeHandlers) handler.destroy();
+        }
+    });
+
+    it('unpublishes the HomeKit accessory once when switching to Matter', () => {
+        const api = makeMockApi();
+        const platform = makePlatformInstance({ ...config, expose: 'matter' }, api);
+        const hap = makeAccessoryStub('Kitchen', api.hap.uuid.generate('myhome-light-42'));
+        platform.configureAccessory(hap);
+        platform.discoverDevices();
+        try {
+            platform.discoverDevices();
+            assert.equal(api.unregistered.length, 1);
+            assert.deepEqual(api.unregistered[0][2], [hap]);
+            assert.equal(api.registered.length, 0);
+            assert.equal(platform.activeHandlers.length, 1);
+        } finally {
+            for (const handler of platform.activeHandlers) handler.destroy();
+        }
+    });
+
+    it('does not restart monitoring when shutdown occurs during Matter registration', async () => {
+        const api = makeMockApi();
+        const platform = makePlatformInstance({ ...config, expose: 'both' }, api);
+        let release!: () => void;
+        const pending = new Promise<void>(resolve => { release = resolve; });
+        let started = false;
+        platform.controller.startMonitor = () => { started = true; };
+        Object.assign(platform, { matterBridge: { sync: () => pending } });
+        platform.discoverDevices();
+        const launching = finish(platform);
+        Object.assign(platform, { stopped: true });
+        release();
+        await launching;
+        try { assert.equal(started, false); } finally {
+            for (const handler of platform.activeHandlers) handler.destroy();
+        }
+    });
+
+    it('shutdown cancels an active scan without publishing its late discoveries', async t => {
+        const api = makeMockApi();
+        const callbacks = new Map<string, () => void>();
+        api.on = (event, callback) => { callbacks.set(event, callback); };
+        const platform = new OwnPlatform(makeMockPlatform().log, {
+            platform: 'MyHome', ...config, expose: 'both', autoDiscover: true, autoDiscoverMaxAddr: 30,
+        }, api as unknown as API);
+        let matterDestroyed = false;
+        let matterSyncs = 0;
+        Object.assign(platform, { matterBridge: {
+            destroy: () => { matterDestroyed = true; },
+            sync: async () => { matterSyncs++; },
+        } });
+        const lifecycle = platform as unknown as { finishDiscovery(ctrl: OwnClient): Promise<void> };
+        const finishDiscovery = lifecycle.finishDiscovery.bind(platform);
+        let discovery: Promise<void> | undefined;
+        lifecycle.finishDiscovery = controller => { discovery = finishDiscovery(controller); return discovery; };
+        const controller = platform.controller;
+        controller.detectGatewayModel = callback => callback(null);
+        let monitorStarts = 0;
+        controller.startMonitor = () => { monitorStarts++; };
+        const connections: OwnConnection[] = [];
+        controller.newConnection = mode => {
+            const connection = new OwnConnection(controller.host, controller.port, controller.password, mode, controller.log);
+            connection.connect = () => {
+                connection.conn = new Socket();
+                connection.state = STATE.CONNECTED;
+                connection.emit('connected');
+            };
+            connection.sendPacket = () => {};
+            connections.push(connection);
+            return connection;
+        };
+        const shutdown = callbacks.get('shutdown')!;
+        t.after(shutdown);
+        callbacks.get('didFinishLaunching')!();
+        assert.ok(discovery);
+        assert.ok(controller.queueSize() > 0);
+        // One device has replied, but most of this scan and its next batch remain pending.
+        connections[0].onData('*1*1*1##' + PKT.ACK);
+        const openedBeforeShutdown = connections.length;
+        shutdown();
+        await discovery;
+        assert.equal(controller.activeCommands, 0);
+        assert.equal(controller.queueSize(), 0);
+        assert.equal(controller.sendCommand({ command: '*1*1*99##' }), false);
+        assert.equal(connections.length, openedBeforeShutdown);
+        assert.ok(connections.every(connection => connection.conn === null));
+        assert.equal(platform.activeHandlers.length, 0);
+        assert.equal(api.registered.length, 1, 'only the configured light was published before shutdown');
+        assert.equal(matterDestroyed, true);
+        assert.equal(matterSyncs, 0);
+        assert.equal(monitorStarts, 0);
+    });
+
+    it('requires Matter to be enabled before selecting Matter-only mode', () => {
+        const api = makeMockApi();
+        assert.throws(() => new OwnPlatform(makeMockPlatform().log, {
+            platform: 'MyHome', host: config.host, expose: 'matter',
+        }, api as unknown as API), /enable Matter/);
+    });
 });
 
 describe('OwnPlatform.autoDiscover', () => {
+    function cacheLight(platform: OwnPlatform, api: MockApi, id: number): PlatformAccessory {
+        const accessory = makeAccessoryStub(`Light ${id}`, api.hap.uuid.generate(`myhome-auto-1-${id}`));
+        accessory.context = { autoDiscovered: true, autoWho: 1, autoId: id, type: 'light', device: { id } };
+        platform.cachedAccessories.push(accessory);
+        return accessory;
+    }
+
+    function scan(platform: OwnPlatform): Promise<void> {
+        return (platform as unknown as { runAutoDiscovery(ctrl: OwnClient): Promise<void> })
+            .runAutoDiscovery(platform.controller);
+    }
+
+    it('restores the HomeKit category and blind position from an auto-discovered Matter cache', async () => {
+        const api = makeMockApi();
+        const platform = makePlatformInstance({ host: '127.0.0.1', autoDiscover: true, autoDiscoverMaxAddr: 1 }, api);
+        platform.configureMatterAccessory({
+            UUID: api.hap.uuid.generate('myhome-auto-2-23'), displayName: 'Blind 23',
+            context: { deviceContext: {
+                type: 'blind', device: { id: 23, time: 30, calibrateOnStart: false },
+                autoDiscovered: true, autoWho: 2, autoId: 23, blindPosition: 63,
+            } },
+        } as unknown as MatterAccessory);
+        platform.controller.sendCommand = params => { params.done?.(null, -1); return true; };
+        platform.discoverDevices();
+        await scan(platform);
+        try {
+            assert.equal(api.registered.length, 1);
+            const [accessory] = api.registered[0][2] as PlatformAccessory[];
+            assert.equal(accessory.category, 14, 'restored blind must use the WindowCovering category');
+            assert.equal(platform.activeHandlers.length, 1);
+            assert.equal(platform.activeHandlers[0].snapshot().position, 63);
+            await scan(platform);
+            assert.equal(api.registered.length, 1, 'a subsequent scan must reuse the published accessory');
+        } finally {
+            for (const handler of platform.activeHandlers) handler.destroy();
+        }
+    });
+
+    for (const scanThrows of [false, true]) {
+        it(`restores cached devices when the startup scan ${scanThrows ? 'throws' : 'gets no replies'}`, async () => {
+            const api = makeMockApi();
+            const platform = makePlatformInstance({ host: '127.0.0.1', autoDiscover: true, autoDiscoverMaxAddr: 1 }, api);
+            const cached = cacheLight(platform, api, 5);
+            platform.controller.sendCommand = params => {
+                if (scanThrows) throw new Error('gateway unavailable');
+                params.done?.(null, -1);
+                return true;
+            };
+            platform.discoverDevices();
+            await scan(platform);
+            try {
+                assert.equal(api.unregistered.length, 0);
+                assert.equal(api.registered.length, 0);
+                const handler = platform.activeHandlers.find(h => h.accessory === cached);
+                assert.ok(handler instanceof OwnLightAccessory);
+                platform.onMonitor('*1*1*5##');
+                assert.equal(handler.value, true, 'returning device must receive monitor events');
+            } finally {
+                for (const handler of platform.activeHandlers) handler.destroy();
+            }
+        });
+    }
+
+    it('preserves distinct cached devices when a custom WHERE shares their id or prefix', async () => {
+        const api = makeMockApi();
+        const platform = makePlatformInstance({
+            host: '127.0.0.1', autoDiscover: true, autoDiscoverMaxAddr: 1,
+            lights: [{ id: 7, where: '68#4#01' }],
+        }, api);
+        const cached = [cacheLight(platform, api, 7), cacheLight(platform, api, 68)];
+        platform.controller.sendCommand = params => { params.done?.(null, -1); return true; };
+        platform.discoverDevices();
+        await scan(platform);
+        try {
+            assert.equal(api.unregistered.length, 0);
+            for (const accessory of cached) {
+                assert.ok(platform.activeHandlers.some(h => h.accessory === accessory));
+                assert.ok(platform.cachedAccessories.includes(accessory));
+            }
+        } finally {
+            for (const handler of platform.activeHandlers) handler.destroy();
+        }
+    });
+
+    it('promotes only the exact effective address even when the scan fails', async () => {
+        const api = makeMockApi();
+        const platform = makePlatformInstance({
+            host: '127.0.0.1', autoDiscover: true, autoDiscoverMaxAddr: 1,
+            lights: [{ id: 7, where: '15' }],
+        }, api);
+        const retained = cacheLight(platform, api, 7);
+        const promoted = cacheLight(platform, api, 15);
+        platform.controller.sendCommand = params => { params.done?.(null, -1); return true; };
+        platform.discoverDevices();
+        await scan(platform);
+        try {
+            assert.equal(api.unregistered.length, 1);
+            assert.deepEqual(api.unregistered[0][2], [promoted]);
+            assert.ok(platform.cachedAccessories.includes(retained));
+            assert.ok(!platform.cachedAccessories.includes(promoted));
+        } finally {
+            for (const handler of platform.activeHandlers) handler.destroy();
+        }
+    });
+
+    it('reuses a restored handler when its device also responds to the scan', async () => {
+        const api = makeMockApi();
+        const platform = makePlatformInstance({ host: '127.0.0.1', autoDiscover: true, autoDiscoverMaxAddr: 1 }, api);
+        const cached = cacheLight(platform, api, 1);
+        platform.controller.sendCommand = params => {
+            if (params.command === '*#1*1##') {
+                params.packet?.('*1*1*1##');
+                params.done?.('*#*1##', 0);
+            } else {
+                params.done?.(null, -1);
+            }
+            return true;
+        };
+        platform.discoverDevices();
+        await scan(platform);
+        try {
+            assert.equal(platform.activeHandlers.filter(h => h.accessory === cached).length, 1);
+            assert.equal(api.registered.length, 0);
+            assert.equal(api.updated.length, 1);
+        } finally {
+            for (const handler of platform.activeHandlers) handler.destroy();
+        }
+    });
+
     it('registerAutoDiscoveredAccessory registers new light with placeholder name', () => {
         const api = makeMockApi();
         const platform = makePlatformInstance({ host: '127.0.0.1', autoDiscover: true }, api);
@@ -489,19 +860,17 @@ describe('OwnPlatform.autoDiscover', () => {
         assert.equal(api.registered.length, 0);
     });
 
-    it('buildConfiguredAddrSet maps WHO to configured ids', () => {
+    it('buildConfiguredAddrSet maps WHO to exact effective bus addresses', () => {
         const api = makeMockApi();
         const platform = makePlatformInstance({
             host: '127.0.0.1',
-            lights: [{ id: 3 }, { id: 7 }],
+            lights: [{ id: 3 }, { id: 7, where: '15' }, { id: 8, where: '68#4#01' }],
             blinds: [{ id: 2, time: 20 }],
         }, api);
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const addrSet: Map<number, Set<number>> = (platform as any).buildConfiguredAddrSet();
-        assert.ok(addrSet.get(1)?.has(3));
-        assert.ok(addrSet.get(1)?.has(7));
-        assert.ok(addrSet.get(2)?.has(2));
-        assert.ok(!addrSet.get(1)?.has(10));
+        const addrSet: Map<number, Set<string>> = (platform as any).buildConfiguredAddrSet();
+        assert.deepEqual(addrSet.get(1), new Set(['3', '15', '68#4#01']));
+        assert.deepEqual(addrSet.get(2), new Set(['2']));
     });
 
     it('discoverDevices preserves auto-discovered cached accessory when autoDiscover:true', () => {

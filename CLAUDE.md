@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Homebridge platform plugin (`homebridge-myhome-unik`) that bridges **Legrand MyHome** (BTicino) home automation gateways with Apple HomeKit via Homebridge. Uses the **Dynamic Platform API** (Homebridge >=2.0). **TypeScript with strict mode** (Node.js >=18). Requires a build step: `npm run build` compiles `*.ts` → `dist/`.
+Homebridge platform plugin (`homebridge-myhome-unik`) that bridges **Legrand MyHome** (BTicino) home automation gateways with HomeKit and Matter via Homebridge. Uses the **Dynamic Platform API** (Homebridge >=2.4, 2.x). **TypeScript with strict mode** (Node.js 22 >=22.13.0, 24 or 26). Requires a build step: `npm run build` compiles `*.ts` → `dist/`.
 
 ## Commands
 
@@ -12,14 +12,14 @@ Homebridge platform plugin (`homebridge-myhome-unik`) that bridges **Legrand MyH
 npm install          # Install dependencies
 npm run build        # Compile TypeScript → dist/
 npm test             # Build + run automated test suite (node --test)
-node test.ts         # Manual integration test against a real gateway (compile first)
+node test.js         # Manual integration test against a real gateway (compile first)
 ```
 
 ## Architecture
 
 ### Entry Point & Registration
 
-[index.ts](index.ts) registers `OwnPlatform` as a Dynamic Platform using the 2-argument `api.registerPlatform(PLATFORM_NAME, OwnPlatform)`. Re-exports `PLUGIN_NAME` and `PLATFORM_NAME` from [lib/constants.ts](lib/constants.ts). Previously `index.js` imported these back from itself (circular require); the `constants.ts` module breaks that cycle.
+[index.ts](index.ts) registers `OwnPlatform` using `api.registerPlatform(PLUGIN_NAME, PLATFORM_NAME, OwnPlatform)`. Re-exports `PLUGIN_NAME` and `PLATFORM_NAME` from [lib/constants.ts](lib/constants.ts).
 
 ### Dynamic Platform Lifecycle
 
@@ -36,6 +36,36 @@ node test.ts         # Manual integration test against a real gateway (compile f
 | [lib/OwnNet.ts](lib/OwnNet.ts) | `OwnConnection`, `OwnMonitor`, `OwnClient` | TCP networking, OpenWebNet auth handshake, command queue (concurrency auto-detected or config-driven) |
 | [lib/OwnAccessory.ts](lib/OwnAccessory.ts) | `OwnLightAccessory`, `OwnBlindAccessory`, `OwnThermostatAccessory`, `OwnScenarioAccessory`, `OwnContactAccessory`, `OwnEnergyAccessory` | HomeKit accessory implementations using `onGet`/`onSet` API |
 | [lib/OwnProtcol.ts](lib/OwnProtcol.ts) | `OwnProtcol` | Stateless packet parsing/encoding utilities and WHO constants |
+| [lib/OwnDevice.ts](lib/OwnDevice.ts) | `OwnDevice` | Shared command, snapshot and event contract for both protocols |
+| [lib/OwnMatterBridge.ts](lib/OwnMatterBridge.ts) | `OwnMatterBridge` | Matter descriptors, commands, state projection and cache reconciliation |
+| [lib/OwnBlindController.ts](lib/OwnBlindController.ts) | `OwnBlindController` | Protocol-neutral motor operations, cancellation, calibration and position confidence |
+| [lib/BlindPositionEstimator.ts](lib/BlindPositionEstimator.ts) | `BlindPositionEstimator` | Fractional monotonic travel-time integration with independent directional durations and slat zone |
+
+### HomeKit and Matter
+
+The platform's `expose` option is `homekit` (default), `matter`, or `both`. Matter
+also requires the bridge's Matter API to be enabled. Each physical device has
+one controller in `activeHandlers`; both adapters call its `execute()` and
+observe its `snapshot()`/`subscribe()` contract. Matter-only mode uses an
+unpublished HAP service container for the existing device controller. Never
+instantiate a second blind state machine or energy poller for the other protocol.
+
+`configureMatterAccessory()` restores `context.deviceContext` into this container
+when no HAP cache is available. Matter descriptors are registered after discovery
+and before starting the monitor. Snapshot updates are deferred outside Matter
+command transactions, and shutdown prevents pending startup work from reconnecting.
+
+Dimmers compose the public LevelControl behavior and override its command logic
+hooks, including the WithOnOff variants that Homebridge 2.4 does not forward through
+its handler registry. Do not also register `handlers.levelControl`: Homebridge would
+replace the composed behavior. Cached dimmer endpoints must be reconstructed to
+restore these hooks because Homebridge compares behavior keys rather than classes.
+
+Thermostat `matterMode` (`heat`, `cool`, `both`; default `heat`) selects Matter
+capabilities. MyHome's scheduled `auto` mode is exposed as a separate programme
+switch, not Matter's automatic heat/cool mode. Temperature writes in scheduled
+mode remain rejected. Scenarios use a commandable virtual outlet with auto-reset;
+doorbells emit GenericSwitch events. Power is converted from W to Matter mW.
 
 ### Communication Model
 
@@ -44,17 +74,23 @@ The plugin connects to a Legrand gateway over **raw TCP on port 20000** using th
 - **MONITOR connection** (`*99*1##`): persistent; receives all state-change events pushed by the gateway.
 - **COMMAND connections** (`*99*9##`): short-lived, queued; concurrency limit auto-detected from gateway model at startup (see `maxConcurrent` below) or overridden via config.
 
-**Authentication**: The gateway either accepts the connection immediately (`*#*1##`) or sends a nonce. The client responds using `calcPass()` in `OwnNet.ts` — a bit-rotation/XOR chain applied to the configured password integer.
+**Authentication**: Trusted-IP connections are accepted immediately. Legacy nonces use `calcPass()` in `OwnNet.ts`. `*98*1##` / `*98*2##` negotiate SHA-1/SHA-256 mutual authentication implemented in `OwnAuth.ts` against Legrand HMAC v1.1. It is a hash of ASCII hex fields, not `crypto.createHmac`. Verify the server proof before emitting `connected`. Any authentication failure blocks the whole client, including queued discovery commands.
 
 **Packet format**: `*WHO*WHAT*WHERE##` for commands, `*#WHO*WHERE*DIM*VAL##` for dimension reads. Multiple packets can arrive concatenated in one TCP data event; `OwnConnection` handles this with a while-loop regex scan.
 
 ### Accessory Behavior Notes
 
-- **`OwnLightAccessory`**: Supports dimmer mode (config `dimmer: true`). Brightness maps to OWN levels 2-10; brightness=0 sends an off command. Also handles extended packets `*1*1000#X*WHERE##` (sent by the gateway when a light is triggered by a scenario or automation rule): `X=0` → off, `X>0` → on. Identify command blinks the light off then back on. Supports custom `where` config string for special relay configurations (e.g. `"68#4#01"`); defaults to `String(id)`. The `checkWhere` override matches the exact `where` string, and the `onData`/status-query regexes accept `[\d#]+` so non-numeric WHERE addresses are recognized.
-- **`OwnBlindAccessory`**: Position modeled by timing movement against configured `time` (seconds for full travel). Supports venetian blinds with `timeSlat`/`slatPercent`. On first `updateStatus()` resets to known state by issuing a full down command, with a calibration-end timer that fires STOP after `time + timeSlat + 1s`. Identify command jogs the blind up for 1s then stops. Position is cached to `accessory.context.blindPosition` on every STOP and at every 10% boundary during movement; `calibrateOnStart: false` restores the cached position at startup without moving the blind. Direction mapping (verified on Legrand/BTicino installations): `*2*1*` → INCREASING (UP/opening), `*2*2*` → DECREASING (DOWN/closing); `moveUp()` sends `*2*1*`, `moveDown()` sends `*2*2*`, calibration init sends `*2*2*`.
+- **Matter restoration**: Homebridge >= 2.5.0 restores composed thermostat/occupancy
+  features in place. Detect it via `api.versionGreaterOrEqual`, preserving the 2.4
+  reconstruction path. Custom dimmer LevelControl classes still require reconstruction
+  on both versions; behavior-key/feature checks cannot compare their device hooks.
+
+- **`OwnLightAccessory`**: WHAT 2..10 means 20..100% (WHO 1 v1.2), not a remapped 1..100% scale. DIM 1 reports level 100..200 plus speed; subtract 100. Decode via `OwnProtcol.decodeLightState`, including `1000#WHAT`, and filter the exact WHERE. Relative/timed WHATs must not become brightness levels. Later bus observations take precedence over ACK fallback; HAP writes reassert the actual level after commit.
+- **`OwnBlindAccessory`**: HAP facade over one `OwnBlindController`; Matter calls the same facade. `timeUp`/`timeDown` fall back to `time`. Position is fractional and monotonic-time-based, not callback-count-based. Each target replaces unsent older commands using generation guards, including after TCP handshake. STOP uses reserved capacity and priority, preserving per-device ordering. Monitor STOPs override automatic movement unless correlated with a sent STOP or a completed full run; status-channel replies never mask monitor events. Timed calibration (`always`, `whenUnknown`, `manual`) requires an uninterrupted full closing duration including slat time and either its natural end-stop or an acknowledged safety STOP. `calibrateOnStart` retains its legacy meaning when the new policy is absent. `blindState` holds confidence/timestamp/dirty marker, `blindPosition` remains for migration. Start/STOP persistence is immediate; intermediate checkpoints are batched. Unknown partial positions are rejected; a full endpoint run is allowed. Direction mapping remains `*2*1*` = opening, `*2*2*` = closing. Tests inject the clock and exercise public commands/events, not obsolete timer flags.
+  Natural end-stop STOPs after the full travel duration complete calibration without waiting for the extra margin. Advanced DIM 10 reports supply measured positions (255 = unknown) and disabled/rejected states. Never overwrite explicit unknown hardware feedback with a timed reference. `where` supports local buses; independent tilt and native GoToLevel writes are not exposed.
 - **`OwnThermostatAccessory`**: Uses two addresses — `id` for the zone probe and `#0#<zone>` for central unit commands. Supports HEAT, COOL, OFF, and AUTO modes. TargetTemperature is writable in both HEAT and COOL modes (DIM 14 mode byte `*1` = Heat, `*2` = Cool). Linked `TemperatureSensor` service provides temperature history graphing in the Home app. `targetTemperature` is exposed to HomeKit with `minValue=5`/`maxValue=30` and clamped on every update so out-of-range setpoints from the gateway (e.g. `0` when the zone is OFF) do not trigger HAP warnings.
 - **`OwnScenarioAccessory`**: Exposed as a `Switch` with auto-reset after 500ms (preserves automations). The historical `asButton` option (which used `StatelessProgrammableSwitch`) was removed in 0.4.7 because SPS is emit-only in HomeKit — it cannot receive taps from the Home app, so `asButton: true` silently disabled activation. Any pre-existing SPS service from an older install is cleaned up at startup.
-- **`OwnContactAccessory`**: Read-only dry contact sensor (WHO=9/auxiliary). Optional `sensorType` config selects HomeKit display: `contact` (default, door/window), `motion`, `occupancy`, `leak`, `smoke`, or `co` (CarbonMonoxide). For non-`contact` types, contact CLOSED is the safe/idle state, contact OPEN triggers the alarm/detection.
+- **`OwnContactAccessory`**: `protocol` selects legacy WHO 9 `auxiliary` or standard WHO 25 `dry-contact`/`ir`. WHO 25 uses 31#0/1 and 32#0/1 at 3N addresses. 31 means closed for a contact and detected for IR; polarity must not be conflated. `sensorType` selects the HAP/Matter presentation. CEN button frames are ignored rather than routed as contact events.
 - **`OwnEnergyAccessory`**: Default mode is `LightSensor` with watts displayed as lux (legacy). Optional `asOutlet: true` config exposes it as `Outlet` with the Eve Consumption custom characteristic (UUID `E863F10D-079E-48FF-8F27-9C2605A29F52`) for proper Eve.app integration. Polls every 30s.
 
 ### Service-flip cleanup
@@ -79,11 +115,11 @@ When `asOutlet` or `sensorType` is changed in config, the accessory removes the 
 | 4 | Thermostat/Temperature |
 | 9 | Auxiliary (dry contacts) |
 | 13 | Gateway (keep-alive probe, model query) |
-| 15/25 | CEN / CEN PLUS (physical button press events — received on monitor, silently ignored) |
+| 15/25 | CEN / CEN PLUS; WHO 25 contact/IR states are routed, button events are ignored |
 | 18 | Energy management |
 | 3 | Load control — received on monitor, silently ignored |
 | 5 | Alarm — received on monitor, silently ignored |
-| 7 | Video door entry — received on monitor, silently ignored |
+| 7 | Video door entry — routed to configured door adapters |
 | 16 | Sound system — received on monitor, silently ignored |
 | 17 | Scenario/scene activation — received on monitor, silently ignored |
 | 22 | Sound diffusion — received on monitor, silently ignored |
@@ -92,7 +128,7 @@ When `asOutlet` or `sensorType` is changed in config, the accessory removes the 
 
 ## Configuration
 
-See [config.schema.json](config.schema.json). The platform config block requires `host`. Optional: `port` (default 20000), `password` (numeric string), `maxConcurrent` (integer 1–10, default auto-detected). If `maxConcurrent` is omitted the plugin sends `*#13**15##` (DIM 15 = Device Type) at startup to identify the gateway model and sets the limit accordingly:
+See [config.schema.json](config.schema.json). The platform config block requires `host`. Optional: `port` (default 20000), `password` (numeric legacy or alphanumeric HMAC), `maxConcurrent` (integer 1–10, default auto-detected). If `maxConcurrent` is omitted the plugin sends `*#13**15##` (DIM 15 = Device Type) at startup to identify the gateway model and sets the limit accordingly:
 
 | Model code (DIM 15) | Gateway | `maxConcurrent` |
 |---------------------|---------|-----------------|
@@ -106,12 +142,12 @@ The gateway responds with `*#13**15*<code>##`; if no data packet is received bef
 
 ### Auto-discovery
 
-When `autoDiscover: true` is set in the platform config (default `false`), after `detectGatewayModel` and before `startMonitor` the plugin runs a STATUS scan against the gateway: it probes `*#WHO*WHERE##` for WHO=1/2/9/18 on addresses 1..`autoDiscoverMaxAddr` (default 20) and WHO=4 on zones 1..9. Found addresses not already in any of the manual config arrays are registered as placeholder HomeKit accessories with names like `Light 5`, `Blind 3`, `Thermostat 1`, `Contact 7`, `Energy 12`. The placeholder UUID scheme is `myhome-auto-${who}-${id}` (distinct from the config-driven `myhome-${type}-${id}` scheme), and `accessory.context.autoDiscovered = true` marks them. When the user adds the address to `config.json` and restarts, the new manual UUID supersedes the placeholder, which is then unregistered automatically. Auto-discovered blinds default to `time: 30` and `calibrateOnStart: false` to prevent accidental calibration with a placeholder travel time. Scenarios (WHO=0) and doors (WHO=7) are not auto-discovered because they require command-specific configuration.
+When `autoDiscover: true`, the STATUS scan probes WHO 1/2/9 at 1..N, WHO 4 up to min(N,99), WHO 18 at 5N and WHO 25 at 3N. An ACK alone never establishes device presence: a matching state reply is required. Placeholder UUIDs remain `myhome-auto-${who}-${id}` and promotion compares full bus addresses. Blinds default to `time: 30`, `calibrateOnStart: false`. WHO 25 placeholders use explicit raw WHERE and `protocol: "dry-contact"`; users should select IR presentation when appropriate. Scenarios and doors require manual configuration.
 
 `startMonitor()` is deferred until the auto-discovery scan resolves (typically 2–9 s) to avoid saturating the command queue with concurrent monitor keep-alive probes during the scan. The shared scan logic lives in [lib/scanHelper.ts](lib/scanHelper.ts) and is also used by the standalone `scan.ts` CLI tool.
 
 ## Known Issues / Quirks
 
 - `lib/OwnProtcol.ts` is intentionally misspelled ("Protcol") throughout the codebase — do not rename.
-- `test.ts` is a manual live-gateway test script, not an automated test suite. It is excluded from the TypeScript build (`tsconfig.json` `exclude`) and must be run via `ts-node` or compiled separately.
+- `test.js` is a manual live-gateway test script, not an automated test suite. It runs against compiled output in `dist/` and requires a live gateway.
 - `tsconfig.json` keeps `"ignoreDeprecations": "6.0"` intentionally: `moduleResolution: "node10"` is deprecated in TypeScript 6 but migrating to `node16` requires either switching the project to ESM or adding `resolution-mode` attributes to all `homebridge` type imports (Homebridge 2 ships as ESM). Until the project migrates to ESM output, this suppression is load-bearing.

@@ -13,7 +13,7 @@ describe('runStatusScan', () => {
         assert.deepEqual(result, []);
     });
 
-    it('discovers WHO=2 blinds on ACK without data packet', async () => {
+    it('does not invent WHO=2 blinds from an ACK without a state reply', async () => {
         const client = {
             sendCommand: (params: { command: string; done?: (pkt: string | null) => void }) => {
                 if (params.command.startsWith('*#2*') && params.done) {
@@ -27,7 +27,7 @@ describe('runStatusScan', () => {
 
         const result = await runStatusScan(client as never, 1);
         const blinds = result.filter(x => x.who === 2 && x.where === '1');
-        assert.equal(blinds.length, 1);
+        assert.equal(blinds.length, 0);
     });
 
     it('does not discover WHO=1 lights on ACK-only (requires data packet)', async () => {

@@ -1,25 +1,19 @@
-import type { Characteristic, CharacteristicValue, HapStatusError, Logging, PlatformAccessory, Service } from 'homebridge';
+import type { Characteristic, CharacteristicValue, HapStatusError, Logging, Perms, PlatformAccessory, Service } from 'homebridge';
 import type { OwnClient } from './OwnNet';
+import { PKT } from './OwnNet';
 import { OwnProtcol, WHO } from './OwnProtcol';
 import { PLUGIN_VERSION } from './constants';
+import type { DeviceCommand, DeviceCommandOptions, DeviceEvent, DeviceMode, DeviceState, OwnDevice } from './OwnDevice';
+import { OwnBlindController, BlindError, type BlindConfig, type BlindState } from './OwnBlindController';
+export type { BlindConfig } from './OwnBlindController';
 import {
     brightnessToOwnLevel,
     ownLevelToBrightness,
     errorMessage,
     IDENTIFY_BLINK_MS,
-    IDENTIFY_JOG_MS,
     SCENARIO_RESET_MS,
     DOOR_RESET_MS,
-    BLIND_MOVE_RETRY_INTERVAL_MS,
-    BLIND_MAX_MOVE_RETRIES,
-    BLIND_COMMAND_ECHO_TIMEOUT_MS,
-    BLIND_INIT_CALIBRATION_MARGIN_MS,
-    BLIND_POST_STOP_GRACE_MS,
-    BLIND_END_STOP_SAFETY_MIN_MS,
-    BLIND_END_STOP_SAFETY_MAX_MS,
     COMMAND_QUEUE_BUSY_THRESHOLD,
-    BLIND_MIN_TICK_MS,
-    BLIND_END_STOP_SNAP_PCT,
     ENERGY_POLL_INTERVAL_MS,
     ENERGY_POLL_QUEUE_THRESHOLD,
     ENERGY_OUTLET_IN_USE_THRESHOLD_W,
@@ -35,6 +29,7 @@ export interface OwnPlatformLike {
     HAPStatus: Record<string, number>;
     /** Optional: notify Homebridge that an accessory was mutated (e.g., displayName change). */
     updateAccessory?(accessory: PlatformAccessory): void;
+    persistAccessory?(accessory: PlatformAccessory, immediate: boolean): void;
 }
 
 export interface BaseConfig {
@@ -48,20 +43,19 @@ export interface LightConfig extends BaseConfig {
     where?: string;
 }
 
-export interface BlindConfig extends BaseConfig {
-    time: number;
-    timeSlat?: number;
-    slatPercent?: number;
-    /** Re-calibrate (move fully down) on first Homebridge start to establish a known position.
-     *  Set to false to restore the last cached position without moving the blind (default: true). */
-    calibrateOnStart?: boolean;
-}
-
 export interface ThermostatConfig extends BaseConfig {
     zone: number;
+    /** Raw central/zone address; e.g. #1 for a 99-zone unit. Default: #0#<zone>. */
+    where?: string;
+    /** Capabilities advertised by the Matter adapter; HomeKit keeps its existing modes. */
+    matterMode?: 'heat' | 'cool' | 'both';
 }
 
 export interface ScenarioConfig extends BaseConfig {
+    /** Scenario module address (01..99, optionally on a local bus). */
+    where?: string;
+    /** Scenario number 1..20; defaults to id. */
+    scenario?: number;
     // Note: the historical `asButton` option was removed because a HomeKit
     // StatelessProgrammableSwitch is emit-only — it cannot receive taps from
     // the Home app, so `asButton: true` silently disabled scenario activation.
@@ -69,16 +63,19 @@ export interface ScenarioConfig extends BaseConfig {
 }
 export interface ContactConfig extends BaseConfig {
     sensorType?: 'contact' | 'motion' | 'occupancy' | 'leak' | 'smoke' | 'co';
+    protocol?: 'auxiliary' | 'dry-contact' | 'ir';
+    where?: string;
 }
 export interface EnergyConfig extends BaseConfig {
     asOutlet?: boolean;
+    where?: string;
 }
 export interface DoorConfig extends BaseConfig {
     openCommand?: string;
     doorbell?: boolean;
 }
 
-class OwnAccessory {
+class OwnAccessory implements OwnDevice {
     protected log: Logging;
     protected controller: OwnClient;
     protected Service: typeof Service;
@@ -90,6 +87,8 @@ class OwnAccessory {
     name: string;
     protected id: number;
     protected fault = false;
+    destroyed = false;
+    private readonly deviceListeners = new Set<(event: DeviceEvent) => void>();
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     private charWarningListener: ((warning: any) => void) | undefined;
 
@@ -183,6 +182,7 @@ class OwnAccessory {
                 // Push the displayName change to Homebridge's accessory cache so it survives a restart.
                 this.platform.updateAccessory?.(this.accessory);
                 this.log.info(`[${this.id}] Renamed to "${newName}"`);
+                this.publishState();
             });
         if (withStatusActive) {
             svc.getCharacteristic(this.Characteristic.StatusActive)
@@ -204,17 +204,89 @@ class OwnAccessory {
             this.Characteristic.StatusFault,
             online ? this.Characteristic.StatusFault.NO_FAULT : this.Characteristic.StatusFault.GENERAL_FAULT,
         );
+        this.publishState();
     }
 
-    protected sendOrThrow(command: string): void {
+    snapshot(): DeviceState {
+        return { name: this.name, online: !this.fault && !this.destroyed };
+    }
+
+    subscribe(listener: (event: DeviceEvent) => void): () => void {
+        if (this.destroyed) return () => {};
+        this.deviceListeners.add(listener);
+        return () => { this.deviceListeners.delete(listener); };
+    }
+
+    protected publish(event: DeviceEvent): void {
+        if (this.destroyed) return;
+        for (const listener of this.deviceListeners) {
+            try { listener(event); } catch (err) {
+                this.log.warn('[%s] Device subscriber failed: %s', this.id, errorMessage(err));
+            }
+        }
+    }
+
+    protected publishState(): void {
+        this.publish({ type: 'state', state: this.snapshot() });
+    }
+
+    execute(command: DeviceCommand, options?: DeviceCommandOptions): void | Promise<void> {
+        if (this.destroyed) throw new this.HapStatusError(this.HAPStatus.SERVICE_COMMUNICATION_FAILURE);
+        if (options?.signal?.aborted) throw new this.HapStatusError(this.HAPStatus.NOT_ALLOWED_IN_CURRENT_STATE);
+        if (command.type === 'identify') {
+            this.accessory.emit('identify');
+        } else {
+            const result = this.executeDeviceCommand(command, options);
+            this.publish({ type: 'command', command });
+            // Asynchronous commands publish their committed state on ACK.
+            if (result) return result;
+        }
+        this.publishState();
+    }
+
+    protected executeDeviceCommand(_command: DeviceCommand, _options?: DeviceCommandOptions): void | Promise<void> {
+        throw new this.HapStatusError(this.HAPStatus.NOT_ALLOWED_IN_CURRENT_STATE);
+    }
+
+    protected get commandKey(): string {
+        return `${this.who}:${this.id}`;
+    }
+
+    /** Complete a user action only after the gateway acknowledges it. */
+    protected sendOrThrow(command: string, onAck: () => void = () => {}, onStarted?: () => void, options?: DeviceCommandOptions): Promise<void> {
         if (this.controller.queueSize() >= COMMAND_QUEUE_BUSY_THRESHOLD) {
             this.log.warn('[%s] Command dropped (queue full): %s', this.id, command);
             throw new this.HapStatusError(this.HAPStatus.RESOURCE_BUSY);
         }
-        if (!this.controller.sendCommand({ command, log: this.log })) {
+        let resolve!: () => void;
+        let reject!: (error: unknown) => void;
+        const result = new Promise<void>((ok, fail) => { resolve = ok; reject = fail; });
+        let settled = false;
+        const queued = this.controller.sendCommand({
+            command, log: this.log, serialKey: this.commandKey, started: onStarted, signal: options?.signal,
+            done: (packet, _index, failure) => {
+                if (settled) return;
+                settled = true;
+                if (this.destroyed || packet !== PKT.ACK) {
+                    if (failure === 'cancelled') this.log.debug('[%s] Command cancelled: %s', this.id, command);
+                    else this.log.warn('[%s] Command failed (%s): %s', this.id, failure ?? 'gateway rejected or disconnected', command);
+                    reject(new this.HapStatusError(failure === 'timeout'
+                        ? this.HAPStatus.OPERATION_TIMED_OUT : failure === 'cancelled'
+                            ? this.HAPStatus.NOT_ALLOWED_IN_CURRENT_STATE : this.HAPStatus.SERVICE_COMMUNICATION_FAILURE));
+                    return;
+                }
+                try {
+                    onAck();
+                    this.publishState();
+                    resolve();
+                } catch (err) { reject(err); }
+            },
+        });
+        if (!queued) {
             this.log.warn('[%s] Command rejected (queue saturated): %s', this.id, command);
             throw new this.HapStatusError(this.HAPStatus.RESOURCE_BUSY);
         }
+        return result;
     }
 
     updateStatus(): void {
@@ -238,9 +310,14 @@ class OwnAccessory {
         return null;
     }
 
-    setOnline(_online: boolean): void {}
+    setOnline(online: boolean): void {
+        this.fault = !online;
+        this.publishState();
+    }
 
     destroy(): void {
+        this.destroyed = true;
+        this.deviceListeners.clear();
         // Best-effort listener cleanup — accessory is unregistered shortly after destroy(),
         // but explicit removal documents intent and prevents leaks if the object survives.
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -261,6 +338,9 @@ export class OwnLightAccessory extends OwnAccessory {
     readonly where: string;
     private lightbulbService: InstanceType<typeof Service>;
     private identifyTimeout: ReturnType<typeof setTimeout> | undefined;
+    private powerRevision = 0;
+    private brightnessRevision = 0;
+    private hapCorrection?: ReturnType<typeof setTimeout>;
 
     get who(): number { return WHO.light; }
 
@@ -275,6 +355,7 @@ export class OwnLightAccessory extends OwnAccessory {
         this.dimmer = config.dimmer ?? false;
         this.brightness = 100;
         this.where = config.where ?? String(this.id);
+        if (!OwnProtcol.isWhere(this.where)) throw new Error('Light where must be an OpenWebNet address');
         this.identifyTimeout = undefined;
 
         this.accessory.removeAllListeners('identify');
@@ -293,39 +374,70 @@ export class OwnLightAccessory extends OwnAccessory {
 
         this.lightbulbService.getCharacteristic(this.Characteristic.On)
             .onGet(() => this.value)
-            .onSet((value: CharacteristicValue) => {
-                this.log.info(`[${this.id}] Setting power state to ${value ? 'on' : 'off'}`);
-                if (value && this.dimmer) {
-                    const level = brightnessToOwnLevel(this.brightness);
-                    this.sendOrThrow(`*1*${level}*${this.where}##`);
-                } else {
-                    this.sendOrThrow(`*1*${value ? '1' : '0'}*${this.where}##`);
-                }
-                this.value = value as boolean;
-            });
+            .onSet((value: CharacteristicValue) => this.setFromHap({ type: 'power', value: value as boolean }));
 
         if (this.dimmer) {
             this.lightbulbService.getCharacteristic(this.Characteristic.Brightness)
                 .onGet(() => this.brightness)
-                .onSet((value: CharacteristicValue) => {
-                    this.log.info(`[${this.id}] Setting brightness to ${value}`);
-                    if (value === 0) {
-                        this.sendOrThrow(`*1*0*${this.where}##`);
-                        this.brightness = 0;
-                        this.value = false;
-                        this.lightbulbService.updateCharacteristic(this.Characteristic.On, false);
-                    } else {
-                        const level = brightnessToOwnLevel(value as number);
-                        this.sendOrThrow(`*1*${level}*${this.where}##`);
-                        this.brightness = value as number;
-                        // Setting brightness > 0 on an off lamp also turns it on — sync `On`
-                        // to HomeKit so the tile doesn't show "off" while the lamp is lit.
-                        if (!this.value) {
-                            this.value = true;
-                            this.lightbulbService.updateCharacteristic(this.Characteristic.On, true);
-                        }
-                    }
-                });
+                .onSet((value: CharacteristicValue) => this.setFromHap({ type: 'brightness', value: value as number }));
+        }
+    }
+
+    snapshot(): DeviceState {
+        return { ...super.snapshot(), on: this.value, brightness: this.brightness };
+    }
+
+    private setFromHap(command: DeviceCommand): void | Promise<void> {
+        const result = this.execute(command);
+        return Promise.resolve(result).then(() => {
+            if (this.destroyed) return;
+            // HAP commits the requested value after onSet returns. Reassert the
+            // actual bus value/quantized level outside that write transaction.
+            clearTimeout(this.hapCorrection);
+            this.hapCorrection = setTimeout(() => {
+                this.hapCorrection = undefined;
+                if (this.destroyed) return;
+                this.lightbulbService.updateCharacteristic(this.Characteristic.On, this.value);
+                if (this.dimmer) this.lightbulbService.updateCharacteristic(this.Characteristic.Brightness, this.brightness);
+            }, 0);
+        });
+    }
+
+    protected executeDeviceCommand(command: DeviceCommand, options?: DeviceCommandOptions): void | Promise<void> {
+        let powerRevision = this.powerRevision;
+        let brightnessRevision = this.brightnessRevision;
+        const started = () => { powerRevision = this.powerRevision; brightnessRevision = this.brightnessRevision; };
+        if (command.type === 'power') {
+            this.log.info(`[${this.id}] Setting power state to ${command.value ? 'on' : 'off'}`);
+            const level = command.value && this.dimmer ? brightnessToOwnLevel(this.brightness) : command.value ? 1 : 0;
+            return this.sendOrThrow(`*1*${level}*${this.where}##`, () => {
+                if (powerRevision === this.powerRevision) this.value = command.value;
+                if (this.dimmer && command.value && this.value && brightnessRevision === this.brightnessRevision) {
+                    this.brightness = ownLevelToBrightness(level);
+                    this.lightbulbService.updateCharacteristic(this.Characteristic.Brightness, this.brightness);
+                }
+                this.lightbulbService.updateCharacteristic(this.Characteristic.On, this.value);
+            }, started, options);
+        } else if (command.type === 'brightness' && this.dimmer) {
+            const value = command.value;
+            if (!Number.isFinite(value) || value < 0 || value > 100) {
+                throw new this.HapStatusError(this.HAPStatus.NOT_ALLOWED_IN_CURRENT_STATE);
+            }
+            this.log.info(`[${this.id}] Setting brightness to ${value}`);
+            const level = value === 0 ? 0 : brightnessToOwnLevel(value);
+            return this.sendOrThrow(`*1*${level}*${this.where}##`, () => {
+                const on = value !== 0;
+                if (powerRevision === this.powerRevision) this.value = on;
+                // A generic ON report conveys no brightness. Fill in that missing
+                // value, while preserving newer level reports or a contrary OFF.
+                if (brightnessRevision === this.brightnessRevision && this.value === on) {
+                    this.brightness = level === 0 ? 0 : ownLevelToBrightness(level);
+                }
+                this.lightbulbService.updateCharacteristic(this.Characteristic.Brightness, this.brightness);
+                this.lightbulbService.updateCharacteristic(this.Characteristic.On, this.value);
+            }, started, options);
+        } else {
+            return super.executeDeviceCommand(command);
         }
     }
 
@@ -339,671 +451,140 @@ export class OwnLightAccessory extends OwnAccessory {
             command: `*#1*${this.where}##`,
             log: this.log,
             packet: (pkt: string) => {
-                const m = pkt.match(/^\*#1\*[\d#]+\*1\*(\d+)##$/);
-                if (m) this.onData(`*1*${m[1]}*${this.where}##`);
+                this.onData(pkt);
             },
         });
     }
 
     onData(packet: string): void {
-        // Extended scenario/automation format *1*1000#<level>*<id>## — treat sub-level as the effective level
-        const ext = packet.match(/^\*1\*1000#(\d+)\*[\d#]+##$/);
-        const extract = ext ?? packet.match(/^\*1\*(\d+)\*[\d#]+##$/);
-        if (extract) {
+        const state = OwnProtcol.decodeLightState(packet);
+        if (state && state.where === this.where) {
+            this.powerRevision++;
             this.log.debug('id:%s onLight(%s)', this.id, packet);
-            const level = parseInt(extract[1], 10);
-            if (level === 0) {
-                this.log.info(`[${this.id}] power off`);
-                this.value = false;
-            } else {
-                this.log.info(`[${this.id}] power on (level ${level})`);
-                this.value = true;
-                if (this.dimmer && level >= 2) {
-                    this.brightness = ownLevelToBrightness(level);
-                    this.lightbulbService.updateCharacteristic(this.Characteristic.Brightness, this.brightness);
-                }
+            this.value = state.on;
+            if (this.dimmer && state.brightness !== undefined) {
+                this.brightnessRevision++;
+                this.brightness = state.brightness;
+                this.lightbulbService.updateCharacteristic(this.Characteristic.Brightness, this.brightness);
             }
             this.lightbulbService.updateCharacteristic(this.Characteristic.On, this.value);
+            this.publishState();
         } else {
-            this.log.error('[%s] Light unknown packet:%s', this.id, packet);
+            this.log.debug('[%s] Light ignoring packet:%s', this.id, packet);
         }
     }
 
     destroy(): void {
         clearTimeout(this.identifyTimeout);
+        clearTimeout(this.hapCorrection);
         super.destroy();
     }
 }
 
 export class OwnBlindAccessory extends OwnAccessory {
-    time: number;
-    timeSlat: number;
-    slatPercent: number;
-    state: number;
-    expectedState: number;
-    position: number;
-    initStartPosition: boolean;
-    commandSent: boolean;
-    target: number;
-    moveTrackingTimeout: ReturnType<typeof setTimeout> | undefined;
-    packetTimeout: ReturnType<typeof setTimeout> | undefined;
-    positionTimeout: ReturnType<typeof setTimeout> | undefined;
-    moveRetries: number;
-    initPhase: boolean;
-    homeKitMovement: boolean;
-    private calibrateOnStart: boolean;
-    /** Non-private: read/asserted by the test suite. */
-    inStatusQuery: boolean;
-    private statusQueryTimeout: ReturnType<typeof setTimeout> | undefined;
-    private initTimeout: ReturnType<typeof setTimeout> | undefined;
-    /** True for a brief grace window after a STOP packet, used to suppress the
-     *  spurious post-STOP direction packet some BTicino gateways emit
-     *  (F454 reliably sends *2*2* a few ms after a wall-switch STOP).
-     *  Non-private: read/asserted by the test suite. */
-    postStopGrace: boolean;
-    private postStopGraceTimeout: ReturnType<typeof setTimeout> | undefined;
-    /** The direction ('1' = INCREASING, '2' = DECREASING) the blind was last observed
-     *  moving. Set whenever state transitions to a moving state; NEVER cleared by a STOP.
-     *  The F454 spurious packet is a phantom re-emission of the SAME direction the blind was
-     *  just moving, so the post-STOP filter suppresses only a direction matching this. A
-     *  genuine manual command from an end-stop is the OPPOSITE direction and must pass through.
-     *  Non-private: read/asserted by the test suite. */
-    lastMovingDirection: string;
-    /** True from the moment we send a HomeKit-originated STOP until its echo is received.
-     *  Lets onData() distinguish the echo of our own STOP (no F454 spurious-packet quirk,
-     *  grace must NOT arm) from a physical wall-switch STOP (quirk fires, grace must arm),
-     *  even when a physical STOP happens to arrive while a HomeKit STOP is still in flight.
-     *  Non-private: set by the test suite to simulate an in-flight HomeKit STOP. */
-    homeKitStopPending: boolean;
-    /** Safety timeout for silent physical end-stops — some gateways do NOT emit
-     *  `*2*0*` when the motor reaches its natural end-of-travel. Without this,
-     *  HomeKit's PositionState would stay INCREASING/DECREASING forever. */
-    private endStopSafetyTimeout: ReturnType<typeof setTimeout> | undefined;
-    private identifyJogTimeout: ReturnType<typeof setTimeout> | undefined;
-    private windowCoveringService: InstanceType<typeof Service>;
+    readonly blind: OwnBlindController;
+    private readonly windowCoveringService: Service;
+    private readonly calibrationService?: Service;
 
     get who(): number { return WHO.automation; }
+    checkWhere(where: string): boolean { return where === this.blind.where; }
 
     constructor(platform: OwnPlatformLike, accessory: PlatformAccessory, config: BlindConfig) {
         super(platform, accessory, config, 'blind');
-
-        if (!config.time || config.time <= 0) {
-            throw new Error(`homebridge-myhome: blind id=${config.id} requires a positive "time" value`);
-        }
-        this.time = config.time;
-        this.timeSlat = config.timeSlat ?? 0;
-        this.slatPercent = config.slatPercent ?? 0;
-        this.calibrateOnStart = config.calibrateOnStart ?? true;
-
-        this.state = this.Characteristic.PositionState.STOPPED;
-        this.expectedState = this.Characteristic.PositionState.STOPPED;
-        this.position = this.readCachedPosition();
-        this.target = this.position;
-        this.initStartPosition = false;
-        this.commandSent = false;
-        this.moveTrackingTimeout = undefined;
-        this.packetTimeout = undefined;
-        this.positionTimeout = undefined;
-        this.moveRetries = 0;
-        this.initPhase = false;
-        this.homeKitMovement = false;
-        this.inStatusQuery = false;
-        this.statusQueryTimeout = undefined;
-        this.initTimeout = undefined;
-        this.postStopGrace = false;
-        this.postStopGraceTimeout = undefined;
-        this.homeKitStopPending = false;
-        this.lastMovingDirection = '';
-        this.endStopSafetyTimeout = undefined;
-
         this.windowCoveringService = this.initPrimaryService(this.Service.WindowCovering, 'WindowCovering', true);
-
-        this.windowCoveringService.getCharacteristic(this.Characteristic.CurrentPosition)
-            .onGet(() => this.position);
-
-        this.windowCoveringService.getCharacteristic(this.Characteristic.TargetPosition)
-            .onGet(() => this.target)
-            .onSet((target: CharacteristicValue) => {
-                if (this.controller.queueSize() >= COMMAND_QUEUE_BUSY_THRESHOLD) {
-                    throw new this.HapStatusError(this.HAPStatus.RESOURCE_BUSY);
-                }
-                this.log.info(`[${this.id}] Blind setting Target :${target}`);
-                this.stopMoveTracking();
-                this.target = target as number;
-                this.move();
-            });
-
-        this.windowCoveringService.getCharacteristic(this.Characteristic.PositionState)
-            .onGet(() => this.state);
-
-        this.windowCoveringService.getCharacteristic(this.Characteristic.ObstructionDetected)
-            .onGet(() => false);
-
-        this.windowCoveringService.getCharacteristic(this.Characteristic.HoldPosition)
-            .onSet((hold: CharacteristicValue) => {
-                if (this.controller.queueSize() >= COMMAND_QUEUE_BUSY_THRESHOLD) {
-                    throw new this.HapStatusError(this.HAPStatus.RESOURCE_BUSY);
-                }
-                this.log.info(`[${this.id}] Blind hold position :${hold}`);
-                this.stopMoveTracking();
-                this.target = this.position;
-                this.move();
-            });
-
-        this.accessory.removeAllListeners('identify');
-        this.accessory.on('identify', () => {
-            this.log.info(`[${this.id}] Identify — jog`);
-            this.stopMoveTracking();  // cancel any in-progress HomeKit movement cleanly
-            this.moveUp();
-            clearTimeout(this.identifyJogTimeout);
-            this.identifyJogTimeout = setTimeout(() => {
-                this.identifyJogTimeout = undefined;
-                this.stopMoveTracking();  // clear position tracking before issuing STOP
-                this.moveStop();
-                // Position is now unknown — mark as unreliable so the next HomeKit
-                // command re-queries the gateway.
-                this.initStartPosition = false;
-            }, IDENTIFY_JOG_MS);
-        });
-    }
-
-    setOnline(online: boolean): void {
-        this.setFaultOnline(this.windowCoveringService, online);
-    }
-
-    private readCachedPosition(): number {
-        const raw = (this.accessory.context as Record<string, unknown>).blindPosition;
-        return typeof raw === 'number' && Number.isFinite(raw)
-            ? Math.min(100, Math.max(0, Math.round(raw)))
-            : 0;
-    }
-
-    private cachePosition(): void {
-        (this.accessory.context as Record<string, unknown>).blindPosition = this.position;
-    }
-
-    updateStatus(): void {
-        this.log.info(`[${this.id}] Blind updateStatus`);
-        if (!this.initStartPosition) {
-            if (this.calibrateOnStart) {
-                this.log.info(`[${this.id}] Calibrating: move fully down to establish known position`);
-                const queued = this.controller.sendCommand({ command: `*2*2*${this.id}##`, log: this.log });
-                if (!queued) {
-                    this.log.warn('[%s] Blind init DOWN dropped: queue full — calibration deferred', this.id);
-                    return;
-                }
-                this.position = 0;
-                this.target = 0;
-                this.initPhase = true;
-                this.cachePosition();
-                // Always send an explicit STOP after the full travel time to guarantee the blind
-                // is not left in a moving state. Sending STOP twice (once by the gateway when the
-                // end-stop is reached, once by us) is harmless — the motor is already off.
-                clearTimeout(this.initTimeout);
-                this.initTimeout = setTimeout(() => {
-                    this.initTimeout = undefined;
-                    this.log.info(`[${this.id}] Init calibration timer elapsed, sending STOP`);
-                    this.endCalibration();
-                    this.moveStop();
-                }, (this.time + this.timeSlat) * 1000 + BLIND_INIT_CALIBRATION_MARGIN_MS);
-            } else {
-                this.log.info(`[${this.id}] Restoring cached position ${this.position}% (calibrateOnStart disabled)`);
-                this.windowCoveringService.updateCharacteristic(this.Characteristic.CurrentPosition, this.position);
-                this.windowCoveringService.updateCharacteristic(this.Characteristic.TargetPosition, this.position);
+        this.blind = new OwnBlindController(this.controller, this.log, config, accessory.context, (state, persist) => {
+            this.render(state);
+            if (persist) {
+                const cached = this.blind.serialize();
+                const previous = accessory.context.blindState;
+                accessory.context.blindState = Object.assign(typeof previous === 'object' && previous !== null && !Array.isArray(previous) ? previous : {}, cached);
+                accessory.context.blindPosition = Math.round(cached.position);
+                if (platform.persistAccessory) platform.persistAccessory(accessory, persist === 'now');
+                else platform.updateAccessory?.(accessory);
             }
-            this.initStartPosition = true;
+            this.publishState();
+        });
+        const service = this.windowCoveringService;
+        service.getCharacteristic(this.Characteristic.CurrentPosition).onGet(() => this.snapshot().position!);
+        service.getCharacteristic(this.Characteristic.TargetPosition)
+            .onGet(() => this.snapshot().targetPosition!)
+            .onSet(value => this.execute({ type: 'position', value: Number(value) }));
+        service.getCharacteristic(this.Characteristic.PositionState).onGet(() => this.hapMovement(this.blind.snapshot()));
+        service.getCharacteristic(this.Characteristic.StatusFault).onGet(() => this.hapFault(this.blind.snapshot()));
+        service.getCharacteristic(this.Characteristic.ObstructionDetected).onGet(() => false);
+        service.getCharacteristic(this.Characteristic.HoldPosition).onSet(() => this.execute({ type: 'stop' }));
+        if (config.calibrationSwitch || config.calibration === 'manual') {
+            this.calibrationService = accessory.getService(this.Service.Switch)
+                ?? accessory.addService(this.Service.Switch, `${this.name} Calibration`, 'calibration');
+            service.addLinkedService(this.calibrationService);
+            this.calibrationService.getCharacteristic(this.Characteristic.On)
+                .onGet(() => this.blind.snapshot().calibrating)
+                .onSet(value => value ? this.execute({ type: 'calibrate' })
+                    : this.blind.snapshot().calibrating ? this.execute({ type: 'stop' }) : undefined);
         } else {
-            this.log.info(`[${this.id}] Blind fetching State :${this.state}`);
-            this.inStatusQuery = true;
-            const queued = this.controller.sendCommand({
-                command: `*#2*${this.id}##`,
-                log: this.log,
-                packet: (pkt: string) => {
-                    this.onData(pkt);
-                },
-                done: (_pkt: string | null, _idx: number) => {
-                    this.inStatusQuery = false;
-                },
-            });
-            // If the queue was saturated, sendCommand dropped the command and will NEVER
-            // invoke `done` — leaving inStatusQuery stuck true forever. That flag suppresses
-            // target/position sync to HomeKit (see syncManualTarget and the STOPPED branch),
-            // so a blind operated only from the wall would silently stop syncing. Clear it now.
-            if (!queued) {
-                this.log.warn('[%s] Blind status query dropped: queue full', this.id);
-                this.inStatusQuery = false;
-            }
+            const old = accessory.getService(this.Service.Switch);
+            if (old) { service.removeLinkedService(old); accessory.removeService(old); }
         }
-    }
-
-    startTimerCommand(): void {
-        clearTimeout(this.packetTimeout);
-        this.packetTimeout = undefined;
-        this.commandSent = true;
-    }
-
-    private startConfirmationTimer(): void {
-        if (!this.commandSent) return;
-        clearTimeout(this.packetTimeout);
-        this.packetTimeout = setTimeout(this.endTimerCommand.bind(this), BLIND_COMMAND_ECHO_TIMEOUT_MS);
-    }
-
-    endTimerCommand(): void {
-        if (this.state !== this.expectedState) {
-            this.state = this.expectedState;
-            this.log.warn(`[${this.id}] Blind command confirmation not received, forcing state to: ${this.expectedState}`);
-            this.updateStatus();
-        }
-        this.commandSent = false;
-        this.homeKitStopPending = false;
-        clearTimeout(this.packetTimeout);
-    }
-
-    /** Mark the calibration phase as ended. The initTimeout is intentionally NOT cleared
-     *  here so the safety STOP fires unconditionally at the end of the travel time, even
-     *  when the gateway sends a premature or duplicate STOP. */
-    private endCalibration(): void {
-        this.initPhase = false;
-    }
-
-    moveStop(): void {
-        this.log.info(`[${this.id}] Blind sending stop`);
-        this.homeKitMovement = false;
-        this.expectedState = this.Characteristic.PositionState.STOPPED;
-        this.homeKitStopPending = true;
-        this.startTimerCommand();
-        const queued = this.controller.sendCommand({
-            command: `*2*0*${this.id}##`,
-            log: this.log,
-            started: () => this.startConfirmationTimer(),
+        accessory.removeAllListeners('identify');
+        accessory.on('identify', () => {
+            void this.blind.identify().catch(err => this.log.warn('[%s] Identify failed: %s', this.id, errorMessage(err)));
         });
-        if (!queued) {
-            this.log.warn('[%s] Blind STOP dropped: queue full', this.id);
-            this.commandSent = false;
-            this.homeKitStopPending = false;
-        }
+        this.render(this.blind.snapshot());
     }
 
-    moveUp(): void {
-        this.log.info(`[${this.id}] Blind sending move up`);
-        this.homeKitMovement = true;
-        this.expectedState = this.Characteristic.PositionState.INCREASING;
-        this.startTimerCommand();
-        const queued = this.controller.sendCommand({
-            command: `*2*1*${this.id}##`,
-            log: this.log,
-            started: () => this.startConfirmationTimer(),
+    private hapMovement(state: BlindState): number {
+        const values = this.Characteristic.PositionState;
+        return state.moving === 'opening' ? values.INCREASING : state.moving === 'closing' ? values.DECREASING : values.STOPPED;
+    }
+
+    private render(state: BlindState): void {
+        this.windowCoveringService.updateCharacteristic(this.Characteristic.CurrentPosition, Math.round(state.position));
+        this.windowCoveringService.updateCharacteristic(this.Characteristic.TargetPosition, Math.round(state.targetPosition));
+        this.windowCoveringService.updateCharacteristic(this.Characteristic.PositionState, this.hapMovement(state));
+        this.windowCoveringService.updateCharacteristic(this.Characteristic.StatusFault, this.hapFault(state));
+        this.calibrationService?.updateCharacteristic(this.Characteristic.On, state.calibrating);
+    }
+
+    private hapFault(state: BlindState): number {
+        return !state.online || state.positionConfidence === 'unknown' || state.blindPhase === 'fault'
+            ? this.Characteristic.StatusFault.GENERAL_FAULT : this.Characteristic.StatusFault.NO_FAULT;
+    }
+
+    snapshot(): DeviceState {
+        const state = this.blind.snapshot();
+        return { ...super.snapshot(), ...state, position: Math.round(state.position), targetPosition: Math.round(state.targetPosition) };
+    }
+
+    protected executeDeviceCommand(command: DeviceCommand): void | Promise<void> {
+        const result = command.type === 'position' ? this.blind.moveTo(command.value)
+            : command.type === 'stop' ? this.blind.stop()
+                : command.type === 'calibrate' ? this.blind.calibrate() : undefined;
+        if (!result) return super.executeDeviceCommand(command);
+        return result.catch(err => {
+            const code = err instanceof BlindError ? err.code : 'communication';
+            throw new this.HapStatusError(code === 'busy' ? this.HAPStatus.RESOURCE_BUSY
+                : code === 'timeout' ? this.HAPStatus.OPERATION_TIMED_OUT
+                    : code === 'invalid' || code === 'cancelled' ? this.HAPStatus.NOT_ALLOWED_IN_CURRENT_STATE
+                        : this.HAPStatus.SERVICE_COMMUNICATION_FAILURE);
         });
-        if (!queued) {
-            this.log.warn('[%s] Blind UP dropped: queue full', this.id);
-            this.commandSent = false;
-            this.homeKitMovement = false;
-        }
     }
 
-    moveDown(): void {
-        this.log.info(`[${this.id}] Blind sending move down`);
-        this.homeKitMovement = true;
-        this.expectedState = this.Characteristic.PositionState.DECREASING;
-        this.startTimerCommand();
-        const queued = this.controller.sendCommand({
-            command: `*2*2*${this.id}##`,
-            log: this.log,
-            started: () => this.startConfirmationTimer(),
-        });
-        if (!queued) {
-            this.log.warn('[%s] Blind DOWN dropped: queue full', this.id);
-            this.commandSent = false;
-            this.homeKitMovement = false;
-        }
-    }
+    setOnline(online: boolean): void { this.blind.setOnline(online); super.setOnline(online); this.render(this.blind.snapshot()); }
+    updateStatus(): void { this.blind.updateStatus(); }
 
-    onData(packet: string): void {
-        // Match standard *2*<dir>*<id>## OR extended *2*1000#<dir>*<id>## (same direction codes)
-        const extract = packet.match(/^\*2\*(?:1000#)?(\d+)\*\d+##$/);
-        if (extract) {
-            this.log.debug('id:%s onBlind(%s)', this.id, packet);
-            const direction = extract[1];
+    onData(packet: string): void { this.blind.onData(packet); }
+    destroy(): void { this.blind.destroy(); super.destroy(); }
+}
 
-            // Some BTicino gateways (F454 confirmed) send a spurious *2*1* or *2*2* immediately
-            // after a wall-switch STOP that does not represent a real new movement. The phantom
-            // always re-emits the SAME direction the blind was last moving in. Suppress exactly
-            // ONE such direction packet during the post-STOP grace window when no HomeKit movement
-            // is in progress, no command is pending, AND the incoming direction matches the last
-            // known moving direction. A genuine manual command from an end-stop is the OPPOSITE
-            // direction (the only way to leave the end-stop), so it does not match and passes
-            // through — this is what a `position === target` proxy could never distinguish.
-            if (this.postStopGrace && direction !== '0' && !this.homeKitMovement
-                && !this.commandSent && direction === this.lastMovingDirection) {
-                this.log.debug('[%s] Ignoring spurious post-STOP direction packet %s', this.id, packet);
-                this.postStopGrace = false;
-                clearTimeout(this.postStopGraceTimeout);
-                this.postStopGraceTimeout = undefined;
-                return;
-            }
-            // Any direction packet we DO process closes the grace window early.
-            if (this.postStopGrace) {
-                this.postStopGrace = false;
-                clearTimeout(this.postStopGraceTimeout);
-                this.postStopGraceTimeout = undefined;
-            }
-
-            const prevState = this.state;
-            // Distinguish the echo of our own HomeKit STOP from a physical (wall-switch) STOP.
-            // Only moveStop() sets homeKitStopPending, and it is cleared the moment any STOP
-            // echo is consumed below — so it is true ONLY during the genuine in-flight window
-            // of a HomeKit STOP, not left sticky like (commandSent && expectedState) was.
-            // Our own STOP does not trigger the F454 spurious-direction quirk, so the grace
-            // window must arm only for physical STOPs (homeKitStopPending === false).
-            const isEchoOfHomeKitStop = direction === '0' && this.homeKitStopPending;
-            if (direction === '0') {
-                this.homeKitStopPending = false;
-                const wasDecreasing = this.state === this.Characteristic.PositionState.DECREASING;
-                // Capture calibration state before endCalibration() clears it below, so the
-                // manual end-stop snap does not fire on a calibration STOP (which owns position).
-                const wasCalibrating = this.initPhase;
-                this.state = this.Characteristic.PositionState.STOPPED;
-                // Gateway did emit STOP — clear the end-stop safety net.
-                clearTimeout(this.endStopSafetyTimeout);
-                this.endStopSafetyTimeout = undefined;
-                // End calibration if: not in calibration, OR was actually moving down (normal end),
-                // OR position is already 0 (blind was at bottom-stop before calibration move started).
-                if (!this.initPhase || wasDecreasing || this.position === 0) {
-                    this.endCalibration();
-                }
-                if (this.homeKitMovement && Math.abs(this.position - this.target) <= 3) {
-                    this.position = this.target;
-                } else if (!this.homeKitMovement && !isEchoOfHomeKitStop && !wasCalibrating && !this.inStatusQuery) {
-                    // Manual (wall-switch) STOP: the gateway confirms the motor stopped. If our
-                    // timer-estimated position is already near an end-stop, treat this STOP as
-                    // physical end-of-travel and snap to the exact end value. This is the only
-                    // reliable anchor to cancel accumulated timer drift on manual movements —
-                    // HomeKit movements snap to `target` instead (branch above). We must exclude
-                    // the echo of our OWN stop (isEchoOfHomeKitStop): after a HomeKit move reaches
-                    // its target, moveStop() has already cleared homeKitMovement, so without this
-                    // guard a HomeKit move to e.g. 96% would be wrongly snapped to 100%.
-                    // The direction last observed tells us which end-stop the blind was heading toward.
-                    if (this.lastMovingDirection === '2' && this.position <= BLIND_END_STOP_SNAP_PCT) {
-                        this.position = 0;
-                    } else if (this.lastMovingDirection === '1' && this.position >= 100 - BLIND_END_STOP_SNAP_PCT) {
-                        this.position = 100;
-                    }
-                }
-                this.cachePosition();
-                // Arm the F454 grace window ONLY for a genuine MOTION→STOP transition. The
-                // spurious F454 direction packet is emitted only right after the blind was
-                // actually moving; a redundant STOP received while already STOPPED must NOT
-                // re-arm the window. Otherwise a manual re-press in the SAME direction as the
-                // last movement (e.g. continuing to close in several taps) would be mistaken
-                // for the phantom and swallowed — the field bug this fixes. Also skip the echo
-                // of our own HomeKit STOP (the gateway does not follow it with a phantom).
-                const wasMoving = prevState === this.Characteristic.PositionState.INCREASING
-                    || prevState === this.Characteristic.PositionState.DECREASING;
-                if (!isEchoOfHomeKitStop && wasMoving) {
-                    this.postStopGrace = true;
-                    clearTimeout(this.postStopGraceTimeout);
-                    this.postStopGraceTimeout = setTimeout(() => {
-                        this.postStopGrace = false;
-                        this.postStopGraceTimeout = undefined;
-                    }, BLIND_POST_STOP_GRACE_MS);
-                }
-            } else if (direction === '1') {
-                this.state = this.Characteristic.PositionState.INCREASING;
-                this.lastMovingDirection = '1';
-            } else if (direction === '2') {
-                this.state = this.Characteristic.PositionState.DECREASING;
-                this.lastMovingDirection = '2';
-            } else {
-                this.log.warn('[%s] Blind unknown direction byte %s in packet %s', this.id, direction, packet);
-                return;
-            }
-            this.windowCoveringService.updateCharacteristic(this.Characteristic.PositionState, this.state);
-            this.log.debug(`[${this.id}] received state dir:${direction} position:${this.position} target:${this.target}`);
-
-            if (this.commandSent && this.expectedState === this.state) {
-                this.log.info(`[${this.id}] expected state ${this.expectedState} reached`);
-                this.endTimerCommand();
-            } else if (this.homeKitMovement && this.state !== prevState
-                    && this.state !== this.expectedState
-                    && !this.inStatusQuery) {
-                // Physical button pressed while HomeKit movement was in progress — yield immediately
-                this.log.info(`[${this.id}] Physical override detected, cancelling HomeKit movement`);
-                this.stopMoveTracking();
-            }
-
-            // Skip evaluatePosition for duplicate packets that don't change state.
-            // For STOP (direction '0'), always evaluate even if positionTimeout is pending —
-            // it clears the timeout on entry and syncs CurrentPosition/TargetPosition to HomeKit.
-            // For a direction reversal (INCREASING↔DECREASING) without an intervening STOP,
-            // cancel the stale positionTimeout so the new direction is picked up immediately
-            // instead of waiting for the previous tick to expire.
-            const isStop = direction === '0';
-            const isDirectionReversal = !isStop && this.state !== prevState
-                && prevState !== this.Characteristic.PositionState.STOPPED;
-            if (isDirectionReversal && this.positionTimeout !== undefined) {
-                clearTimeout(this.positionTimeout);
-                this.positionTimeout = undefined;
-            }
-            if (!this.commandSent && (isStop || !this.positionTimeout) && this.state !== prevState) {
-                this.evaluatePosition();
-            }
-        } else {
-            this.log.debug('[%s] Blind ignoring extended packet:%s', this.id, packet);
-        }
-    }
-
-    evaluatePosition(): void {
-        clearTimeout(this.positionTimeout);
-        this.positionTimeout = undefined;
-        if (this.state === this.Characteristic.PositionState.STOPPED) {
-            this.log.info(`[${this.id}] Blind is STOPPED pos:${this.position} target:${this.target}`);
-            // Sync TargetPosition to CurrentPosition only when no HomeKit movement is in progress
-            // and we are not absorbing a status-query response or a post-confirmation echo.
-            if (!this.homeKitMovement && !this.inStatusQuery && this.target !== this.position) {
-                this.target = this.position;
-                this.windowCoveringService.updateCharacteristic(this.Characteristic.TargetPosition, this.target);
-            }
-        } else if (this.state === this.Characteristic.PositionState.INCREASING) {
-            if (this.position < 100) this.position++;
-            if (this.position % 10 === 0 || this.position >= this.target)
-                this.log.debug(`[${this.id}] Blind moving UP pos:${this.position} target:${this.target}`);
-            // For manual (wall-switch) movements, HomeKit still holds the previous target
-            // from the last HomeKit command. Sync it to the live position so the Home app
-            // doesn't display a stale TargetPosition while the blind is physically moving.
-            this.syncManualTarget();
-            if (this.homeKitMovement && this.position >= this.target) {
-                this.moveStop();
-            } else if (!this.homeKitMovement && this.position >= 100) {
-                // physical movement reached upper end-stop — wait for gateway STOP packet
-                this.cachePosition();
-                this.armEndStopSafetyTimeout();
-            } else {
-                this.startPositionTracking();
-            }
-        } else if (this.state === this.Characteristic.PositionState.DECREASING) {
-            if (this.position > 0) this.position--;
-            if (this.position % 10 === 0 || this.position <= this.target)
-                this.log.debug(`[${this.id}] Blind moving DOWN pos:${this.position} target:${this.target}`);
-            this.syncManualTarget();
-            if (!this.initPhase && this.homeKitMovement && this.position <= this.target) {
-                this.moveStop();
-            } else if (this.initPhase && this.position === 0) {
-                // calibration in progress — initTimeout will fire moveStop after full travel time
-            } else if (!this.homeKitMovement && this.position <= 0) {
-                // physical movement reached lower end-stop — wait for gateway STOP packet
-                this.cachePosition();
-                this.armEndStopSafetyTimeout();
-            } else {
-                this.startPositionTracking();
-            }
-        }
-        this.windowCoveringService.updateCharacteristic(this.Characteristic.CurrentPosition, this.position);
-        // Cache at 10% boundaries so position survives Homebridge crash within 10% accuracy.
-        if (this.position % 10 === 0) {
-            this.cachePosition();
-        }
-    }
-
-    msPerPercent(position: number): number {
-        if (this.slatPercent > 0 && position < this.slatPercent) {
-            return Math.max(BLIND_MIN_TICK_MS, (this.timeSlat / this.slatPercent) * 1000);
-        }
-        return (this.time / Math.max(1, 100 - this.slatPercent)) * 1000;
-    }
-
-    startPositionTracking(): void {
-        clearTimeout(this.positionTimeout);
-        this.positionTimeout = setTimeout(this.evaluatePosition.bind(this), this.msPerPercent(this.position));
-    }
-
-    move(): void {
-        if (this.commandSent) {
-            this.log.info(`[${this.id}] Blind command is still pending: wait for action`);
-            this.moveRetries++;
-            if (this.moveRetries > BLIND_MAX_MOVE_RETRIES) {
-                this.log.warn('[%s] Blind giving up: command stuck pending too long (gateway offline?)', this.id);
-                this.stopMoveTracking();
-                return;
-            }
-            clearTimeout(this.moveTrackingTimeout);
-            this.moveTrackingTimeout = setTimeout(this.move.bind(this), BLIND_MOVE_RETRY_INTERVAL_MS);
-            return;
-        }
-        if (this.target === this.position) {
-            if (this.state !== this.Characteristic.PositionState.STOPPED) {
-                this.moveStop();
-            }
-            this.log.info(`[${this.id}] Blind position is good: stop moving ${this.position} target:${this.target}`);
-            return;
-        }
-        if (this.adjustToward(this.target - this.position)) {
-            return;  // STOP issued to reverse direction — wait for echo
-        }
-        if (!this.commandSent && !this.positionTimeout) {
-            this.startPositionTracking();
-        }
-        this.startMoveTracking();
-    }
-
-    /**
-     * Drive the blind toward the target by `delta` percentage points.
-     * - If currently moving in the OPPOSITE direction, sends STOP and returns true (caller should wait for echo).
-     * - If currently STOPPED, sends the appropriate UP/DOWN command and returns false.
-     * - If already moving in the CORRECT direction with no command pending and no position tracking,
-     *   restores `homeKitMovement` (recovers from rapid retarget) and returns false.
-     * Returns true iff caller must return early (STOP issued).
-     */
-    private adjustToward(delta: number): boolean {
-        const goingUp = delta > 0;
-        const oppositeDir = goingUp ? this.Characteristic.PositionState.DECREASING : this.Characteristic.PositionState.INCREASING;
-        if (this.state === oppositeDir) {
-            this.moveStop();
-            return true;
-        }
-        if (this.state === this.Characteristic.PositionState.STOPPED) {
-            if (goingUp) this.moveUp();
-            else         this.moveDown();
-            return false;
-        }
-        // Already moving in the correct direction.
-        if (!this.commandSent && !this.positionTimeout) {
-            // Position tracking was cancelled mid-flight (rapid retarget). Re-enable tracking.
-            this.homeKitMovement = true;
-        }
-        return false;
-    }
-
-    /**
-     * During a manual (wall-switch) movement HomeKit still holds the target from the last
-     * HomeKit command. Keep `target` in step with the live position so the Home app does not
-     * show a stale TargetPosition. Guarded by `!inStatusQuery` (matching the STOPPED branch)
-     * so status-query responses for an already-moving blind don't overwrite a meaningful
-     * prior target. The HomeKit characteristic push is throttled to 10% boundaries (plus the
-     * end-stops) to avoid flooding HAP with ~100 updates per full travel.
-     */
-    private syncManualTarget(): void {
-        if (this.homeKitMovement || this.inStatusQuery || this.target === this.position) return;
-        // Throttle to 10% boundaries (and the end-stops) to avoid flooding HAP with ~100
-        // updates per full travel. We update `this.target` and push the characteristic
-        // together so they stay consistent — leaving `this.target` diverged between
-        // boundaries lets the STOPPED branch perform the final authoritative sync on STOP.
-        if (this.position % 10 === 0 || this.position === 0 || this.position === 100) {
-            this.target = this.position;
-            this.windowCoveringService.updateCharacteristic(this.Characteristic.TargetPosition, this.target);
-        }
-    }
-
-    /**
-     * Safety net for gateways that reach a physical end-stop without emitting `*2*0*`.
-     * When position hits 0 or 100 during a non-HomeKit movement, we wait a short window
-     * for the gateway STOP; if it never arrives, force STATE=STOPPED so HomeKit's
-     * PositionState doesn't stay INCREASING/DECREASING forever.
-     */
-    private armEndStopSafetyTimeout(): void {
-        clearTimeout(this.endStopSafetyTimeout);
-        // Derive the wait from the blind's own tick rate: allow a few ticks' worth of grace
-        // for a delayed gateway STOP, clamped so fast blinds don't linger and slow blinds
-        // with a legitimately late STOP aren't cut off mid-travel.
-        const delay = Math.min(
-            BLIND_END_STOP_SAFETY_MAX_MS,
-            Math.max(BLIND_END_STOP_SAFETY_MIN_MS, this.msPerPercent(this.position) * 5),
-        );
-        this.endStopSafetyTimeout = setTimeout(() => {
-            this.endStopSafetyTimeout = undefined;
-            if (this.state === this.Characteristic.PositionState.STOPPED) return;
-            this.log.warn('[%s] Blind reached end-stop but gateway never emitted STOP — forcing STOPPED', this.id);
-            this.state = this.Characteristic.PositionState.STOPPED;
-            this.windowCoveringService.updateCharacteristic(this.Characteristic.PositionState, this.state);
-            this.target = this.position;
-            this.windowCoveringService.updateCharacteristic(this.Characteristic.TargetPosition, this.target);
-            // Push CurrentPosition too: if the timer fired before the position reached an exact
-            // 0/100, HomeKit could otherwise show a CurrentPosition inconsistent with STOPPED.
-            this.windowCoveringService.updateCharacteristic(this.Characteristic.CurrentPosition, this.position);
-            this.cachePosition();
-        }, delay);
-    }
-
-    startMoveTracking(): void {
-        clearTimeout(this.moveTrackingTimeout);
-        this.moveTrackingTimeout = undefined;
-        if (this.moveRetries > BLIND_MAX_MOVE_RETRIES) {
-            this.log.warn('[%s] Blind giving up after too many move retries', this.id);
-            this.stopMoveTracking();
-            return;
-        }
-        this.moveTrackingTimeout = setTimeout(this.move.bind(this), BLIND_MOVE_RETRY_INTERVAL_MS);
-    }
-
-    stopMoveTracking(): void {
-        clearTimeout(this.moveTrackingTimeout);
-        this.moveTrackingTimeout = undefined;
-        clearTimeout(this.positionTimeout);
-        this.positionTimeout = undefined;
-        clearTimeout(this.packetTimeout);
-        this.packetTimeout = undefined;
-        clearTimeout(this.statusQueryTimeout);
-        this.statusQueryTimeout = undefined;
-        clearTimeout(this.initTimeout);
-        this.initTimeout = undefined;
-        clearTimeout(this.postStopGraceTimeout);
-        this.postStopGraceTimeout = undefined;
-        clearTimeout(this.endStopSafetyTimeout);
-        this.endStopSafetyTimeout = undefined;
-        this.postStopGrace = false;
-        this.homeKitStopPending = false;
-        this.inStatusQuery = false;
-        this.commandSent = false;
-        this.homeKitMovement = false;
-        this.initPhase = false;
-        this.moveRetries = 0;
-        this.expectedState = this.Characteristic.PositionState.STOPPED;
-    }
-
-    destroy(): void {
-        this.stopMoveTracking();
-        clearTimeout(this.identifyJogTimeout);
-        super.destroy();
-    }
+interface ThermostatWrite {
+    mode: DeviceMode;
+    temperature?: number;
+    signal: AbortSignal;
+    sequence: number;
+    modeRevision: number;
+    temperatureRevision: number;
+    echoed: boolean;
+    expires: number;
 }
 
 export class OwnThermostatAccessory extends OwnAccessory {
@@ -1013,6 +594,15 @@ export class OwnThermostatAccessory extends OwnAccessory {
     targetTemperature: number;
     heatingCoolingState: number;
     targetHeatingCoolingState: number;
+    private targetModeKnown = false;
+    private pendingMode?: { value: DeviceMode };
+    private modeRevision = 0;
+    private temperatureRevision = 0;
+    private writeSequence = 0;
+    private controlRevision = 0;
+    private intent = new AbortController();
+    private writes: ThermostatWrite[] = [];
+    private hapCorrection?: ReturnType<typeof setTimeout>;
     displayUnits: number;
     private thermostatService: InstanceType<typeof Service>;
     private temperatureSensorService: InstanceType<typeof Service>;
@@ -1026,7 +616,8 @@ export class OwnThermostatAccessory extends OwnAccessory {
             throw new Error(`homebridge-myhome: thermostat id=${config.id} requires a positive integer "zone"`);
         }
         this.zone = config.zone;
-        this.address = `#0#${this.zone}`;
+        this.address = config.where ?? `#0#${this.zone}`;
+        if (!/^#\d+(?:#\d+)?$/.test(this.address)) throw new Error('Thermostat where must be a central or zone address beginning with #');
 
         this.temperature = 0;
         // Default to 20°C (within the 5..30 range exposed to HomeKit) so the initial
@@ -1057,30 +648,8 @@ export class OwnThermostatAccessory extends OwnAccessory {
             .setProps({ validValues: [TargetState.OFF, TargetState.HEAT, TargetState.COOL, TargetState.AUTO] })
             .onGet(() => this.targetHeatingCoolingState)
             .onSet((value: CharacteristicValue) => {
-                this.log.info(`[${this.id}] zone[${this.zone}] setTargetHeatingCoolingState:${value}`);
-                switch (value) {
-                    case this.Characteristic.TargetHeatingCoolingState.HEAT: {
-                        const temperature = OwnProtcol.encodeTemperature(this.targetTemperature);
-                        this.log.info(`[${this.id}] send Heat Manual at ${temperature}`);
-                        this.sendOrThrow(`*#4*${this.address}*#14*${temperature}*1##`);
-                        break;
-                    }
-                    case this.Characteristic.TargetHeatingCoolingState.COOL: {
-                        const temperature = OwnProtcol.encodeTemperature(this.targetTemperature);
-                        this.log.info(`[${this.id}] send Cool Manual at ${temperature}`);
-                        this.sendOrThrow(`*#4*${this.address}*#14*${temperature}*2##`);
-                        break;
-                    }
-                    case this.Characteristic.TargetHeatingCoolingState.OFF:
-                        this.log.info(`[${this.id}] send STOP`);
-                        this.sendOrThrow(`*4*103*${this.address}##`);
-                        break;
-                    case this.Characteristic.TargetHeatingCoolingState.AUTO:
-                        this.log.info(`[${this.id}] send AUTO`);
-                        this.sendOrThrow(`*4*3100*${this.address}##`);
-                        break;
-                }
-                this.targetHeatingCoolingState = value as number;
+                const mode = this.modeFromHap(value as number);
+                return this.setFromHap({ type: 'mode', value: mode });
             });
 
         this.thermostatService.getCharacteristic(this.Characteristic.CurrentTemperature)
@@ -1090,23 +659,144 @@ export class OwnThermostatAccessory extends OwnAccessory {
         this.thermostatService.getCharacteristic(this.Characteristic.TargetTemperature)
             .setProps({ minValue: 5, minStep: 0.5, maxValue: 30 })
             .onGet(() => this.targetTemperature)
-            .onSet((value: CharacteristicValue) => {
-                this.log.info(`[${this.id}] zone[${this.zone}] setTargetTemperature:${value}`);
-                const isHeat = this.targetHeatingCoolingState === this.Characteristic.TargetHeatingCoolingState.HEAT;
-                const isCool = this.targetHeatingCoolingState === this.Characteristic.TargetHeatingCoolingState.COOL;
-                if (!isHeat && !isCool) {
-                    this.log.error("Can't change target temperature with mode (%s)", this.targetHeatingCoolingState);
-                    throw new this.HapStatusError(this.HAPStatus.NOT_ALLOWED_IN_CURRENT_STATE);
-                }
-                const temperature = OwnProtcol.encodeTemperature(value as number);
-                const modeByte = isCool ? '2' : '1';
-                this.sendOrThrow(`*#4*${this.address}*#14*${temperature}*${modeByte}##`);
-                this.targetTemperature = value as number;
-            });
+            .onSet((value: CharacteristicValue) => this.setFromHap({ type: 'temperature', value: value as number }));
 
         this.thermostatService.getCharacteristic(this.Characteristic.TemperatureDisplayUnits)
             .onGet(() => this.displayUnits)
             .onSet((value: CharacteristicValue) => { this.displayUnits = value as number; });
+    }
+
+    private modeFromHap(value: number): DeviceMode {
+        const target = this.Characteristic.TargetHeatingCoolingState;
+        if (value === target.HEAT) return 'heat';
+        if (value === target.COOL) return 'cool';
+        if (value === target.AUTO) return 'auto';
+        return 'off';
+    }
+
+    snapshot(): DeviceState {
+        return {
+            ...super.snapshot(), temperature: this.temperature, targetTemperature: this.targetTemperature,
+            mode: this.modeFromHap(this.targetHeatingCoolingState),
+            activeMode: this.heatingCoolingState === this.Characteristic.CurrentHeatingCoolingState.HEAT ? 'heat'
+                : this.heatingCoolingState === this.Characteristic.CurrentHeatingCoolingState.COOL ? 'cool' : 'off',
+        };
+    }
+
+    private setFromHap(command: DeviceCommand): Promise<void> {
+        const result = this.execute(command);
+        return Promise.resolve(result).then(() => {
+            if (this.destroyed) return;
+            clearTimeout(this.hapCorrection);
+            this.hapCorrection = setTimeout(() => {
+                this.hapCorrection = undefined;
+                if (this.destroyed) return;
+                this.thermostatService.updateCharacteristic(this.Characteristic.TargetHeatingCoolingState, this.targetHeatingCoolingState);
+                this.thermostatService.updateCharacteristic(this.Characteristic.TargetTemperature, this.targetTemperature);
+            }, 0);
+        });
+    }
+
+    private sendThermostat(packet: string, mode: DeviceMode, temperature?: number): Promise<void> {
+        this.controlRevision++;
+        const write: ThermostatWrite = { mode, temperature, signal: this.intent.signal, sequence: 0,
+            modeRevision: this.modeRevision, temperatureRevision: this.temperatureRevision, echoed: false, expires: Infinity };
+        this.writes = this.writes.filter(w => w.expires >= Date.now());
+        this.writes.push(write);
+        let result: Promise<void>;
+        try {
+            result = this.sendOrThrow(packet, () => {
+                if (write.signal.aborted) return;
+                const target = this.Characteristic.TargetHeatingCoolingState;
+                if (write.modeRevision === this.modeRevision) {
+                    this.updateCharacteristicTargetHeatingCoolingState(mode === 'heat' ? target.HEAT
+                        : mode === 'cool' ? target.COOL : mode === 'auto' ? target.AUTO : target.OFF);
+                }
+                if (temperature !== undefined && write.temperatureRevision === this.temperatureRevision) {
+                    this.updateCharacteristicTargetTemperature(temperature);
+                }
+            }, () => {
+                write.sequence = ++this.writeSequence;
+                write.modeRevision = this.modeRevision;
+                write.temperatureRevision = this.temperatureRevision;
+            }, { signal: write.signal });
+        } catch (err) {
+            write.expires = 0;
+            throw err;
+        }
+        return result.then(() => { write.expires = Date.now() + 1000; }, err => {
+            write.expires = 0;
+            throw err;
+        });
+    }
+
+    private observeMode(mode: DeviceMode, temperature?: number): void {
+        this.writes = this.writes.filter(w => w.expires >= Date.now());
+        const echo = this.writes.find(w => w.sequence > 0 && !w.echoed && w.mode === mode
+            && (temperature === undefined || temperature === w.temperature));
+        if (echo) {
+            echo.echoed = true;
+            if (echo.sequence < this.writeSequence || echo.signal.aborted) return;
+        } else {
+            // A central-unit mode/setpoint change supersedes queued remote writes.
+            // Keep matching own echoes from cancelling a newer queued user choice.
+            this.intent.abort();
+            this.intent = new AbortController();
+            this.pendingMode = undefined;
+        }
+        this.modeRevision++;
+        const target = this.Characteristic.TargetHeatingCoolingState;
+        this.updateCharacteristicTargetHeatingCoolingState(mode === 'heat' ? target.HEAT
+            : mode === 'cool' ? target.COOL : mode === 'auto' ? target.AUTO : target.OFF);
+        if (temperature !== undefined) {
+            this.temperatureRevision++;
+            this.updateCharacteristicTargetTemperature(temperature);
+        }
+    }
+
+    protected executeDeviceCommand(command: DeviceCommand): void | Promise<void> {
+        if (command.type === 'mode') {
+            const mode = command.value;
+            let packet: string;
+            let setpoint: number | undefined;
+            if (mode === 'heat' || mode === 'cool') {
+                const temperature = OwnProtcol.encodeTemperature(this.targetTemperature);
+                setpoint = OwnProtcol.decodeTemperature(temperature);
+                packet = `*#4*${this.address}*#14*${temperature}*${mode === 'heat' ? 1 : 2}##`;
+            } else if (mode === 'off') {
+                packet = `*4*303*${this.address}##`;
+            } else {
+                // MyHome programme mode is deliberately distinct from Matter heat/cool Auto.
+                packet = `*4*${/^#[1-9]\d*$/.test(this.address) ? 311 : 3100}*${this.address}##`;
+            }
+            // HomeKit may write mode and temperature together. Keep the desired
+            // mode for subsequent queued writes without reporting it as confirmed.
+            const pending = { value: mode };
+            const previous = this.pendingMode;
+            this.pendingMode = pending;
+            try {
+                return this.sendThermostat(packet, mode, setpoint).finally(() => {
+                    if (this.pendingMode === pending) this.pendingMode = undefined;
+                });
+            } catch (err) {
+                this.pendingMode = previous;
+                throw err;
+            }
+        } else if (command.type === 'temperature') {
+            if (!Number.isFinite(command.value) || command.value < 5 || command.value > 30) {
+                throw new this.HapStatusError(this.HAPStatus.NOT_ALLOWED_IN_CURRENT_STATE);
+            }
+            const mode = this.pendingMode?.value ?? this.modeFromHap(this.targetHeatingCoolingState);
+            if (mode !== 'heat' && mode !== 'cool') {
+                this.log.error("Can't change target temperature with mode (%s)", this.targetHeatingCoolingState);
+                throw new this.HapStatusError(this.HAPStatus.NOT_ALLOWED_IN_CURRENT_STATE);
+            }
+            const temperature = OwnProtcol.encodeTemperature(command.value);
+            return this.sendThermostat(`*#4*${this.address}*#14*${temperature}*${mode === 'cool' ? 2 : 1}##`,
+                mode, OwnProtcol.decodeTemperature(temperature));
+        } else {
+            return super.executeDeviceCommand(command);
+        }
     }
 
     setOnline(online: boolean): void {
@@ -1115,7 +805,16 @@ export class OwnThermostatAccessory extends OwnAccessory {
 
     updateStatus(): void {
         this.log.info(`[${this.id}] Thermostat updateStatus`);
-        const handler = (pkt: string) => { this.onData(pkt); };
+        if (this.writes.some(write => write.expires === Infinity)) return;
+        const controlRevision = this.controlRevision;
+        let modeRevision = this.modeRevision;
+        let temperatureRevision = this.temperatureRevision;
+        const handler = (pkt: string) => {
+            if (controlRevision !== this.controlRevision || modeRevision !== this.modeRevision || temperatureRevision !== this.temperatureRevision) return;
+            this.onData(pkt);
+            modeRevision = this.modeRevision;
+            temperatureRevision = this.temperatureRevision;
+        };
         this.controller.sendCommand({ command: `*#4*${this.address}##`, log: this.log, packet: handler });
         this.controller.sendCommand({ command: `*#4*${this.id}##`, log: this.log, packet: handler });
     }
@@ -1129,6 +828,7 @@ export class OwnThermostatAccessory extends OwnAccessory {
         this.temperature = temperature;
         this.thermostatService.updateCharacteristic(this.Characteristic.CurrentTemperature, this.temperature);
         this.temperatureSensorService.updateCharacteristic(this.Characteristic.CurrentTemperature, this.temperature);
+        this.publishState();
     }
 
     updateCharacteristicTargetTemperature(temperature: number): void {
@@ -1138,23 +838,27 @@ export class OwnThermostatAccessory extends OwnAccessory {
         // (e.g. 0 when the zone is OFF).
         this.targetTemperature = Math.min(30, Math.max(5, temperature));
         this.thermostatService.updateCharacteristic(this.Characteristic.TargetTemperature, this.targetTemperature);
+        this.publishState();
     }
 
     updateCharacteristicTargetHeatingCoolingState(state: number): void {
         this.log.info(`[${this.id}] update TargetHeatingCoolingState (${state})`);
         this.targetHeatingCoolingState = state;
+        this.targetModeKnown = true;
         this.thermostatService.updateCharacteristic(this.Characteristic.TargetHeatingCoolingState, this.targetHeatingCoolingState);
+        this.publishState();
     }
 
     updateCharacteristicCurrentHeatingCoolingState(state: number): void {
         this.log.info(`[${this.id}] update CurrentHeatingCoolingState (${state})`);
         this.heatingCoolingState = state;
         this.thermostatService.updateCharacteristic(this.Characteristic.CurrentHeatingCoolingState, this.heatingCoolingState);
+        this.publishState();
     }
 
     onData(packet: string): void {
         let extract: RegExpMatchArray | null;
-        if ((extract = packet.match(/^\*#4\*\d+\*0\*(\d+)##$/))) {
+        if ((extract = packet.match(/^\*#4\*\d+\*0\*([01]\d{3})(?:\*[123])?##$/))) {
             this.updateCharacteristicCurrentTemperature(OwnProtcol.decodeTemperature(extract[1]));
         } else if ((extract = packet.match(/^\*#4\*\d+\*12\*(\d+)\*3##$/))) {
             this.log.debug(`[${this.id}] zone[${this.zone}] probe temperature with local offset (${OwnProtcol.decodeTemperature(extract[1])})`);
@@ -1180,18 +884,14 @@ export class OwnThermostatAccessory extends OwnAccessory {
         } else if ((extract = packet.match(/^\*#4\*[\d#]+\*14\*(\d+)\*(\d+)##$/))) {
             // DIM 14 = Setpoint temperature. Second value is the mode byte:
             //   *1 = Heat, *2 = Cool, *3 = Generic (mode not enforced).
+            this.temperatureRevision++;
             this.updateCharacteristicTargetTemperature(OwnProtcol.decodeTemperature(extract[1]));
-            // The mode byte here rides along with a *setpoint* report, which the gateway also
-            // broadcasts passively (status refresh, reconnect) — it is NOT an authoritative
-            // mode-change event. Only adopt it when HomeKit has no explicit HEAT/COOL choice
-            // (currently OFF or AUTO); otherwise a passive broadcast could silently flip the
-            // user's deliberate HEAT↔COOL selection. Authoritative mode changes still arrive
-            // via DIM 19 and the central-unit operation-mode packets below.
+            // A setpoint report is not an authoritative mode change. Use its mode
+            // only to seed an unknown startup state, never to leave AUTO or an
+            // explicitly selected OFF/HEAT/COOL mode.
             const modeByte = extract[2];
             const TargetState = this.Characteristic.TargetHeatingCoolingState;
-            const hasExplicitChoice = this.targetHeatingCoolingState === TargetState.HEAT
-                || this.targetHeatingCoolingState === TargetState.COOL;
-            if (!hasExplicitChoice) {
+            if (!this.targetModeKnown && !this.pendingMode && this.targetHeatingCoolingState === TargetState.OFF) {
                 if (modeByte === '1') {
                     this.updateCharacteristicTargetHeatingCoolingState(TargetState.HEAT);
                 } else if (modeByte === '2') {
@@ -1202,8 +902,8 @@ export class OwnThermostatAccessory extends OwnAccessory {
         } else if ((extract = packet.match(/^\*#4\*[\d#]+\*19\*(\d)\*(\d)##$/))) {
             const CV = extract[1];
             const HV = extract[2];
-            const coolingActive = ['1', '2'].includes(CV);
-            const heatingActive = ['1', '2'].includes(HV);
+            const coolingActive = ['1', '2', '6', '7', '8'].includes(CV);
+            const heatingActive = ['1', '2', '6', '7', '8'].includes(HV);
             if (heatingActive) {
                 this.log.debug(`[${this.id}] zone[${this.zone}] heating ON`);
                 this.updateCharacteristicCurrentHeatingCoolingState(this.Characteristic.CurrentHeatingCoolingState.HEAT);
@@ -1235,61 +935,71 @@ export class OwnThermostatAccessory extends OwnAccessory {
                 this.log.error('[%s] zone[%s] operation mode (%s)', this.id, this.zone, value);
             }
             this.log.debug(`[${this.id}] zone[${this.zone}] operation mode (${status})`);
-            // Map to HomeKit CurrentHeatingCoolingState. Values 1101/1103/3100 (weekly/holiday
-            // programs) leave CurrentState alone — actual heating/cooling status arrives via DIM 19.
-            let hkCurrentState: number | null;
-            if (value === '1' || value === '102') hkCurrentState = this.Characteristic.CurrentHeatingCoolingState.HEAT;
-            else if (value === '0') hkCurrentState = this.Characteristic.CurrentHeatingCoolingState.COOL;
-            else if (value === '303' || value === '202') hkCurrentState = this.Characteristic.CurrentHeatingCoolingState.OFF;
-            else hkCurrentState = null;
-            if (hkCurrentState !== null) this.updateCharacteristicCurrentHeatingCoolingState(hkCurrentState);
-        } else if ((extract = packet.match(/^\*4\*(\d+)\*#\d+#\d+##$/))) {
+            // WHO 4 §1.9.2 reports operating mode, not valve activity. DIM 19
+            // supplies CurrentHeatingCoolingState, including fan-coil speeds.
+        } else if ((extract = packet.match(/^\*4\*(\d+)\*#\d+(?:#\d+)?##$/))) {
             const valInt = parseInt(extract[1], 10);
-            if (valInt === 103) {
-                this.updateCharacteristicTargetHeatingCoolingState(this.Characteristic.TargetHeatingCoolingState.OFF);
+            if ([103, 203, 303].includes(valInt)) {
+                this.observeMode('off');
                 this.log.debug('[%s] zone[%s] operation mode Heating OFF', this.id, this.zone);
-            } else if (valInt === 102) {
-                this.updateCharacteristicTargetHeatingCoolingState(this.Characteristic.TargetHeatingCoolingState.OFF);
+            } else if ([102, 202, 302].includes(valInt)) {
+                this.observeMode('off');
                 this.log.debug('[%s] zone[%s] operation mode Anti Freeze', this.id, this.zone);
-            } else if (valInt === 1101 || valInt === 1102 || valInt === 1103) {
-                this.updateCharacteristicTargetHeatingCoolingState(this.Characteristic.TargetHeatingCoolingState.AUTO);
+            } else if ([111, 211, 311, 1101, 1102, 1103, 2101, 2102, 2103, 3101, 3102, 3103].includes(valInt)) {
+                this.observeMode('auto');
                 this.log.debug('[%s] zone[%s] operation mode Heating program', this.id, this.zone);
-            } else if (valInt > 13000 && valInt <= 13255) {
-                this.updateCharacteristicTargetHeatingCoolingState(this.Characteristic.TargetHeatingCoolingState.AUTO);
+            } else if ((valInt > 13000 && valInt <= 13255) || (valInt > 23000 && valInt <= 23255)) {
+                this.observeMode('auto');
                 this.log.debug('[%s] zone[%s] operation mode Holiday program for %s day', this.id, this.zone, valInt - 13000);
             } else if (valInt === 21) {
                 this.log.debug('[%s] zone[%s] Remote control enabled', this.id, this.zone);
-            } else if (valInt === 0) {
-                this.updateCharacteristicTargetHeatingCoolingState(this.Characteristic.TargetHeatingCoolingState.COOL);
+            } else if (valInt === 0 || valInt === 210) {
+                this.observeMode('cool');
                 this.log.debug('[%s] zone[%s] operation mode Conditioning', this.id, this.zone);
+            } else if (valInt === 110) {
+                this.observeMode('heat');
             } else {
                 this.log.error('[%s] zone[%s] unknown value (%i) in packet: %s', this.id, this.zone, valInt, packet);
             }
-        } else if ((extract = packet.match(/^\*4\*(\d+)#(\d+)\*#\d+#\d+##$/))) {
+        } else if ((extract = packet.match(/^\*4\*(\d+)#([01]\d{3})\*#\d+(?:#\d+)?##$/))) {
             const value = extract[1];
             if (value === '110') {
                 const temp = OwnProtcol.decodeTemperature(extract[2]);
                 this.log.debug('[%s] zone[%s] operation mode Manual Heating (%s)', this.id, this.zone, temp);
-                this.updateCharacteristicTargetHeatingCoolingState(this.Characteristic.TargetHeatingCoolingState.HEAT);
-                this.updateCharacteristicTargetTemperature(temp);
+                this.observeMode('heat', temp);
             } else if (value === '210') {
                 const temp = OwnProtcol.decodeTemperature(extract[2]);
                 this.log.debug('[%s] zone[%s] operation mode Manual Cooling (%s)', this.id, this.zone, temp);
-                this.updateCharacteristicTargetHeatingCoolingState(this.Characteristic.TargetHeatingCoolingState.COOL);
-                this.updateCharacteristicTargetTemperature(temp);
+                this.observeMode('cool', temp);
             }
         } else {
             this.log.error('[%s] zone[%s] unknown packet: %s', this.id, this.zone, packet);
         }
+    }
+
+    destroy(): void {
+        this.intent.abort();
+        clearTimeout(this.hapCorrection);
+        super.destroy();
     }
 }
 
 export class OwnScenarioAccessory extends OwnAccessory {
     private resetTimeout: ReturnType<typeof setTimeout> | undefined;
     private service: InstanceType<typeof Service>;
+    private active = false;
+    private readonly where?: string;
+    private readonly scenario: number;
 
     constructor(platform: OwnPlatformLike, accessory: PlatformAccessory, config: ScenarioConfig) {
         super(platform, accessory, config, 'scenario');
+
+        this.where = config.where;
+        this.scenario = config.scenario ?? config.id;
+        if (!Number.isInteger(this.scenario) || this.scenario < 1 || this.scenario > 20) throw new Error('Scenario number must be in 1..20');
+        if (this.where !== undefined && (!/^\d{1,2}(?:#4#\d{1,2})?$/.test(this.where) || Number(this.where.split('#')[0]) < 1)) {
+            throw new Error('Scenario where must identify a module in 01..99');
+        }
 
         this.resetTimeout = undefined;
 
@@ -1299,7 +1009,7 @@ export class OwnScenarioAccessory extends OwnAccessory {
         this.service.getCharacteristic(this.Characteristic.On)
             .onGet(() => false)
             .onSet((value: CharacteristicValue) => {
-                if (value) this.activate();
+                if (value) return this.execute({ type: 'activate' });
             });
         // Remove a previously-registered StatelessProgrammableSwitch from installs
         // that used the deprecated `asButton: true` option.
@@ -1307,13 +1017,27 @@ export class OwnScenarioAccessory extends OwnAccessory {
         if (existingSPS) this.accessory.removeService(existingSPS);
     }
 
-    private activate(): void {
+    snapshot(): DeviceState {
+        return { ...super.snapshot(), on: this.active };
+    }
+
+    protected executeDeviceCommand(command: DeviceCommand): void | Promise<void> {
+        if (command.type !== 'activate') return super.executeDeviceCommand(command);
+        if (!this.where) {
+            this.log.error('[%s] Configure scenario "where" with its module address (01..99); WHO 0 has no general address 0.', this.id);
+            throw new this.HapStatusError(this.HAPStatus.NOT_ALLOWED_IN_CURRENT_STATE);
+        }
         this.log.info(`[${this.id}] Scenario activate`);
-        this.sendOrThrow(`*0*${this.id}*0##`);
-        clearTimeout(this.resetTimeout);
-        this.resetTimeout = setTimeout(() => {
-            this.service.updateCharacteristic(this.Characteristic.On, false);
-        }, SCENARIO_RESET_MS);
+        return this.sendOrThrow(`*0*${this.scenario}*${this.where}##`, () => {
+            this.active = true;
+            this.service.updateCharacteristic(this.Characteristic.On, true);
+            clearTimeout(this.resetTimeout);
+            this.resetTimeout = setTimeout(() => {
+                this.active = false;
+                this.service.updateCharacteristic(this.Characteristic.On, false);
+                this.publishState();
+            }, SCENARIO_RESET_MS);
+        });
     }
 
     onData(_packet: string): void {}
@@ -1332,13 +1056,20 @@ export class OwnContactAccessory extends OwnAccessory {
     private sensorService: InstanceType<typeof Service>;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     private stateChar: any;
+    private readonly protocol: NonNullable<ContactConfig['protocol']>;
+    private readonly where: string;
 
-    get who(): number { return WHO.auxiliary; }
+    get who(): number { return this.protocol === 'auxiliary' ? WHO.auxiliary : WHO.CEN; }
+    checkWhere(where: string): boolean { return where === this.where; }
 
     constructor(platform: OwnPlatformLike, accessory: PlatformAccessory, config: ContactConfig) {
         super(platform, accessory, config, 'contact');
 
         this.sensorType = config.sensorType ?? 'contact';
+        this.protocol = config.protocol ?? 'auxiliary';
+        if (!['auxiliary', 'dry-contact', 'ir'].includes(this.protocol)) throw new Error('Invalid contact protocol');
+        this.where = config.where ?? (this.protocol === 'auxiliary' ? String(this.id) : `3${this.id}`);
+        if (!OwnProtcol.isWhere(this.where)) throw new Error('Contact where must be an OpenWebNet address');
         this.contactState = this.Characteristic.ContactSensorState.CONTACT_DETECTED;
 
         // Single mapping table: sensor type → (HAP service, model name, state characteristic).
@@ -1370,6 +1101,10 @@ export class OwnContactAccessory extends OwnAccessory {
             .onGet(() => this.mapStateForSensor(this.contactState));
     }
 
+    snapshot(): DeviceState {
+        return { ...super.snapshot(), triggered: this.contactState !== this.Characteristic.ContactSensorState.CONTACT_DETECTED };
+    }
+
     private mapStateForSensor(rawState: number): boolean | number {
         if (this.sensorType === 'contact') {
             return rawState; // 0=DETECTED, 1=NOT_DETECTED
@@ -1388,20 +1123,25 @@ export class OwnContactAccessory extends OwnAccessory {
     updateStatus(): void {
         this.log.info(`[${this.id}] ${this.sensorType} updateStatus`);
         this.controller.sendCommand({
-            command: `*#9*${this.id}##`,
+            command: `*#${this.who}*${this.where}##`,
             log: this.log,
             packet: (pkt: string) => { this.onData(pkt); },
         });
     }
 
     onData(packet: string): void {
-        const extract = packet.match(/^\*9\*(\d+)\*\d+##$/);
-        if (extract) {
-            this.contactState = extract[1] === '0'
+        const extract = this.protocol === 'auxiliary'
+            ? packet.match(/^\*9\*([01])\*([\d#]+)##$/)
+            : packet.match(/^\*25\*(31|32)#[01]\*([\d#]+)##$/);
+        if (extract && extract[2] === this.where) {
+            const closed = this.protocol === 'auxiliary' ? extract[1] === '0'
+                : this.protocol === 'ir' ? extract[1] === '32' : extract[1] === '31';
+            this.contactState = closed
                 ? this.Characteristic.ContactSensorState.CONTACT_DETECTED
                 : this.Characteristic.ContactSensorState.CONTACT_NOT_DETECTED;
             this.log.info(`[${this.id}] ${this.sensorType} state: ${this.contactState}`);
             this.sensorService.updateCharacteristic(this.stateChar, this.mapStateForSensor(this.contactState));
+            this.publishState();
         } else {
             this.log.error('[%s] Contact unknown packet:%s', this.id, packet);
         }
@@ -1416,16 +1156,18 @@ export class OwnEnergyAccessory extends OwnAccessory {
     private asOutlet: boolean;
     private energyService: InstanceType<typeof Service>;
     private pollInterval: ReturnType<typeof setInterval>;
-    private destroyed = false;
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    private eveWattsChar: any;
+    private eveWattsChar: Characteristic | undefined;
+    private readonly where: string;
 
     get who(): number { return WHO.energy; }
+    checkWhere(where: string): boolean { return where === this.where; }
 
     constructor(platform: OwnPlatformLike, accessory: PlatformAccessory, config: EnergyConfig) {
         super(platform, accessory, config, 'energy');
 
-        this.watts = ENERGY_MIN_LIGHT_LEVEL;
+        this.watts = 0;
+        this.where = config.where ?? String(this.id);
+        if (!OwnProtcol.isWhere(this.where)) throw new Error('Energy where must be an OpenWebNet address');
         this.asOutlet = config.asOutlet ?? false;
 
         if (this.asOutlet) {
@@ -1436,15 +1178,18 @@ export class OwnEnergyAccessory extends OwnAccessory {
             this.energyService.getCharacteristic(this.Characteristic.OutletInUse)
                 .onGet(() => this.watts > ENERGY_OUTLET_IN_USE_THRESHOLD_W);
             // Eve custom characteristic for watts
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            const Char = (this.Characteristic as unknown as { new (...args: any[]): any });
             try {
-                const eveChar = new Char('Eve Consumption', EVE_CONSUMPTION_UUID, {
-                    format: 'float', perms: ['ev', 'pr'], unit: 'W',
-                    minValue: 0, maxValue: 100000, minStep: 0.1,
-                });
-                this.energyService.addCharacteristic(eveChar);
-                this.eveWattsChar = eveChar;
+                this.eveWattsChar = this.energyService.characteristics.find(c => c.UUID === EVE_CONSUMPTION_UUID);
+                if (!this.eveWattsChar) {
+                    this.eveWattsChar = this.energyService.addCharacteristic(new this.Characteristic(
+                        'Eve Consumption', EVE_CONSUMPTION_UUID, {
+                            format: 'float',
+                            perms: ['ev', 'pr'] as Perms[],
+                            unit: 'W',
+                            minValue: 0, maxValue: 100000, minStep: 0.1,
+                        },
+                    ));
+                }
             } catch (err) {
                 this.log.debug('[%s] Eve consumption characteristic unavailable: %s', this.id, errorMessage(err));
             }
@@ -1466,6 +1211,10 @@ export class OwnEnergyAccessory extends OwnAccessory {
         }, ENERGY_POLL_INTERVAL_MS);
     }
 
+    snapshot(): DeviceState {
+        return { ...super.snapshot(), watts: this.watts };
+    }
+
     setOnline(online: boolean): void {
         this.setFaultOnline(this.energyService, online, true);
     }
@@ -1473,7 +1222,7 @@ export class OwnEnergyAccessory extends OwnAccessory {
     destroy(): void {
         this.destroyed = true;
         clearInterval(this.pollInterval);
-        this.eveWattsChar = null;
+        this.eveWattsChar = undefined;
         super.destroy();
     }
 
@@ -1481,7 +1230,7 @@ export class OwnEnergyAccessory extends OwnAccessory {
         if (this.destroyed) return;
         this.log.debug(`[${this.id}] Energy updateStatus`);
         this.controller.sendCommand({
-            command: `*#18*${this.id}*113##`,
+            command: `*#18*${this.where}*113##`,
             log: this.log,
             packet: (pkt: string) => { this.onData(pkt); },
         });
@@ -1489,20 +1238,19 @@ export class OwnEnergyAccessory extends OwnAccessory {
 
     onData(packet: string): void {
         if (this.destroyed) return;
-        const extract = packet.match(/^\*#18\*\d+\*113\*(\d+)##$/);
-        if (extract) {
-            this.watts = Math.max(ENERGY_MIN_LIGHT_LEVEL, parseInt(extract[1], 10));
+        const extract = packet.match(/^\*#18\*([\d#]+)\*113\*(\d+)##$/);
+        if (extract && extract[1] === this.where) {
+            this.watts = parseInt(extract[2], 10);
             this.log.debug(`[${this.id}] Energy: ${this.watts}W`);
             if (this.asOutlet) {
                 const inUse = this.watts > ENERGY_OUTLET_IN_USE_THRESHOLD_W;
                 this.energyService.updateCharacteristic(this.Characteristic.On, inUse);
                 this.energyService.updateCharacteristic(this.Characteristic.OutletInUse, inUse);
-                if (this.eveWattsChar) {
-                    this.energyService.updateCharacteristic(this.eveWattsChar, this.watts);
-                }
+                this.eveWattsChar?.updateValue(this.watts);
             } else {
-                this.energyService.updateCharacteristic(this.Characteristic.CurrentAmbientLightLevel, this.watts);
+                this.energyService.updateCharacteristic(this.Characteristic.CurrentAmbientLightLevel, Math.max(ENERGY_MIN_LIGHT_LEVEL, this.watts));
             }
+            this.publishState();
         } else {
             this.log.debug('[%s] Energy: ignoring packet %s', this.id, packet);
         }
@@ -1544,20 +1292,7 @@ export class OwnDoorAccessory extends OwnAccessory {
                 ? this.Characteristic.LockTargetState.UNSECURED
                 : this.Characteristic.LockTargetState.SECURED)
             .onSet((value: CharacteristicValue) => {
-                if (value !== this.Characteristic.LockTargetState.UNSECURED) return;
-                this.log.info(`[${this.id}] Door open`);
-                this.sendOrThrow(this.openCommand);
-                this.currentLockState = this.Characteristic.LockCurrentState.UNSECURED;
-                this.lockService.updateCharacteristic(this.Characteristic.LockCurrentState, this.currentLockState);
-                clearTimeout(this.resetTimeout);
-                this.resetTimeout = setTimeout(() => {
-                    this.resetTimeout = undefined;
-                    this.currentLockState = this.Characteristic.LockCurrentState.SECURED;
-                    this.lockService.updateCharacteristic(this.Characteristic.LockTargetState,
-                        this.Characteristic.LockTargetState.SECURED);
-                    this.lockService.updateCharacteristic(this.Characteristic.LockCurrentState,
-                        this.currentLockState);
-                }, DOOR_RESET_MS);
+                if (value === this.Characteristic.LockTargetState.UNSECURED) return this.execute({ type: 'unlock' });
             });
 
         if (this.doorbellEnabled) {
@@ -1580,6 +1315,28 @@ export class OwnDoorAccessory extends OwnAccessory {
                 this.accessory.removeService(existing);
             }
         }
+    }
+
+    snapshot(): DeviceState {
+        return { ...super.snapshot(), locked: this.currentLockState !== this.Characteristic.LockCurrentState.UNSECURED };
+    }
+
+    protected executeDeviceCommand(command: DeviceCommand): void | Promise<void> {
+        if (command.type !== 'unlock') return super.executeDeviceCommand(command);
+        this.log.info(`[${this.id}] Door open`);
+        return this.sendOrThrow(this.openCommand, () => {
+            this.currentLockState = this.Characteristic.LockCurrentState.UNSECURED;
+            this.lockService.updateCharacteristic(this.Characteristic.LockCurrentState, this.currentLockState);
+            this.lockService.updateCharacteristic(this.Characteristic.LockTargetState, this.Characteristic.LockTargetState.UNSECURED);
+            clearTimeout(this.resetTimeout);
+            this.resetTimeout = setTimeout(() => {
+                this.resetTimeout = undefined;
+                this.currentLockState = this.Characteristic.LockCurrentState.SECURED;
+                this.lockService.updateCharacteristic(this.Characteristic.LockTargetState, this.Characteristic.LockTargetState.SECURED);
+                this.lockService.updateCharacteristic(this.Characteristic.LockCurrentState, this.currentLockState);
+                this.publishState();
+            }, DOOR_RESET_MS);
+        });
     }
 
     setOnline(online: boolean): void {
@@ -1615,6 +1372,7 @@ export class OwnDoorAccessory extends OwnAccessory {
             this.Characteristic.ProgrammableSwitchEvent,
             this.Characteristic.ProgrammableSwitchEvent.SINGLE_PRESS,
         );
+        this.publish({ type: 'doorbell' });
     }
 
     destroy(): void {
@@ -1622,4 +1380,3 @@ export class OwnDoorAccessory extends OwnAccessory {
         super.destroy();
     }
 }
-

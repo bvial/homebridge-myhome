@@ -2,6 +2,76 @@
 
 All notable changes to this project are documented here.
 
+## [Unreleased]
+
+### Added
+- SHA-1/SHA-256 mutual authentication negotiated by the gateway, alongside legacy authentication.
+- Standard WHO 25 dry-contact/IR inputs, raw energy/shutter/thermostat WHERE overrides,
+  and DIM 10 shutter position/fault feedback.
+- Native Matter accessories through Homebridge 2.4, with `homekit`, `matter`,
+  and `both` exposure modes and shared MyHome device controllers.
+- Matter light, blind, thermostat, sensor, power, door-relay, scenario, and
+  doorbell mappings; the scheduled heating programme has a separate control.
+- Matter cache reconciliation and device context restoration across restarts.
+- Shared blind motor controller and monotonic position estimator, independent opening/
+  closing durations, calibration policies and a linked HomeKit/Matter calibration control.
+- Persistent blind position confidence, timestamp and interrupted-motion marker, with
+  immediate start/STOP persistence and batched HomeKit checkpoints.
+
+### Fixed
+- Preserve restored thermostat/occupancy Matter endpoints on Homebridge 2.5;
+  keep the required reconstruction for Homebridge 2.4 and custom dimmer behaviors.
+- Corrected WHO 1 levels to 20–100% and DIM 1 feedback to the 100–200 wire scale.
+  Timed/blinking/relative WHAT values are no longer treated as brightness percentages.
+- WHO 0 scenarios now target an explicit module. Generic thermostat OFF, 99-zone AUTO,
+  cooling programmes and active fan-coil states follow the published WHO 4 tables.
+- Natural end-stop STOPs after a full calibration run are accepted before the safety margin.
+- Discovery requires matching state replies and uses standard 5N energy/3N contact addresses.
+- Authentication failures stop queued scans; late handshake callbacks cannot reopen a closed connection.
+- Invalid device collections and entries are isolated before accessory registration.
+- Central thermostat mode/setpoint changes supersede older ACKs and cancel queued or
+  handshaking remote writes; HomeKit reasserts the latest bus state after write completion.
+- A wall reversal cancels an earlier blind STOP that has not yet reached the bus.
+- Continuous Matter dimming cancels pending gateway commands on OFF, STOP and disposal,
+  including queued commands and incomplete TCP handshakes. Already-written commands still settle normally.
+- Blind echoes are correlated with transmission order so delayed reversal STOPs cannot
+  freeze the next movement or invalidate a newer STOP acknowledgement.
+- HomeKit blind fault reads now match notifications for unknown positions and controller failures.
+- Light ACKs preserve newer bus reports and otherwise publish the quantized hardware level;
+  HomeKit is corrected after its write transaction commits the original request.
+- Matter thermostat context survives failed endpoint reconstruction and subsequent registration retries.
+- Rapid blind inversions retain the latest target; wall STOPs cannot be masked by
+  outstanding status requests. Cancelled and expired movements cannot execute after a delayed handshake.
+- STOP commands have priority over unrelated traffic and reserved queue capacity.
+  Position tracking accounts for callback delays and movement while a STOP is queued.
+- Failed or interrupted calibrations retain an unknown reference instead of saving a false 0%.
+- HomeKit and Matter writes now await the gateway ACK and propagate rejections,
+  disconnects and timeouts instead of reporting successful state changes.
+- Commands for the same device are serialized; an immediate blind STOP is sent
+  after an outstanding UP/DOWN even before its monitor echo arrives.
+- Passive thermostat setpoint reports preserve known AUTO and OFF modes.
+- Matter thermostat reconstruction preserves the remembered manual heating/cooling mode.
+- Continuous Matter dimming stops when HomeKit queues an OFF or the wall switch turns the light off.
+- Command callbacks now run once, rejected commands release their queue slot immediately,
+  and pending keep-alive replies cannot restart a stopped monitor.
+- Eve consumption updates use the HAP characteristic API correctly and continue after
+  Homebridge restores the accessory cache.
+- Blinds resume toward the requested target after reversing direction.
+- Light status queries accept standard OpenWebNet replies.
+- Auto-discovery restores cached devices even when the scan fails and compares full
+  bus addresses when replacing placeholders with manually configured accessories.
+- Shutdown closes active command connections and cancels queued discovery work.
+- Auto-discovered devices retain their HomeKit category when restored from Matter.
+- The scanner no longer treats the value of `--max-addr` as a port or password.
+
+### Changed
+- Development dependencies updated to Homebridge 2.5.0 and available compatible audit fixes.
+- Existing scenarios need `where` (module address); legacy WHO 9 inputs remain available via `protocol: "auxiliary"`.
+- Manual STOPs near an endpoint no longer snap to an unverified 0%/100%. Unknown blind
+  positions require a full endpoint run or calibration before partial-position commands.
+- Requires Homebridge 2.4 or later (2.x); CI covers Node.js 22 (at least 22.13.0),
+  24, and 26.
+
 ## [0.4.11] — 2026-07-24
 
 ### Fixed

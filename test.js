@@ -1,6 +1,6 @@
 //@ts-check
-let OwnNet = require('./lib/OwnNet.js');
-let OwnProtcol = require('./lib/OwnProtcol.js');
+let OwnNet = require('./dist/lib/OwnNet.js');
+let OwnProtcol = require('./dist/lib/OwnProtcol.js');
 //const sprintf = require("sprintf-js").sprintf;
 
 const host = '192.168.1.35';

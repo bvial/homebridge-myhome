@@ -4,7 +4,7 @@
 
 ### Prérequis système
 
-- [Node.js](https://nodejs.org) ≥ 18 (`node --version`)
+- [Node.js](https://nodejs.org) 22 (≥ 22.13.0), 24 ou 26 (`node --version`)
 - npm ≥ 9 (inclus avec Node.js)
 - Git
 
@@ -29,10 +29,82 @@ tsc --version
 
 ```bash
 npm run build   # compile TypeScript → dist/
+npm run lint    # vérifie les sources et les tests
 npm test        # compile + suite de tests automatisés
 ```
 
-Les tests ne nécessitent pas de passerelle réelle — tout est simulé.
+Les tests ne nécessitent pas de passerelle réelle : le transport OWN est simulé.
+Les tests d'intégration HAP et Matter utilisent les véritables bibliothèques
+Homebridge pour vérifier les services, commandes et types d'appareils. Les
+endpoints Matter utilisent un stockage en mémoire, sans publication d'un pont.
+
+La revue du 18 novembre 2026 a validé **1 421 tests** sous Homebridge **2.5.0**,
+puis les mêmes tests compilés sous **2.4.0**, avec Node 22.23.4. La CI couvre
+Node 22/24/26 × Homebridge 2.4.0/2.5.0. Voir le
+[rapport de revue](docs/PROTOCOL_REVIEW.md) pour les sources et la portée vérifiée.
+
+### Tests du protocole et de la restauration
+
+- `OpenWebNetSpec.test.ts` : niveaux WHAT/DIM, adresses, scénarios, polarité des
+  contacts/IR, énergie, chauffage et réponses nécessaires à la découverte.
+- `OwnAuth.test.ts` : vecteurs SHA-1/SHA-256 recoupés avec `hashlib`, preuve
+  serveur, refus d'authentification et fermeture pendant l'établissement de session.
+- `OwnMatterReal.test.ts` : conservation des endpoints composés sous Homebridge
+  2.5, compatibilité de restauration 2.4 et commandes des variateurs après redémarrage.
+
+Pour reproduire le contrôle d'une version de Homebridge dans une copie de travail :
+
+```bash
+npm ci
+npm install --no-save --package-lock=false --ignore-scripts homebridge@2.4.0
+npm test
+```
+
+`npm ci` rétablit ensuite les dépendances du verrouillage de développement.
+
+### Tests des volets
+
+- `BlindPositionEstimator.test.ts` : temps écoulé, callbacks retardés, fractions,
+  durées montée/descente et traversée de la zone des lames.
+- `OwnBlindController.test.ts` : inversions rapides, dernière consigne prioritaire,
+  STOP mural pendant une requête, calibration refusée/interrompue ou finie en butée,
+  DIM 10 (position mesurée/inconnue, refus), reconnexion et cache.
+- `OwnNet.test.ts` : réserve et priorité STOP, annulation avant écriture et expiration
+  des commandes obsolètes, tout en conservant l'ordre par appareil.
+- `OwnBlindHap.test.ts` et `OwnMatterReal.test.ts` : erreurs, position inconnue,
+  contrôle de calibration et synchronisation des protocoles avec les véritables services.
+
+L'horloge de l'estimateur est injectable. Les tests avancent le temps réel simulé,
+plutôt que d'appeler une fonction « +1 % » pour chaque tick. Les anciennes assertions
+sur les indicateurs internes ont été remplacées par ces scénarios observables.
+
+`OwnThermostatHap.test.ts` vérifie également la priorité des changements effectués
+sur la centrale face aux ACK retardés, aux écritures en file et aux connexions
+incomplètes. Les tests de variation Matter couvrent l'annulation d'un tick déjà
+en file ou en cours de connexion après OFF, STOP ou destruction du pont. Une
+commande déjà écrite reste suivie jusqu'à son résultat réel.
+
+Sur l'installation, mesurer séparément les courses de montée et descente. Vérifier
+une cible intermédiaire, un STOP mural pendant le mouvement, puis une inversion
+rapide. Le journal debug indique les délais de file et d'ACK. Avec une position
+inconnue, tester une course complète ou le contrôle Calibration avant une cible partielle.
+
+### Validation Matter sur une installation réelle
+
+1. Utiliser Homebridge 2.4 ou ultérieur (2.x), activer Matter sur le pont et mettre
+   `expose: "both"` dans la plateforme MyHome.
+2. Associer le pont avec le code Matter fourni par Homebridge. Vérifier la
+   connectivité IPv6 et la découverte locale entre le pont et le contrôleur.
+3. Tester marche/arrêt, variation, commandes murales et synchronisation des deux
+   protocoles. Pour les volets : STOP, inversion et cible intermédiaire.
+4. Vérifier les températures et la commande séparée du programme automatique.
+   Une modification de consigne en mode programme doit être refusée.
+5. Tester capteurs, puissance instantanée, scénarios, relais de porte et sonnerie
+   selon les appareils disponibles et les fonctions de l'application Matter.
+6. Redémarrer Homebridge, puis simuler une indisponibilité de la passerelle :
+   les accessoires doivent conserver leurs identifiants et récupérer leur état.
+7. Vérifier les modes `homekit`, `matter` et `both`. Un changement de protocole
+   peut supprimer des accessoires associés aux automatisations de l'application.
 
 ### Structure du projet
 
@@ -41,7 +113,7 @@ lib/            Sources TypeScript du plugin
 test/           Tests automatisés (node:test)
 dist/           Fichiers compilés (généré par npm run build, ignoré par git)
 scan.ts         Outil de découverte des appareils (compile → dist/scan.js)
-test.ts         Test d'intégration manuel contre une vraie passerelle (hors build)
+test.js         Test d'intégration manuel contre une vraie passerelle (nécessite npm run build)
 config.schema.json  Schéma de configuration pour l'UI Homebridge
 ```
 

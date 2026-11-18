@@ -1,5 +1,7 @@
 import { EventEmitter } from 'events';
 import * as net from 'net';
+import { timingSafeEqual } from 'node:crypto';
+import { createOwnHmacResponse, type OwnHashAlgorithm } from './OwnAuth';
 import type { Logging } from 'homebridge';
 import { errorMessage, COMMAND_QUEUE_CAPACITY, COMMAND_TIMEOUT_MS } from './utils';
 
@@ -36,12 +38,23 @@ export const CMD = {
     SCAN_ALL: '*#1001*0*13##',
 } as const;
 
+export type CommandFailure = 'timeout' | 'cancelled' | 'expired';
+
 export interface CommandParams {
     command: string;
     stopon?: string | string[];
     packet?: (pkt: string) => void;
-    done?: (pkt: string | null, index: number) => void;
+    done?: (pkt: string | null, index: number, failure?: CommandFailure) => void;
     started?: () => void;
+    /** Commands sharing a key execute in order, even with multiple TCP slots. */
+    serialKey?: string;
+    priority?: 'stop' | 'background';
+    /** Wall-clock deadline for commands that must not execute after a long queue wait. */
+    expiresAt?: number;
+    /** Rechecked after the TCP handshake, immediately before writing to the bus. */
+    shouldSend?: () => boolean;
+    /** Cancellation is effective until the packet is written, including the handshake. */
+    signal?: AbortSignal;
     log?: Logging;
     id?: string;
 }
@@ -54,7 +67,8 @@ export function calcPass(pass: string | undefined, nonce: string): string {
         throw new Error('OWN password must be a non-empty decimal integer string');
     }
     const password = Number(pass);
-    if (!Number.isInteger(password)) throw new Error('OWN password must be a number (got non-numeric value)');
+    if (!Number.isSafeInteger(password) || password > 0xffffffff) throw new Error('Legacy OWN password must fit an unsigned 32-bit integer');
+    if (!/^\d+$/.test(nonce)) throw new Error('Legacy OWN nonce must be decimal digits');
     for (const c of nonce) {
         if (c !== '0') {
             if (flag) num2 = password;
@@ -87,6 +101,8 @@ export class OwnConnection extends EventEmitter {
     state: StateValue;
     mode: ModeValue;
     log: Logging;
+    private hmac?: { algorithm: OwnHashAlgorithm; serverProof?: string };
+    private ended = false;
 
     constructor(host: string, port: string | number, password: string, mode: ModeValue, log: Logging) {
         super();
@@ -104,11 +120,13 @@ export class OwnConnection extends EventEmitter {
 
     private destroyConn(): void {
         if (this.conn) {
+            this.ended = true;
             this.conn.removeAllListeners();
             this.conn.on('error', () => {});
             this.conn.destroy();
             this.conn = null;
             this.state = STATE.UNCONNECTED;
+            this.emit('close');
         }
     }
 
@@ -118,6 +136,8 @@ export class OwnConnection extends EventEmitter {
             this.destroyConn();
         }
         this.buf = '';
+        this.hmac = undefined;
+        this.ended = false;
         this.log.debug('conn:%s open socket host: %s, port:%s ', this.id, this.host, this.port);
         this.conn = net.connect({ host: this.host, port: this.port });
         this.conn.setKeepAlive(true, 30000);
@@ -132,15 +152,13 @@ export class OwnConnection extends EventEmitter {
         });
         // Peer half-close: the gateway sent FIN but not RST. Without this handler Node would
         // leave the socket in read-only mode indefinitely. Tear the socket down AND notify
-        // subscribers via 'close' — routing through this.end()/destroyConn() alone would strip
-        // the 'close' listener before destroy() fires, swallowing the disconnect notification
-        // and preventing OwnMonitor from reconnecting.
+        // subscribers via 'close'.
         this.conn.on('end', () => {
             this.log.debug('conn:%s peer half-closed connection (FIN)', this.id);
             this.destroyConn();
-            this.emit('close');
         });
         this.conn.on('close', () => {
+            this.ended = true;
             this.state = STATE.UNCONNECTED;
             const socket = this.conn;
             this.conn = null;
@@ -164,6 +182,7 @@ export class OwnConnection extends EventEmitter {
     }
 
     end(): void {
+        this.ended = true;
         if (this.conn) {
             this.log.debug('conn:%s end', this.id);
             this.destroyConn();
@@ -184,9 +203,19 @@ export class OwnConnection extends EventEmitter {
     }
 
     onData(data: Buffer | string): void {
+        if (this.ended) return;
         this.buf += data.toString();
 
-        while (this.buf.length > 0) {
+        while (!this.ended && this.buf.length > 0) {
+            // Discard any leading characters prior to the start of a packet ('*')
+            const startIdx = this.buf.indexOf('*');
+            if (startIdx > 0) {
+                this.buf = this.buf.slice(startIdx);
+            } else if (startIdx === -1) {
+                this.buf = '';
+                break;
+            }
+
             const m = this.buf.match(/^(\*.+?##)([\s\S]*)$/);
             if (!m) {
                 if (this.buf.length > 4096) {
@@ -214,13 +243,20 @@ export class OwnConnection extends EventEmitter {
                     break;
                 case STATE.CONNECTING:
                     if (packet === PKT.ACK) {
-                        this.emit('connected');
                         this.state = STATE.CONNECTED;
+                        this.emit('connected');
                         this.log.debug('conn:%s start unauthenticated connection', this.id);
                     } else if (packet === PKT.NACK) {
                         this.log.error('conn:%s Gateway rejected session type (NACK) — gateway may be busy or out of slots', this.id);
                         this.state = STATE.UNCONNECTED;
                         this.end();
+                    } else if (packet === '*98*1##' || packet === '*98*2##') {
+                        this.hmac = { algorithm: packet === '*98*1##' ? 'sha1' : 'sha256' };
+                        this.state = STATE.LOGGING_IN;
+                        this.sendPacket(PKT.ACK);
+                    } else if (packet.startsWith('*98*')) {
+                        this.failAuthentication('Unsupported gateway authentication algorithm');
+                        return;
                     } else {
                         const loginMatch = packet.match(/^\*#(\d+)##$/);
                         if (loginMatch === null) {
@@ -243,9 +279,32 @@ export class OwnConnection extends EventEmitter {
                     }
                     break;
                 case STATE.LOGGING_IN:
+                    if (this.hmac) {
+                        const frame = packet.match(/^\*#(\d+)##$/);
+                        try {
+                            if (!frame) throw new Error('Gateway rejected HMAC authentication or returned an invalid frame');
+                            if (!this.hmac.serverProof) {
+                                const response = createOwnHmacResponse(this.password, frame[1], this.hmac.algorithm);
+                                this.hmac.serverProof = response.serverProof;
+                                this.sendPacket(response.packet);
+                            } else {
+                                const actual = Buffer.from(frame[1]);
+                                const expected = Buffer.from(this.hmac.serverProof);
+                                if (actual.length !== expected.length || !timingSafeEqual(actual, expected)) throw new Error('Gateway HMAC proof verification failed');
+                                this.sendPacket(PKT.ACK);
+                                this.hmac = undefined;
+                                this.state = STATE.CONNECTED;
+                                this.emit('connected');
+                            }
+                        } catch (err) {
+                            this.failAuthentication(errorMessage(err));
+                            return;
+                        }
+                        break;
+                    }
                     if (packet === PKT.ACK) {
-                        this.emit('connected');
                         this.state = STATE.CONNECTED;
+                        this.emit('connected');
                         this.log.debug('conn:%s start authenticated connection', this.id);
                     } else if (packet === PKT.NACK) {
                         this.log.error('conn:%s Authentication failed (wrong password)', this.id);
@@ -263,6 +322,15 @@ export class OwnConnection extends EventEmitter {
             }
         }
     }
+
+    private failAuthentication(message: string): void {
+        this.log.error('conn:%s %s', this.id, message);
+        this.sendPacket(PKT.NACK);
+        this.hmac = undefined;
+        this.state = STATE.UNCONNECTED;
+        this.emit('auth-failed');
+        this.end();
+    }
 }
 
 export class OwnMonitor extends EventEmitter {
@@ -278,6 +346,7 @@ export class OwnMonitor extends EventEmitter {
      *  when a delayed `done` callback overlaps with the next checkTimeout tick.
      *  Non-private: asserted by the test suite. */
     checkInFlight: boolean;
+    private stopped = false;
 
     constructor(client: OwnClient) {
         super();
@@ -301,6 +370,7 @@ export class OwnMonitor extends EventEmitter {
     }
 
     connect(): void {
+        if (this.stopped) return;
         this.nbCheck = 0;
         this.checkInFlight = false;
         clearTimeout(this.reconnectTimeout);
@@ -315,6 +385,7 @@ export class OwnMonitor extends EventEmitter {
         });
         this.connection.on('auth-failed', () => {
             this.authFailed = true;
+            this.emit('auth-failed');
         });
         this.connection.on('close', () => {
             this.emit('close');
@@ -332,6 +403,7 @@ export class OwnMonitor extends EventEmitter {
      *  false if it was skipped (previous probe still in flight) or dropped (queue full) —
      *  the caller uses this to avoid counting a non-dispatched tick as a failed check. */
     checkMonitor(): boolean {
+        if (this.stopped) return false;
         if (this.checkInFlight) {
             // A previous probe hasn't resolved yet — skip this tick to avoid
             // stacking parallel `*#13**15##` commands on the queue.
@@ -343,8 +415,10 @@ export class OwnMonitor extends EventEmitter {
             command: '*#13**15##',
             stopon: PKT.ACK,
             done: (pkt: string | null) => {
+                // A queued probe may complete after stop() has disposed this monitor.
+                if (this.stopped) return;
                 this.checkInFlight = false;
-                if (pkt !== null) {
+                if (pkt === PKT.ACK) {
                     const connAlive = this.connection !== null && this.connection.state === STATE.CONNECTED;
                     if (!connAlive) {
                         this.client.log.warn('Monitor: keep-alive OK but monitor disconnected, reconnecting now');
@@ -380,11 +454,13 @@ export class OwnMonitor extends EventEmitter {
     }
 
     resetAutoConnectTimeout(): void {
+        if (this.stopped) return;
         if (this.checkTimeout !== undefined) clearTimeout(this.checkTimeout);
         this.checkTimeout = setTimeout(this.restartConnection.bind(this), this.reconnectSeconds * 1000);
     }
 
     restartConnection(): void {
+        if (this.stopped) return;
         if (this.authFailed) {
             this.client.log.error('Monitor: authentication failed, not reconnecting (check password)');
             this.emit('auth-failed');
@@ -409,6 +485,7 @@ export class OwnMonitor extends EventEmitter {
     }
 
     stop(): void {
+        this.stopped = true;
         clearTimeout(this.checkTimeout);
         clearTimeout(this.reconnectTimeout);
         this.checkTimeout = undefined;
@@ -428,6 +505,12 @@ export class OwnClient extends EventEmitter {
     commandQueue: CommandParams[];
     activeCommands: number;
     maxConcurrent: number;
+    private destroyed = false;
+    private authenticationBlocked = false;
+    private readonly cancelActiveCommands = new Set<() => void>();
+    private readonly activeKeys = new Set<string>();
+    private queueTimer?: ReturnType<typeof setTimeout>;
+    private readonly queuedAborts = new Map<CommandParams, () => void>();
 
     constructor(host: string, port: string | number, password: string, log: Logging) {
         super();
@@ -450,22 +533,81 @@ export class OwnClient extends EventEmitter {
     }
 
     sendCommand(params: CommandParams): boolean {
-        if (this.commandQueue.length >= COMMAND_QUEUE_CAPACITY) {
+        if (this.destroyed || this.authenticationBlocked) return false;
+        if (params.signal?.aborted) {
+            this.rejectQueued(params, 'cancelled');
+            return true;
+        }
+        const capacity = COMMAND_QUEUE_CAPACITY + (params.priority === 'stop' ? 10 : 0);
+        if (this.commandQueue.length >= capacity) {
             this.log.warn('Command queue full (%d), dropping: %s', this.commandQueue.length, params.command);
             return false;
         }
         this.commandQueue.push(params);
+        if (params.signal) {
+            const signal = params.signal;
+            const abort = () => {
+                const index = this.commandQueue.indexOf(params);
+                if (index === -1) return;
+                this.commandQueue.splice(index, 1);
+                this.rejectQueued(params, 'cancelled');
+                this.processQueue();
+            };
+            signal.addEventListener('abort', abort, { once: true });
+            this.queuedAborts.set(params, () => signal.removeEventListener('abort', abort));
+        }
         this.processQueue();
         return true;
     }
 
     processQueue(): void {
-        while (this.activeCommands < this.maxConcurrent && this.commandQueue.length > 0) {
+        clearTimeout(this.queueTimer);
+        this.queueTimer = undefined;
+        const expired = this.commandQueue.filter(p => p.expiresAt !== undefined && p.expiresAt <= Date.now());
+        this.commandQueue = this.commandQueue.filter(p => !expired.includes(p));
+        for (const params of expired) this.rejectQueued(params, 'expired');
+        while (!this.destroyed && !this.authenticationBlocked && this.activeCommands < this.maxConcurrent && this.commandQueue.length > 0) {
+            const score = (p: CommandParams) => p.priority === 'stop' ? 2 : p.priority === 'background' ? 0 : 1;
+            let index = -1;
+            for (let i = 0; i < this.commandQueue.length; i++) {
+                const params = this.commandQueue[i];
+                if (params.serialKey && (this.activeKeys.has(params.serialKey)
+                    || this.commandQueue.slice(0, i).some(p => p.serialKey === params.serialKey))) continue;
+                if (index === -1 || score(params) > score(this.commandQueue[index])) index = i;
+            }
+            if (index === -1) break;
+            const [params] = this.commandQueue.splice(index, 1);
+            this.detachQueuedAbort(params);
             this.activeCommands++;
-            const params = this.commandQueue.shift();
-            if (params === undefined) return;
+            if (params.serialKey) this.activeKeys.add(params.serialKey);
             this.executeCommand(params);
         }
+        const deadlines = this.commandQueue.flatMap(p => p.expiresAt === undefined ? [] : [p.expiresAt]);
+        clearTimeout(this.queueTimer);
+        this.queueTimer = undefined;
+        if (!this.destroyed && deadlines.length) {
+            this.queueTimer = setTimeout(() => this.processQueue(), Math.max(1, Math.min(...deadlines) - Date.now()));
+        }
+    }
+
+    /** Cancel only queued work. Already-written commands require a subsequent STOP. */
+    cancelQueued(serialKey: string): void {
+        const removed = this.commandQueue.filter(p => p.serialKey === serialKey);
+        this.commandQueue = this.commandQueue.filter(p => p.serialKey !== serialKey);
+        for (const params of removed) this.rejectQueued(params, 'cancelled');
+        this.processQueue();
+    }
+
+    private rejectQueued(params: CommandParams, failure: CommandFailure): void {
+        this.detachQueuedAbort(params);
+        try { params.done?.(null, -1, failure); } catch (err) {
+            this.log.error('Command callback failed: %s', errorMessage(err));
+        }
+    }
+
+    private detachQueuedAbort(params: CommandParams): void {
+        this.queuedAborts.get(params)?.();
+        this.queuedAborts.delete(params);
     }
 
     releaseSlot(): void {
@@ -474,65 +616,95 @@ export class OwnClient extends EventEmitter {
     }
 
     executeCommand(params: CommandParams): void {
-        let released = false;
-        const releaseSlot = (failed: boolean) => {
-            if (!released) {
-                released = true;
-                if (failed && params.done) params.done(null, -1);
-                this.releaseSlot();
+        if (this.destroyed) {
+            this.releaseSlot();
+            params.done?.(null, -1);
+            return;
+        }
+        let finished = false;
+        let sent = false;
+        let commandconn: OwnConnection | undefined;
+        let cmdTimeout: ReturnType<typeof setTimeout> | undefined;
+        const cancel = () => finish(null, -1);
+        const abort = () => { if (!sent) finish(null, -1, 'cancelled'); };
+        const finish = (packet: string | null, index: number, failure?: CommandFailure) => {
+            if (finished) return;
+            // end() emits close synchronously. Settle first so that close, a timeout,
+            // or a late packet cannot release another command's slot or call done twice.
+            finished = true;
+            clearTimeout(cmdTimeout);
+            params.signal?.removeEventListener('abort', abort);
+            this.cancelActiveCommands.delete(cancel);
+            try {
+                commandconn?.end();
+            } finally {
+                if (this.activeCommands > 0) this.activeCommands--;
+                try {
+                    // Commit the result before dispatching another command for this device.
+                    params.done?.(packet, index, failure);
+                } finally {
+                    if (params.serialKey) this.activeKeys.delete(params.serialKey);
+                    this.processQueue();
+                }
             }
         };
+        this.cancelActiveCommands.add(cancel);
+        params.signal?.addEventListener('abort', abort, { once: true });
+        if (params.signal?.aborted) { abort(); return; }
 
         try {
-            let cmdTimeout: ReturnType<typeof setTimeout> | undefined;
-            const commandconn = this.newConnection(MODE.COMMAND, params.log);
-            commandconn.on('connected', () => {
-                commandconn.sendPacket(params.command);
-                if (params.started) params.started();
-                cmdTimeout = setTimeout(() => {
-                    commandconn.log.debug('conn:%s command timeout', commandconn.id);
-                    commandconn.end();
-                    releaseSlot(true);
-                }, COMMAND_TIMEOUT_MS);
+            const connection = this.newConnection(MODE.COMMAND, params.log);
+            commandconn = connection;
+            // Arm overall timeout right away so connection hangs or unhandled stalls don't freeze the queue
+            cmdTimeout = setTimeout(() => {
+                connection.log.debug('conn:%s command timeout', connection.id);
+                finish(null, -1, 'timeout');
+            }, COMMAND_TIMEOUT_MS);
+
+            connection.on('connected', () => {
+                if (finished) return;
+                if (params.shouldSend && !params.shouldSend()) return finish(null, -1, 'cancelled');
+                if (params.expiresAt !== undefined && params.expiresAt <= Date.now()) return finish(null, -1, 'expired');
+                params.started?.();
+                if (finished) return;
+                sent = true;
+                connection.sendPacket(params.command);
             });
-            commandconn.on('packet', (packet: string) => {
-                const done = (pkt: string, index: number) => {
-                    clearTimeout(cmdTimeout);
-                    commandconn.end();
-                    releaseSlot(false);
-                    if (params.done) params.done(pkt, index);
-                };
+            connection.on('packet', (packet: string) => {
+                if (finished) return;
 
                 if (params.stopon !== undefined) {
                     if (Array.isArray(params.stopon)) {
                         const i = params.stopon.indexOf(packet);
-                        if (i !== -1) return done(packet, i);
+                        if (i !== -1) return finish(packet, i);
                     } else if (packet === params.stopon) {
-                        return done(packet, 0);
+                        return finish(packet, 0);
                     }
                 } else if (packet === PKT.ACK) {
-                    return done(packet, 0);
+                    return finish(packet, 0);
                 }
+                // A rejection is terminal even when the caller only expects ACK.
+                // Explicit NACK stop conditions above keep their requested index.
+                if (packet === PKT.NACK) return finish(null, -1);
                 if (params.packet) params.packet(packet);
             });
-            commandconn.on('close', () => {
-                clearTimeout(cmdTimeout);
-                releaseSlot(true);
-            });
-            commandconn.connect();
+            connection.on('auth-failed', () => this.blockAuthentication());
+            connection.on('close', () => finish(null, -1));
+            connection.connect();
         } catch (err) {
             this.log.error('executeCommand failed synchronously: %s', errorMessage(err));
-            releaseSlot(true);
+            finish(null, -1);
         }
     }
 
     startMonitor(): void {
+        if (this.destroyed || this.authenticationBlocked) return;
         this.monitor = new OwnMonitor(this);
         this.monitor.on('connected', () => {
             this.emit('monitoring');
         });
         this.monitor.on('auth-failed', () => {
-            this.emit('auth-failed');
+            this.blockAuthentication();
         });
         this.monitor.on('packet', (data: string) => {
             this.emit('packet', data);
@@ -551,6 +723,49 @@ export class OwnClient extends EventEmitter {
         // Note: do NOT call this.removeAllListeners() here — OwnPlatform attaches
         // 'packet'/'monitoring'/'unmonitoring'/'auth-failed' listeners on the OwnClient
         // instance and would lose them across reconnects.
+    }
+
+    private blockAuthentication(): void {
+        if (this.authenticationBlocked || this.destroyed) return;
+        this.authenticationBlocked = true;
+        this.stopMonitor();
+        clearTimeout(this.queueTimer);
+        const queued = this.commandQueue.splice(0);
+        for (const params of queued) {
+            this.detachQueuedAbort(params);
+            try { params.done?.(null, -1); } catch (err) {
+                this.log.error('Command callback failed after authentication failure: %s', errorMessage(err));
+            }
+        }
+        for (const cancel of this.cancelActiveCommands) {
+            try { cancel(); } catch (err) {
+                this.log.error('Command cleanup failed after authentication failure: %s', errorMessage(err));
+            }
+        }
+        this.emit('auth-failed');
+    }
+
+    /** Permanently close this client, including command sockets and pending scans. */
+    destroy(): void {
+        if (this.destroyed) return;
+        this.destroyed = true;
+        clearTimeout(this.queueTimer);
+        this.stopMonitor();
+        const queued = this.commandQueue.splice(0);
+        // Settle every accepted command so callers waiting for a scan can finish.
+        // Callbacks may enqueue more work or throw; neither may interrupt cleanup.
+        for (const params of queued) {
+            this.detachQueuedAbort(params);
+            try { params.done?.(null, -1); } catch (err) {
+                this.log.error('Command callback failed during shutdown: %s', errorMessage(err));
+            }
+        }
+        for (const cancel of this.cancelActiveCommands) {
+            try { cancel(); } catch (err) {
+                this.log.error('Command cleanup failed during shutdown: %s', errorMessage(err));
+            }
+        }
+        this.removeAllListeners();
     }
 
     detectGatewayModel(callback: (model: string | null) => void): void {

@@ -1,11 +1,10 @@
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { makeMockPlatform, makeMockAccessory, POSITION_STATE, HEATING_COOLING_CURRENT, HEATING_COOLING_TARGET, CONTACT_STATE } from './helpers';
+import { makeMockPlatform, makeMockAccessory, HEATING_COOLING_CURRENT, HEATING_COOLING_TARGET, CONTACT_STATE } from './helpers';
 import type { OwnPlatformLike } from '../lib/OwnAccessory';
 import type { PlatformAccessory } from 'homebridge';
 import {
     OwnLightAccessory,
-    OwnBlindAccessory,
     OwnThermostatAccessory,
     OwnScenarioAccessory,
     OwnContactAccessory,
@@ -83,7 +82,7 @@ describe('OwnLightAccessory', () => {
         const h = new OwnLightAccessory(p as unknown as P, a as unknown as A, { id: 42, name: 'dim', dimmer: true });
         h.onData('*1*5*42##');
         assert.equal(h.value, true);
-        assert.equal(h.brightness, Math.round((5 - 2) / 8 * 100));
+        assert.equal(h.brightness, 50);
     });
 
     it('onData dimmer off', () => {
@@ -107,9 +106,9 @@ describe('OwnLightAccessory', () => {
         assert.equal(handler.value, true);
     });
 
-    it('onData unknown packet logs error', () => {
+    it('onData unrelated packet logs at debug level', () => {
         const errors: unknown[] = [];
-        platform.log.error = ((...args: unknown[]) => { errors.push(args); }) as typeof platform.log.error;
+        platform.log.debug = ((...args: unknown[]) => { errors.push(args); }) as typeof platform.log.debug;
         handler.onData('*99*0*42##');
         assert.ok(errors.length > 0);
     });
@@ -123,6 +122,35 @@ describe('OwnLightAccessory', () => {
         handler.updateStatus();
         assert.ok(platform.sendCommandSpy.calls.length > 0);
         assert.ok((platform.sendCommandSpy.calls[0][0] as { command: string }).command.includes('*#1*42'));
+    });
+
+    it('updateStatus applies standard ON and OFF replies from the command connection', () => {
+        handler.updateStatus();
+        const command = platform.sendCommandSpy.calls[0][0] as { packet: (pkt: string) => void };
+        const on = accessory.services['Lightbulb'].characteristics['On'];
+        command.packet('*1*1*42##');
+        assert.equal(on.getter!(), true);
+        assert.equal(on.value, true);
+        command.packet('*1*0*42##');
+        assert.equal(on.getter!(), false);
+        assert.equal(on.value, false);
+    });
+
+    it('updateStatus still applies dimension replies at a custom WHERE address', () => {
+        const h = new OwnLightAccessory(platform as unknown as P, accessory as unknown as A, {
+            id: 42, where: '68#4#01', dimmer: true,
+        });
+        try {
+            h.updateStatus();
+            const command = platform.sendCommandSpy.calls[0][0] as { packet: (pkt: string) => void };
+            command.packet('*#1*68#4#01*1*200*0##');
+            assert.equal(h.value, true);
+            assert.equal(h.brightness, 100);
+            command.packet('*1*1000#0*68#4#01##');
+            assert.equal(h.value, false);
+        } finally {
+            h.destroy();
+        }
     });
 
     it('setOnline false sets StatusFault to GENERAL_FAULT', () => {
@@ -177,970 +205,6 @@ describe('OwnLightAccessory', () => {
     it('no where: checkWhere matches String(id)', () => {
         assert.ok(handler.checkWhere('42'));
         assert.ok(!handler.checkWhere('42#4#01'));
-    });
-});
-
-describe('OwnBlindAccessory', () => {
-    let platform: ReturnType<typeof makeMockPlatform>;
-    let accessory: ReturnType<typeof makeMockAccessory>;
-    let handler: OwnBlindAccessory;
-    beforeEach(() => {
-        platform = makeMockPlatform();
-        accessory = makeMockAccessory();
-        accessory.addService('AccessoryInformation');
-        handler = new OwnBlindAccessory(platform as unknown as P, accessory as unknown as A, { id: 23, name: 'test-blind', time: 30, timeSlat: 0, slatPercent: 0 });
-    });
-    afterEach(() => { handler.destroy(); });
-
-    it('default name when none provided', () => {
-        const p = makeMockPlatform();
-        const a = makeMockAccessory();
-        a.addService('AccessoryInformation');
-        const h = new OwnBlindAccessory(p as unknown as P, a as unknown as A, { id: 5, time: 20 });
-        assert.equal(h.name, 'blind-5');
-    });
-
-    it('throws when time is zero', () => {
-        const p = makeMockPlatform();
-        const a = makeMockAccessory();
-        a.addService('AccessoryInformation');
-        assert.throws(
-            () => new OwnBlindAccessory(p as unknown as P, a as unknown as A, { id: 5, name: 'bad', time: 0 }),
-            /requires a positive "time" value/,
-        );
-    });
-
-    it('status query does not leave inStatusQuery stuck true when queue is full', () => {
-        // Regression: updateStatus() set inStatusQuery=true then relied on the command's
-        // `done` callback to clear it. When sendCommand returns false (queue full) `done`
-        // is never invoked, so the flag stuck true forever and suppressed HomeKit sync.
-        handler.initStartPosition = true; // skip the calibration branch → take the status-query path
-        (platform.controller as unknown as { sendCommand: () => boolean }).sendCommand = () => false;
-        handler.updateStatus();
-        assert.equal(handler.inStatusQuery, false, 'inStatusQuery must be cleared when the status query is dropped');
-    });
-
-    it('throws when time is missing', () => {
-        const p = makeMockPlatform();
-        const a = makeMockAccessory();
-        a.addService('AccessoryInformation');
-        assert.throws(
-            () => new OwnBlindAccessory(p as unknown as P, a as unknown as A, { id: 5, name: 'bad' } as unknown as import('../lib/OwnAccessory').BlindConfig),
-            /requires a positive "time" value/,
-        );
-    });
-
-    it('throws when time is negative', () => {
-        const p = makeMockPlatform();
-        const a = makeMockAccessory();
-        a.addService('AccessoryInformation');
-        assert.throws(
-            () => new OwnBlindAccessory(p as unknown as P, a as unknown as A, { id: 5, name: 'bad', time: -10 }),
-            /requires a positive "time" value/,
-        );
-    });
-
-    it('onData stop', () => {
-        handler.position = 50;
-        handler.target = 50;
-        handler.onData('*2*0*23##');
-        assert.equal(handler.state, POSITION_STATE.STOPPED);
-        assert.equal(handler.position, 50);
-    });
-
-    it('onData stop snaps position to target when within 3 during HomeKit movement', () => {
-        handler.position = 48;
-        handler.target = 50;
-        handler.homeKitMovement = true;
-        handler.onData('*2*0*23##');
-        assert.equal(handler.position, 50, 'position must snap to target during HomeKit movement');
-    });
-
-    it('onData stop does NOT snap position during physical movement', () => {
-        handler.position = 48;
-        handler.target = 50;
-        handler.homeKitMovement = false;
-        handler.onData('*2*0*23##');
-        assert.equal(handler.position, 48, 'position must NOT snap during physical movement');
-    });
-
-    it('manual STOP near lower end-stop snaps position to 0 (drift correction)', () => {
-        // A wall-switch DOWN held to the physical bottom: the local timer may have
-        // over/under-counted, leaving position at e.g. 3%. The gateway STOP confirms the
-        // motor reached the end-stop, so we recalibrate to exactly 0% to cancel drift.
-        const svc = accessory.services['WindowCovering'];
-        handler.position = 3;
-        handler.target = 3;
-        handler.state = POSITION_STATE.DECREASING;
-        handler.homeKitMovement = false;
-        handler.lastMovingDirection = '2'; // was moving DOWN toward the lower stop
-        handler.onData('*2*0*23##');
-        assert.equal(handler.position, 0, 'position must snap to 0 at the lower end-stop');
-        assert.equal(svc.characteristics['CurrentPosition'].value, 0, 'HomeKit CurrentPosition must reflect the snap');
-        assert.equal(accessory.context.blindPosition, 0, 'cached position must be recalibrated to 0');
-    });
-
-    it('manual STOP near upper end-stop snaps position to 100 (drift correction)', () => {
-        const svc = accessory.services['WindowCovering'];
-        handler.position = 97;
-        handler.target = 97;
-        handler.state = POSITION_STATE.INCREASING;
-        handler.homeKitMovement = false;
-        handler.lastMovingDirection = '1'; // was moving UP toward the upper stop
-        handler.onData('*2*0*23##');
-        assert.equal(handler.position, 100, 'position must snap to 100 at the upper end-stop');
-        assert.equal(svc.characteristics['CurrentPosition'].value, 100, 'HomeKit CurrentPosition must reflect the snap');
-    });
-
-    it('manual STOP mid-travel does NOT snap (only end-stops recalibrate)', () => {
-        handler.position = 45;
-        handler.target = 45;
-        handler.state = POSITION_STATE.DECREASING;
-        handler.homeKitMovement = false;
-        handler.lastMovingDirection = '2';
-        handler.onData('*2*0*23##');
-        assert.equal(handler.position, 45, 'a mid-travel manual STOP must leave the estimated position untouched');
-    });
-
-    it('manual STOP near lower stop but last movement was UP does NOT snap', () => {
-        // Guard: only snap toward the stop the blind was actually heading for. A STOP near
-        // 0% after an UP movement is not an end-stop arrival, so position must not jump.
-        handler.position = 4;
-        handler.target = 4;
-        handler.state = POSITION_STATE.INCREASING;
-        handler.homeKitMovement = false;
-        handler.lastMovingDirection = '1'; // was moving UP, away from the lower stop
-        handler.onData('*2*0*23##');
-        assert.equal(handler.position, 4, 'position must not snap to a stop the blind was not heading toward');
-    });
-
-    it('end-stop snap does not apply during calibration (initPhase)', () => {
-        handler.position = 3;
-        handler.target = 3;
-        handler.state = POSITION_STATE.DECREASING;
-        handler.homeKitMovement = false;
-        handler.initPhase = true;
-        handler.lastMovingDirection = '2';
-        handler.onData('*2*0*23##');
-        assert.equal(handler.position, 3, 'calibration flow owns the position — end-stop snap must not interfere');
-    });
-
-    it('HomeKit move ending near an end-stop is NOT snapped to the end (respects target)', () => {
-        // Regression guard: after a HomeKit move reaches its target, moveStop() clears
-        // homeKitMovement BEFORE the STOP echo arrives, so the manual-snap branch would
-        // otherwise fire. isEchoOfHomeKitStop must exclude it — a HomeKit move to 97% must
-        // stay at 97%, not jump to 100%.
-        handler.position = 97;
-        handler.target = 97;
-        handler.state = POSITION_STATE.INCREASING;
-        handler.homeKitMovement = false;   // moveStop() already cleared this
-        handler.homeKitStopPending = true; // moveStop() marked its STOP in flight
-        handler.lastMovingDirection = '1';
-        handler.onData('*2*0*23##');       // echo of our own STOP
-        assert.equal(handler.position, 97, 'HomeKit move must not be snapped to the end-stop');
-    });
-
-    it('onData increasing', () => {
-        handler.onData('*2*1*23##');
-        assert.equal(handler.state, POSITION_STATE.INCREASING);
-    });
-
-    it('onData decreasing', () => {
-        handler.onData('*2*2*23##');
-        assert.equal(handler.state, POSITION_STATE.DECREASING);
-    });
-
-    it('unknown packet logs at debug level', () => {
-        const debugs: unknown[] = [];
-        platform.log.debug = ((...args: unknown[]) => { debugs.push(args); }) as typeof platform.log.debug;
-        handler.onData('*99*0*23##');
-        assert.ok(debugs.length > 0);
-    });
-
-    it('onData extended 1000#2 treated as DECREASING', () => {
-        handler.onData('*2*1000#2*23##');
-        assert.equal(handler.state, POSITION_STATE.DECREASING);
-    });
-
-    it('onData extended 1000#0 treated as STOPPED', () => {
-        handler.state = POSITION_STATE.DECREASING;
-        handler.onData('*2*1000#0*23##');
-        assert.equal(handler.state, POSITION_STATE.STOPPED);
-    });
-
-    it('msPerPercent without slat', () => {
-        assert.equal(handler.msPerPercent(50), (30 / 100) * 1000);
-    });
-
-    it('msPerPercent with slat in slat zone', () => {
-        const p = makeMockPlatform();
-        const a = makeMockAccessory();
-        a.addService('AccessoryInformation');
-        const h = new OwnBlindAccessory(p as unknown as P, a as unknown as A, { id: 1, name: 'v', time: 30, timeSlat: 5, slatPercent: 10 });
-        const ms = h.msPerPercent(5);
-        assert.equal(ms, Math.max(50, (5 / 10) * 1000));
-    });
-
-    it('msPerPercent with slat outside slat zone', () => {
-        const p = makeMockPlatform();
-        const a = makeMockAccessory();
-        a.addService('AccessoryInformation');
-        const h = new OwnBlindAccessory(p as unknown as P, a as unknown as A, { id: 1, name: 'v', time: 30, timeSlat: 5, slatPercent: 10 });
-        const ms = h.msPerPercent(50);
-        assert.equal(ms, (30 / 90) * 1000);
-    });
-
-    it('checkWhere matches', () => {
-        assert.ok(handler.checkWhere('23'));
-        assert.ok(!handler.checkWhere('99'));
-    });
-
-    it('destroy clears timeouts', () => {
-        handler.moveTrackingTimeout = setTimeout(() => {}, 100000);
-        handler.packetTimeout = setTimeout(() => {}, 100000);
-        handler.positionTimeout = setTimeout(() => {}, 100000);
-        handler.destroy();
-    });
-
-    it('startMoveTracking stops scheduling when retry limit exceeded', () => {
-        handler.moveRetries = 31; // one past BLIND_MAX_MOVE_RETRIES (30)
-        handler.startMoveTracking();
-        assert.strictEqual(handler.moveTrackingTimeout, undefined);
-        assert.equal(handler.moveRetries || 0, 0);
-    });
-
-    it('stopMoveTracking resets retry counter', () => {
-        handler.moveRetries = 20;
-        handler.stopMoveTracking();
-        assert.equal(handler.moveRetries || 0, 0);
-    });
-
-    it('startMoveTracking schedules normally when under retry limit', () => {
-        handler.moveRetries = 0;
-        handler.startMoveTracking();
-        assert.notEqual(handler.moveTrackingTimeout, undefined);
-        handler.destroy();
-    });
-
-    it('startMoveTracking does NOT increment moveRetries (single source of truth is move() pending path)', () => {
-        // Bug B fix: previously startMoveTracking incremented moveRetries when commandSent=true,
-        // and move()'s commandIsPending path also incremented — double-counting.
-        // Now: only move()'s pending path increments. startMoveTracking just schedules.
-        handler.moveRetries = 5;
-        handler.commandSent = true;
-        handler.startMoveTracking();
-        assert.equal(handler.moveRetries, 5, 'startMoveTracking must not bump moveRetries');
-        handler.destroy();
-    });
-
-    it('evaluatePosition stops and sends stop command when position reaches target while INCREASING', () => {
-        const spy = platform.sendCommandSpy;
-        spy.calls.length = 0;
-        handler.state = POSITION_STATE.INCREASING;
-        handler.expectedState = POSITION_STATE.INCREASING;
-        handler.homeKitMovement = true;
-        handler.target = 50;
-        handler.position = 49;
-        handler.evaluatePosition();
-        assert.equal(handler.position, 50);
-        assert.equal(handler.expectedState, POSITION_STATE.STOPPED);
-        const cmds = spy.calls.map((c: unknown[]) => (c[0] as { command: string }).command);
-        assert.ok(cmds.some((c: string) => c === '*2*0*23##'), 'expected stop command *2*0*23##, got: ' + cmds.join(', '));
-        handler.destroy();
-    });
-
-    it('updateStatus init phase sets _initPhase and sends move-down', () => {
-        const spy = platform.sendCommandSpy;
-        spy.calls.length = 0;
-        assert.equal(handler.initStartPosition, false);
-        handler.updateStatus();
-        assert.equal(handler.initPhase, true);
-        assert.equal(handler.initStartPosition, true);
-        const cmds = spy.calls.map((c: unknown[]) => (c[0] as { command: string }).command);
-        assert.ok(cmds.some((c: string) => c === '*2*2*23##'));
-    });
-
-    it('calibrateOnStart:false restores cached position without sending move-down', () => {
-        const p = makeMockPlatform();
-        const a = makeMockAccessory();
-        a.addService('AccessoryInformation');
-        a.context.blindPosition = 65;
-        const h = new OwnBlindAccessory(p as unknown as P, a as unknown as A,
-            { id: 30, name: 'test', time: 20, calibrateOnStart: false });
-        assert.equal(h.position, 65, 'position must be restored from cache');
-        assert.equal(h.target, 65, 'target must match restored position');
-        p.sendCommandSpy.calls.length = 0;
-        h.updateStatus();
-        const cmds = p.sendCommandSpy.calls.map((c: unknown[]) => (c[0] as { command: string }).command);
-        assert.ok(!cmds.some((c: string) => c.startsWith('*2*2*')), 'no calibration move-down must be sent');
-        assert.equal(h.initStartPosition, true);
-        h.destroy();
-    });
-
-    it('calibrateOnStart:true (default) still calibrates', () => {
-        const p = makeMockPlatform();
-        const a = makeMockAccessory();
-        a.addService('AccessoryInformation');
-        a.context.blindPosition = 65;
-        const h = new OwnBlindAccessory(p as unknown as P, a as unknown as A,
-            { id: 31, name: 'test', time: 20 }); // calibrateOnStart defaults to true
-        p.sendCommandSpy.calls.length = 0;
-        h.updateStatus();
-        const cmds = p.sendCommandSpy.calls.map((c: unknown[]) => (c[0] as { command: string }).command);
-        assert.ok(cmds.some((c: string) => c === '*2*2*31##'), 'move-down must be sent for calibration');
-        h.destroy();
-    });
-
-    it('position is cached in context on STOP', () => {
-        handler.position = 72;
-        handler.onData('*2*0*23##');
-        assert.equal(accessory.context.blindPosition, 72, 'position must be saved to context on STOP');
-    });
-
-    it('position is cached in context on STOP (not on mid-movement ticks)', () => {
-        handler.state = POSITION_STATE.INCREASING;
-        handler.position = 50;
-        handler.target = 80;
-        // Before STOP: evaluatePosition tick should NOT write to cache
-        accessory.context.blindPosition = 0;
-        handler.evaluatePosition();
-        assert.equal(accessory.context.blindPosition, 0, 'cache must NOT be updated on mid-movement tick');
-        // STOP packet: cache must be written (position far from target → no snap)
-        handler.position = 60;
-        handler.onData('*2*0*23##');
-        assert.equal(accessory.context.blindPosition, 60, 'position must be cached on STOP');
-        handler.destroy();
-    });
-
-    it('evaluatePosition during init does not send stop when DECREASING at target', () => {
-        const spy = platform.sendCommandSpy;
-        spy.calls.length = 0;
-        handler.initPhase = true;
-        handler.state = POSITION_STATE.DECREASING;
-        handler.position = 0;
-        handler.target = 0;
-        handler.evaluatePosition();
-        const cmds = spy.calls.map((c: unknown[]) => (c[0] as { command: string }).command);
-        assert.ok(!cmds.some((c: string) => c.startsWith('*2*0*')), 'stop command must not be sent during init phase by evaluatePosition');
-        handler.destroy();
-    });
-
-    it('onData STOP clears _initPhase when was DECREASING', () => {
-        handler.initPhase = true;
-        handler.state = POSITION_STATE.DECREASING;
-        handler.onData('*2*0*23##');
-        assert.equal(handler.initPhase, false);
-    });
-
-    it('onData STOP does not clear initPhase when state was STOPPED and position > 0 (gateway broadcast before DECREASING echo)', () => {
-        handler.initPhase = true;
-        handler.state = POSITION_STATE.STOPPED;
-        handler.position = 50; // position > 0: calibration not complete yet
-        handler.onData('*2*0*23##');
-        assert.equal(handler.initPhase, true, 'initPhase must survive a state broadcast before DECREASING echo');
-    });
-
-    it('onData STOP clears initPhase when position=0 (blind already at bottom at startup)', () => {
-        handler.initPhase = true;
-        handler.state = POSITION_STATE.STOPPED;
-        handler.position = 0;
-        handler.onData('*2*0*23##');
-        assert.equal(handler.initPhase, false, 'initPhase must clear when blind is already at bottom');
-    });
-
-    it('physical STOP syncs TargetPosition to CurrentPosition', () => {
-        const svc = accessory.services['WindowCovering'];
-        handler.state = POSITION_STATE.INCREASING;
-        handler.homeKitMovement = false;
-        handler.position = 60;
-        handler.target = 100;
-        handler.onData('*2*0*23##');
-        assert.equal(handler.target, 60, 'target must match position after physical stop');
-        assert.equal(svc.characteristics['TargetPosition'].value, 60, 'TargetPosition characteristic must be pushed to HomeKit');
-    });
-
-    it('full manual operation flow: wall switch UP → tracking → wall switch STOP → HomeKit sync', () => {
-        const svc = accessory.services['WindowCovering'];
-        handler.position = 50;
-        handler.target = 50;
-        handler.state = POSITION_STATE.STOPPED;
-
-        // 1. User presses wall UP button — gateway broadcasts INCREASING
-        handler.onData('*2*1*23##');
-        assert.equal(handler.state, POSITION_STATE.INCREASING, 'state must reflect physical UP');
-        assert.equal(handler.homeKitMovement, false, 'homeKitMovement must remain false during physical movement');
-        assert.equal(svc.characteristics['CurrentPosition'].value, 51, 'position must increment one tick on first onData');
-        assert.notEqual(handler.positionTimeout, undefined, 'position tracking must start');
-
-        // 2. Tick a few times manually
-        handler.evaluatePosition();
-        handler.evaluatePosition();
-        assert.equal(handler.position, 53, 'ticks must advance position during physical movement');
-
-        // 3. User presses wall STOP button — gateway broadcasts STOP
-        handler.onData('*2*0*23##');
-        assert.equal(handler.state, POSITION_STATE.STOPPED);
-        assert.equal(handler.target, 53, 'target must be synced to physical position');
-        assert.equal(svc.characteristics['TargetPosition'].value, 53, 'HomeKit TargetPosition must reflect new position');
-        assert.equal(svc.characteristics['CurrentPosition'].value, 53);
-        assert.equal(svc.characteristics['PositionState'].value, POSITION_STATE.STOPPED);
-        assert.equal(accessory.context.blindPosition, 53, 'position must be cached on physical STOP');
-    });
-
-    it('successive manual operations after STOP all reflect in HomeKit (regression test)', (_t, done) => {
-        // Bug: positionTimeout was cleared but never reset to undefined in evaluatePosition().
-        // After the first physical STOP, the variable kept its (cancelled) reference, so the
-        // onData guard `!this.positionTimeout` was false, blocking subsequent evaluatePosition() calls.
-        const svc = accessory.services['WindowCovering'];
-        handler.position = 50;
-        handler.target = 50;
-        handler.state = POSITION_STATE.STOPPED;
-
-        // 1st manual cycle: UP → STOP
-        handler.onData('*2*1*23##');
-        handler.onData('*2*0*23##');
-        assert.equal(handler.state, POSITION_STATE.STOPPED);
-        assert.equal(handler.positionTimeout, undefined, 'positionTimeout must be undefined after STOP');
-
-        // Wait past the post-STOP spurious-packet grace window (150ms)
-        setTimeout(() => {
-            // 2nd manual cycle: DOWN — must update HomeKit state
-            handler.onData('*2*2*23##');
-            assert.equal(handler.state, POSITION_STATE.DECREASING, '2nd manual movement state must be reflected');
-            assert.equal(svc.characteristics['PositionState'].value, POSITION_STATE.DECREASING,
-                '2nd movement PositionState must be pushed to HomeKit');
-
-            // 2nd STOP
-            handler.onData('*2*0*23##');
-            assert.equal(handler.state, POSITION_STATE.STOPPED, '2nd STOP must be reflected');
-
-            setTimeout(() => {
-                // 3rd manual cycle: UP again — must still update HomeKit
-                handler.onData('*2*1*23##');
-                assert.equal(handler.state, POSITION_STATE.INCREASING, '3rd manual movement state must be reflected');
-                assert.equal(svc.characteristics['PositionState'].value, POSITION_STATE.INCREASING);
-                done();
-            }, 200);
-        }, 200);
-    });
-
-    it('post-STOP spurious direction packet (BTicino F454) is suppressed', () => {
-        // F454 broadcasts *2*2* (DECREASING) immediately after a wall-switch STOP, which
-        // would otherwise be mis-interpreted as a new DOWN movement. The plugin must ignore
-        // this packet when received within ~150ms of the STOP AND it re-emits the same
-        // direction the blind was just moving in (here: DECREASING).
-        const svc = accessory.services['WindowCovering'];
-        handler.position = 34;
-        handler.target = 34;
-        handler.state = POSITION_STATE.DECREASING; // blind was actively moving DOWN when the STOP arrived
-        handler.lastMovingDirection = '2'; // blind was moving DOWN before the wall-switch STOP
-
-        // Simulate the exact F454 sequence observed in field logs:
-        //   *2*0* (STOP) → *2*2* (spurious, immediately after)
-        handler.onData('*2*0*23##');
-        const stateAfterStop = handler.state;
-        handler.onData('*2*2*23##'); // spurious same-direction re-emission — must be ignored
-
-        assert.equal(handler.state, stateAfterStop, 'state must remain STOPPED, not DECREASING');
-        assert.equal(svc.characteristics['PositionState'].value, POSITION_STATE.STOPPED,
-            'PositionState must remain STOPPED in HomeKit despite spurious packet');
-    });
-
-    it('manual command from an end-stop is NOT filtered (opposite direction to last movement)', () => {
-        // Regression (present since 0.4.6): at an end-stop position === target is permanently
-        // true, so the old `position === target` filter swallowed EVERY manual command issued
-        // from the end-stop. This gateway sends *2*0* (STOP) before every direction packet,
-        // including manual ones. The fix filters only same-direction phantoms, so a genuine
-        // manual DOWN from the top (last movement was UP) must pass through.
-        handler.position = 100;
-        handler.target = 100;
-        handler.state = POSITION_STATE.INCREASING; // reached the top by actively moving UP
-        handler.homeKitMovement = false;
-        handler.commandSent = false;
-        handler.homeKitStopPending = false;
-        handler.lastMovingDirection = '1'; // reached the top by moving UP
-
-        handler.onData('*2*0*23##');                 // gateway STOP that precedes the manual move
-        assert.equal(handler.postStopGrace, true, 'grace window arms on the physical STOP');
-        handler.onData('*2*2*23##');                 // genuine manual DOWN from the wall switch
-        assert.equal(handler.state, POSITION_STATE.DECREASING,
-            'manual DOWN from upper end-stop must NOT be filtered');
-    });
-
-    it('manual UP from lower end-stop is NOT filtered', () => {
-        handler.position = 0;
-        handler.target = 0;
-        handler.state = POSITION_STATE.DECREASING; // reached the bottom by actively moving DOWN
-        handler.homeKitMovement = false;
-        handler.commandSent = false;
-        handler.homeKitStopPending = false;
-        handler.lastMovingDirection = '2'; // reached the bottom by moving DOWN
-
-        handler.onData('*2*0*23##');
-        assert.equal(handler.postStopGrace, true);
-        handler.onData('*2*1*23##');                 // genuine manual UP from the wall switch
-        assert.equal(handler.state, POSITION_STATE.INCREASING,
-            'manual UP from lower end-stop must NOT be filtered');
-    });
-
-    it('same-direction phantom after a mid-travel STOP is still suppressed', () => {
-        // The true F454 artifact: blind was moving DOWN, stops, gateway re-emits *2*2*.
-        // Even away from an end-stop this must still be filtered.
-        handler.position = 40;
-        handler.target = 40;
-        handler.state = POSITION_STATE.DECREASING; // was actively moving DOWN when the STOP arrived
-        handler.homeKitMovement = false;
-        handler.commandSent = false;
-        handler.homeKitStopPending = false;
-        handler.lastMovingDirection = '2'; // was moving DOWN before the STOP
-
-        handler.onData('*2*0*23##');
-        assert.equal(handler.postStopGrace, true);
-        handler.onData('*2*2*23##');                 // same-direction phantom
-        assert.equal(handler.state, POSITION_STATE.STOPPED,
-            'same-direction phantom after a mid-travel STOP must still be suppressed');
-    });
-
-    it('post-STOP grace window does NOT filter a real manual command after a HomeKit STOP', () => {
-        // Bug fix: previously, if HomeKit sent a STOP (or a HomeKit-initiated move ended
-        // with an auto-STOP), the grace window would arm and swallow the next direction
-        // packet — meaning a user pressing the wall switch DOWN 100 ms after a HomeKit
-        // STOP saw the blind move but HomeKit showed STOPPED.
-        // Post-fix: grace is only armed when the STOP is a *physical* one (i.e. NOT the
-        // echo of a HomeKit command).
-        handler.position = 50;
-        handler.target = 50;
-        handler.state = POSITION_STATE.INCREASING;
-        handler.homeKitMovement = true;
-        handler.commandSent = true;
-        handler.expectedState = POSITION_STATE.STOPPED; // simulate a moveStop() just sent
-        handler.homeKitStopPending = true;              // moveStop() marks its STOP in flight
-        // Echo of the HomeKit STOP command
-        handler.onData('*2*0*23##');
-        assert.equal(handler.state, POSITION_STATE.STOPPED);
-
-        // 100 ms later user presses DOWN on the wall switch — this must be processed.
-        handler.onData('*2*2*23##');
-        assert.equal(handler.state, POSITION_STATE.DECREASING,
-            'real manual DOWN after HomeKit STOP must NOT be filtered by the grace window');
-    });
-
-    it('a physical STOP (no HomeKit STOP in flight) arms the post-STOP grace window', () => {
-        // Complement to the test above: when homeKitStopPending is false the STOP is physical,
-        // so the F454 grace window MUST arm and swallow exactly one spurious direction packet.
-        handler.position = 50;
-        handler.target = 50;
-        handler.state = POSITION_STATE.DECREASING;
-        handler.homeKitMovement = false;
-        handler.commandSent = false;
-        handler.homeKitStopPending = false;
-        handler.lastMovingDirection = '2'; // was moving DOWN; the phantom re-emits DOWN
-        // Physical wall-switch STOP
-        handler.onData('*2*0*23##');
-        assert.equal(handler.state, POSITION_STATE.STOPPED);
-        assert.equal(handler.postStopGrace, true, 'grace window must arm for a physical STOP');
-        // The spurious F454 direction packet within the grace window is ignored.
-        handler.onData('*2*2*23##');
-        assert.equal(handler.state, POSITION_STATE.STOPPED,
-            'spurious post-STOP direction packet must be filtered by the grace window');
-    });
-
-    it('redundant STOP while already stopped does NOT re-arm grace — manual same-direction re-press passes (field bug)', () => {
-        // Field log (0.4.10, blind 88): a user closed a blind in several DOWN taps. After the
-        // first DOWN+STOP, the gateway emitted redundant "*2*0*" STOPs while already stopped,
-        // which re-armed postStopGrace, so the next manual "*2*2*" (same direction as the last
-        // movement) was swallowed as a phantom. The grace window must arm ONLY on a genuine
-        // MOTION→STOP transition, not on a STOP received while already STOPPED.
-        handler.position = 42;
-        handler.target = 42;
-        handler.state = POSITION_STATE.STOPPED;      // blind is already at rest
-        handler.homeKitMovement = false;
-        handler.commandSent = false;
-        handler.homeKitStopPending = false;
-        handler.lastMovingDirection = '2';           // last real movement was DOWN
-
-        // Redundant STOP broadcast while already stopped — must NOT re-arm the grace window.
-        handler.onData('*2*0*23##');
-        assert.equal(handler.postStopGrace, false,
-            'a STOP received while already STOPPED must not arm the grace window');
-
-        // Genuine manual DOWN re-press (same direction as last movement) — must be processed.
-        handler.onData('*2*2*23##');
-        assert.equal(handler.state, POSITION_STATE.DECREASING,
-            'manual same-direction re-press after a redundant STOP must NOT be filtered');
-    });
-
-    it('target syncs to position while a manual movement is in progress', () => {
-        // Bug fix: previously, during a wall-switch UP/DOWN, `target` kept its stale HomeKit
-        // value while `position` advanced — HomeKit displayed TargetPosition inconsistent
-        // with the physically moving blind. Post-fix: `target` and the HomeKit characteristic
-        // are synced together at 10% boundaries (throttled to avoid HAP flooding); between
-        // boundaries `target` stays put so the STOP branch can do the final authoritative sync.
-        const svc = accessory.services['WindowCovering'];
-        handler.position = 30;
-        handler.target = 80; // stale target from a previous HomeKit command
-        handler.state = POSITION_STATE.INCREASING;
-        handler.homeKitMovement = false;
-
-        handler.evaluatePosition(); // one manual tick UP: position 30→31 (not a boundary)
-        assert.equal(handler.position, 31);
-        assert.equal(handler.target, 80,
-            'between boundaries target is left diverged so the STOP branch can finalise it');
-
-        // Advance to a 10% boundary (position 40) where target + characteristic sync fires.
-        for (let i = 0; i < 9; i++) handler.evaluatePosition();
-        assert.equal(handler.position, 40);
-        assert.equal(handler.target, 40,
-            'target must be synced to live position at a 10% boundary');
-        assert.equal(svc.characteristics['TargetPosition'].value, 40,
-            'HomeKit TargetPosition must be pushed at 10% boundaries during manual movement');
-    });
-
-    it('manual target sync is suppressed during a status query', () => {
-        // Regression guard: the INCREASING/DECREASING branches must honour !inStatusQuery
-        // (like the STOPPED branch) so a status-query response for an already-moving blind
-        // does not overwrite a meaningful prior HomeKit target.
-        handler.position = 40;
-        handler.target = 80; // meaningful prior HomeKit target
-        handler.state = POSITION_STATE.INCREASING;
-        handler.homeKitMovement = false;
-        handler.inStatusQuery = true;
-
-        handler.evaluatePosition(); // status-query tick: position 40→41
-        assert.equal(handler.position, 41);
-        assert.equal(handler.target, 80,
-            'target must NOT be clobbered by a status-query response while moving');
-    });
-
-    it('direction reversal without intervening STOP cancels stale positionTimeout', () => {
-        // Bug fix: a wall-switch UP immediately followed by DOWN (without any STOP between
-        // them) previously left the UP's positionTimeout armed, delaying the DOWN tick by
-        // one tick period. Post-fix: reversal clears the stale timeout so DOWN starts
-        // tracking immediately.
-        handler.position = 50;
-        handler.target = 50;
-        handler.state = POSITION_STATE.STOPPED;
-        handler.homeKitMovement = false;
-        // First: UP
-        handler.onData('*2*1*23##');
-        assert.equal(handler.state, POSITION_STATE.INCREASING);
-        assert.ok(handler.positionTimeout !== undefined,
-            'positionTimeout must be armed after first movement');
-        const firstTimeout = handler.positionTimeout;
-        // Second: DOWN — no STOP in between
-        handler.onData('*2*2*23##');
-        assert.equal(handler.state, POSITION_STATE.DECREASING);
-        assert.notEqual(handler.positionTimeout, firstTimeout,
-            'positionTimeout must be reset by the reversal');
-    });
-
-    it('BLIND_END_STOP_SAFETY_MS constant exists and is a positive number', () => {
-        // Simple sanity check that the safety-net timeout is defined. Full behaviour
-        // is exercised via integration since it depends on real setTimeout.
-        // eslint-disable-next-line @typescript-eslint/no-require-imports
-        const { BLIND_END_STOP_SAFETY_MS } = require('../lib/utils') as { BLIND_END_STOP_SAFETY_MS: number };
-        assert.ok(typeof BLIND_END_STOP_SAFETY_MS === 'number' && BLIND_END_STOP_SAFETY_MS > 0);
-    });
-
-    it('STOPPED during HomeKit movement does NOT overwrite target', () => {
-        handler.state = POSITION_STATE.STOPPED;
-        handler.homeKitMovement = true;
-        handler.position = 65;
-        handler.target = 50;
-        handler.evaluatePosition();
-        assert.equal(handler.target, 50, 'target must be preserved while homeKitMovement is true');
-    });
-
-    it('init STOP timer fires moveStop after travel time', (_t, done) => {
-        const spy = platform.sendCommandSpy;
-        spy.calls.length = 0;
-        handler.time = 0.05;  // 50ms travel + 1000ms margin → ~1050ms
-        handler.updateStatus();
-        // Verify init DOWN was sent immediately
-        const downSent = spy.calls.some((c: unknown[]) => (c[0] as { command: string }).command === '*2*2*23##');
-        assert.ok(downSent, 'init DOWN must be sent immediately');
-        // Wait for the calibration timer to fire
-        setTimeout(() => {
-            const stopSent = spy.calls.some((c: unknown[]) => (c[0] as { command: string }).command === '*2*0*23##');
-            assert.ok(stopSent, 'init STOP must be sent after travel time + margin');
-            handler.destroy();
-            done();
-        }, 1200);
-    });
-
-    it('init STOP timer fires even when gateway sends a premature STOP during calibration', (_t, done) => {
-        // Bug fix: endCalibration() previously cleared the safety timer, so a premature
-        // gateway STOP (e.g. blind already at bottom) prevented the final STOP from
-        // being sent. Now endCalibration() leaves the timer alone — a duplicate STOP
-        // at the end of the travel window is harmless.
-        const spy = platform.sendCommandSpy;
-        spy.calls.length = 0;
-        handler.time = 0.05;
-        handler.updateStatus();
-        spy.calls.length = 0;  // ignore the init DOWN
-        // Simulate gateway sending a premature STOP (blind already at bottom)
-        handler.onData('*2*0*23##');
-        assert.equal(handler.initPhase, false, 'initPhase must be cleared by premature STOP');
-        // The safety timer must still fire and send STOP
-        setTimeout(() => {
-            const stopSent = spy.calls.some((c: unknown[]) => (c[0] as { command: string }).command === '*2*0*23##');
-            assert.ok(stopSent, 'safety STOP must be sent after travel time even after premature STOP');
-            handler.destroy();
-            done();
-        }, 1200);
-    });
-
-    it('init STOP timer accounts for timeSlat (venetian blinds)', (_t, done) => {
-        const spy = platform.sendCommandSpy;
-        spy.calls.length = 0;
-        handler.time = 0.05;       // 50ms linear
-        handler.timeSlat = 0.3;    // 300ms slat → total 350ms + 1000ms margin = 1350ms
-        handler.updateStatus();
-        // At 1100ms, STOP must NOT yet be sent (linear timer would have fired at 1050ms)
-        setTimeout(() => {
-            const stopSentEarly = spy.calls.some((c: unknown[]) => (c[0] as { command: string }).command === '*2*0*23##');
-            assert.ok(!stopSentEarly, 'STOP must NOT fire before time+timeSlat elapsed');
-        }, 1100);
-        // After 1500ms, STOP must have fired
-        setTimeout(() => {
-            const stopSent = spy.calls.some((c: unknown[]) => (c[0] as { command: string }).command === '*2*0*23##');
-            assert.ok(stopSent, 'STOP must fire after (time+timeSlat) + margin');
-            handler.destroy();
-            done();
-        }, 1500);
-    });
-
-    it('stopMoveTracking clears initPhase to unblock subsequent stops', () => {
-        handler.initPhase = true;
-        handler.stopMoveTracking();
-        assert.equal(handler.initPhase, false, 'initPhase must be cleared so future moves can stop at target');
-    });
-
-    it('init timer clears initPhase before moveStop (gateway STOP echo may not clear it)', (_t, done) => {
-        handler.time = 0.05;
-        handler.updateStatus();
-        // Wait for the calibration timer to fire
-        setTimeout(() => {
-            assert.equal(handler.initPhase, false, 'initPhase must be cleared by init timer to unblock future DECREASING stops');
-            handler.destroy();
-            done();
-        }, 1200);
-    });
-
-    it('STOPPED during status query does NOT overwrite target', () => {
-        const svc = accessory.services['WindowCovering'];
-        handler.state = POSITION_STATE.STOPPED;
-        handler.homeKitMovement = false;
-        (handler as unknown as { inStatusQuery: boolean }).inStatusQuery = true;
-        handler.position = 75;
-        handler.target = 50;
-        svc.characteristics['TargetPosition'].value = 50;
-        handler.evaluatePosition();
-        assert.equal(handler.target, 50, 'target must be preserved during status query');
-        assert.equal(svc.characteristics['TargetPosition'].value, 50, 'TargetPosition must not be pushed during status query');
-    });
-
-    it('onData duplicate STOP does not call evaluatePosition when already STOPPED', () => {
-        handler.state = POSITION_STATE.STOPPED;
-        let evalCalled = 0;
-        const orig = handler.evaluatePosition.bind(handler);
-        handler.evaluatePosition = () => { evalCalled++; orig(); };
-        handler.onData('*2*0*23##');
-        assert.equal(evalCalled, 0, 'evaluatePosition must not be called for duplicate STOP');
-    });
-
-    it('onData duplicate DECREASING does not call evaluatePosition when already DECREASING', () => {
-        handler.state = POSITION_STATE.DECREASING;
-        let evalCalled = 0;
-        const orig = handler.evaluatePosition.bind(handler);
-        handler.evaluatePosition = () => { evalCalled++; orig(); };
-        handler.onData('*2*2*23##');
-        assert.equal(evalCalled, 0, 'evaluatePosition must not be called for duplicate DECREASING');
-        handler.destroy();
-    });
-
-    it('evaluatePosition physical UP (homeKitMovement=false) does not send stop even at target', () => {
-        const spy = platform.sendCommandSpy;
-        spy.calls.length = 0;
-        handler.homeKitMovement = false;
-        handler.state = POSITION_STATE.INCREASING;
-        handler.position = 0;
-        handler.target = 0;
-        handler.evaluatePosition();
-        const cmds = spy.calls.map((c: unknown[]) => (c[0] as { command: string }).command);
-        assert.ok(!cmds.some((c: string) => c.startsWith('*2*0*')), 'physical UP must not trigger stop');
-        assert.notEqual(handler.positionTimeout, undefined, 'position tracking must continue');
-        handler.destroy();
-    });
-
-    it('evaluatePosition physical DOWN (homeKitMovement=false) does not send stop even at target', () => {
-        const spy = platform.sendCommandSpy;
-        spy.calls.length = 0;
-        handler.homeKitMovement = false;
-        handler.state = POSITION_STATE.DECREASING;
-        handler.position = 5;
-        handler.target = 5;
-        handler.evaluatePosition();
-        const cmds = spy.calls.map((c: unknown[]) => (c[0] as { command: string }).command);
-        assert.ok(!cmds.some((c: string) => c.startsWith('*2*0*')), 'physical DOWN must not trigger stop');
-        assert.notEqual(handler.positionTimeout, undefined, 'position tracking must continue');
-        handler.destroy();
-    });
-
-    it('evaluatePosition physical UP stops tracking at upper end-stop (pos=100)', () => {
-        handler.homeKitMovement = false;
-        handler.state = POSITION_STATE.INCREASING;
-        handler.position = 100;
-        handler.evaluatePosition();
-        assert.equal(handler.positionTimeout, undefined, 'must not reschedule at upper end-stop');
-    });
-
-    it('evaluatePosition physical DOWN stops tracking at lower end-stop (pos=0)', () => {
-        handler.homeKitMovement = false;
-        handler.state = POSITION_STATE.DECREASING;
-        handler.position = 0;
-        handler.target = 0;
-        handler.evaluatePosition();
-        assert.equal(handler.positionTimeout, undefined, 'must not reschedule at lower end-stop');
-    });
-
-    it('status query response does not trigger physical override on monitor path', () => {
-        // Bug: inStatusQuery was only set inside packet callback (command path).
-        // Monitor receives echoed status packets WITHOUT the flag → false physical override.
-        // Fix: inStatusQuery is now set BEFORE sendCommand and cleared in done callback.
-        handler.homeKitMovement = true;
-        handler.expectedState = POSITION_STATE.INCREASING;
-        handler.state = POSITION_STATE.INCREASING;  // forced by endTimerCommand timeout
-        handler.initStartPosition = true;  // skip init path
-
-        handler.updateStatus();  // sets inStatusQuery=true, then calls sendCommand
-
-        // Flag must be true while the query is in flight (monitor path protection)
-        assert.equal((handler as unknown as Record<string, unknown>)['inStatusQuery'], true,
-            'inStatusQuery must be true from the moment updateStatus sends the query');
-
-        // Simulate monitor receiving STOPPED echo (the bug scenario)
-        handler.onData('*2*0*23##');
-
-        // homeKitMovement must survive — no physical override during query window
-        assert.equal(handler.homeKitMovement, true,
-            'homeKitMovement must survive status query STOP echo on monitor path');
-
-        // Simulate done callback (command connection closes)
-        const lastCall = platform.sendCommandSpy.calls[platform.sendCommandSpy.calls.length - 1];
-        const params = lastCall[0] as Record<string, unknown>;
-        if (typeof params['done'] === 'function') {
-            (params['done'] as (p: null, i: number) => void)(null, -1);
-        }
-        assert.equal((handler as unknown as Record<string, unknown>)['inStatusQuery'], false,
-            'inStatusQuery must be cleared after done callback');
-    });
-
-    it('STOP packet from gateway during HomeKit movement triggers physical override (real stop)', () => {
-        // *2*0*<id>## from the gateway always means a real stop (physical button, end-stop, obstacle).
-        // It must NOT be ignored — the override must fire so the blind syncs target=position to HomeKit.
-        handler.homeKitMovement = true;
-        handler.expectedState = POSITION_STATE.INCREASING;
-        handler.state = POSITION_STATE.INCREASING;
-        handler.position = 50;
-        handler.target = 80;
-        handler.onData('*2*0*23##');
-        assert.equal(handler.homeKitMovement, false, 'physical override must cancel HomeKit movement on real STOP');
-    });
-
-    it('physical override fires for genuine direction reversal (INCREASING→DECREASING)', () => {
-        handler.homeKitMovement = true;
-        handler.expectedState = POSITION_STATE.INCREASING;
-        handler.state = POSITION_STATE.INCREASING;
-        handler.position = 50;
-        handler.target = 80;
-
-        handler.onData('*2*2*23##');  // physical DOWN while HomeKit was going UP
-
-        assert.equal(handler.homeKitMovement, false, 'homeKitMovement must be cleared on real physical override');
-        assert.equal(handler.state, POSITION_STATE.DECREASING);
-    });
-
-    it('evaluatePosition during init stops rescheduling when position reaches 0', () => {
-        handler.initPhase = true;
-        handler.state = POSITION_STATE.DECREASING;
-        handler.position = 0;
-        handler.target = 0;
-        handler.evaluatePosition();
-        assert.equal(handler.positionTimeout, undefined);
-    });
-
-    it('move() with pending command increments moveRetries and schedules retry', () => {
-        handler.commandSent = true;
-        handler.moveRetries = 5;
-        handler.target = 80;
-        handler.position = 20;
-        handler.move();
-        assert.equal(handler.moveRetries, 6, 'moveRetries must increment on each pending-command retry');
-        assert.notEqual(handler.moveTrackingTimeout, undefined);
-        handler.destroy();
-    });
-
-    it('move() with pending command gives up after BLIND_MAX_MOVE_RETRIES', () => {
-        handler.commandSent = true;
-        handler.moveRetries = 30; // at the limit
-        handler.target = 80;
-        handler.position = 20;
-        handler.move();
-        assert.equal(handler.moveTrackingTimeout, undefined, 'retry loop must be stopped after max retries');
-        assert.equal(handler.commandSent, false, 'commandSent must be reset after giving up');
-    });
-
-    it('move() issues moveUp when target > position', () => {
-        const spy = platform.sendCommandSpy;
-        spy.calls.length = 0;
-        handler.state = POSITION_STATE.STOPPED;
-        handler.position = 20;
-        handler.target = 80;
-        handler.move();
-        const cmds = spy.calls.map((c: unknown[]) => (c[0] as { command: string }).command);
-        assert.ok(cmds.some((c: string) => c === '*2*1*23##'));
-        handler.destroy();
-    });
-
-    it('move() restores homeKitMovement when already moving in the right direction (rapid retarget)', () => {
-        // Simulate: user set target=50 (blind starts UP), then immediately set target=80
-        // stopMoveTracking() cleared homeKitMovement; move() should restore it
-        handler.state = POSITION_STATE.INCREASING;
-        handler.homeKitMovement = false; // cleared by stopMoveTracking
-        handler.commandSent = false;
-        handler.position = 30;
-        handler.target = 80;
-        // positionTimeout must be undefined (cleared by stopMoveTracking)
-        handler.move();
-        assert.equal(handler.homeKitMovement, true, 'homeKitMovement must be restored when already moving in right direction');
-        handler.destroy();
-    });
-
-    it('move() issues moveDown when target < position', () => {
-        const spy = platform.sendCommandSpy;
-        spy.calls.length = 0;
-        handler.state = POSITION_STATE.STOPPED;
-        handler.position = 80;
-        handler.target = 20;
-        handler.move();
-        const cmds = spy.calls.map((c: unknown[]) => (c[0] as { command: string }).command);
-        assert.ok(cmds.some((c: string) => c === '*2*2*23##'));
-        handler.destroy();
-    });
-
-    it('setOnline false sets StatusFault to GENERAL_FAULT', () => {
-        const svc = accessory.services['WindowCovering'];
-        handler.setOnline(false);
-        assert.equal(svc.characteristics['StatusFault'].value, 1);
-    });
-
-    it('setOnline true clears StatusFault to NO_FAULT', () => {
-        const svc = accessory.services['WindowCovering'];
-        handler.setOnline(false);
-        handler.setOnline(true);
-        assert.equal(svc.characteristics['StatusFault'].value, 0);
-        handler.destroy();
     });
 });
 
@@ -1244,6 +308,24 @@ describe('OwnThermostatAccessory', () => {
             'the setpoint temperature is still applied even when the mode is not adopted');
     });
 
+    for (const mode of ['auto', 'off'] as const) {
+        for (const source of ['command', 'bus'] as const) {
+            it(`DIM 14 preserves ${mode} established by ${source} and keeps setpoint writes blocked`, async () => {
+                if (source === 'command') await handler.execute({ type: 'mode', value: mode });
+                else handler.onData(`*4*${mode === 'auto' ? 1101 : 103}*#0#1##`);
+                const before = platform.sendCommandSpy.calls.length;
+                for (const modeByte of [1, 2, 3]) {
+                    handler.onData(`*#4*1*14*0210*${modeByte}##`);
+                    assert.equal(handler.snapshot().mode, mode);
+                    assert.equal(handler.snapshot().targetTemperature, 21);
+                    assert.throws(() => handler.execute({ type: 'temperature', value: 23 }),
+                        (error: unknown) => (error as { code: number }).code === -70412);
+                }
+                assert.equal(platform.sendCommandSpy.calls.length, before);
+            });
+        }
+    }
+
     it('onData valve status sets heating', () => {
         handler.onData('*#4*1*19*0*1##');
         assert.equal(handler.heatingCoolingState, HEATING_COOLING_CURRENT.HEAT);
@@ -1342,7 +424,7 @@ describe('OwnThermostatAccessory', () => {
         platform.sendCommandSpy.calls.length = 0;
         svc.characteristics['TargetHeatingCoolingState'].setter!(HEATING_COOLING_TARGET.OFF);
         const cmds = platform.sendCommandSpy.calls.map((c: unknown[]) => (c[0] as { command: string }).command);
-        assert.ok(cmds.some((c: string) => c === '*4*103*#0#1##'));
+        assert.ok(cmds.some((c: string) => c === '*4*303*#0#1##'));
     });
 
     it('TargetTemperature onSet in HEAT mode sends temperature command', () => {
@@ -1600,9 +682,10 @@ describe('OwnEnergyAccessory', () => {
         assert.equal(handler.watts, 350);
     });
 
-    it('onData zero watts floors to 0.0001', () => {
+    it('onData zero watts stays zero in the device state', () => {
         handler.onData('*#18*71*113*0##');
-        assert.equal(handler.watts, 0.0001);
+        assert.equal(handler.watts, 0);
+        assert.equal(accessory.services.LightSensor.characteristics.CurrentAmbientLightLevel.value, 0.0001);
     });
 
     it('non-113 dimension packet is ignored', () => {

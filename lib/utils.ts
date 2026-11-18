@@ -13,21 +13,21 @@ export function errorMessage(err: unknown): string {
 }
 
 // ---------------------------------------------------------------------------
-// OWN dimmer level conversion (protocol levels 2..10 ↔ HomeKit brightness 1..100)
+// WHO 1 v1.2, §1.1: WHAT 2..10 means 20%, 30%, ... 100%.
 // ---------------------------------------------------------------------------
 
 const OWN_DIMMER_MIN = 2;
 const OWN_DIMMER_MAX = 10;
-const OWN_DIMMER_RANGE = OWN_DIMMER_MAX - OWN_DIMMER_MIN; // 8
 
 /** HomeKit brightness % → OWN dimmer level (clamped to [2, 10]). */
 export function brightnessToOwnLevel(percent: number): number {
-    return Math.min(OWN_DIMMER_MAX, Math.max(OWN_DIMMER_MIN, Math.round(percent / 100 * OWN_DIMMER_RANGE) + OWN_DIMMER_MIN));
+    return Math.min(OWN_DIMMER_MAX, Math.max(OWN_DIMMER_MIN, Math.round(percent / 10)));
 }
 
-/** OWN dimmer level (≥ 2) → HomeKit brightness % (1..100). */
+/** Absolute WHAT level 2..10 → brightness %. Other WHATs are not levels. */
 export function ownLevelToBrightness(level: number): number {
-    return Math.max(1, Math.round((level - OWN_DIMMER_MIN) / OWN_DIMMER_RANGE * 100));
+    if (!Number.isInteger(level) || level < OWN_DIMMER_MIN || level > OWN_DIMMER_MAX) throw new RangeError('OWN dimmer level must be in 2..10');
+    return level * 10;
 }
 
 // ---------------------------------------------------------------------------

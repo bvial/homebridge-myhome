@@ -12,29 +12,19 @@
 import { OwnClient, OwnConnection, PKT, CMD, MODE } from './lib/OwnNet';
 import { errorMessage } from './lib/utils';
 import { runStatusScan, ScanFound } from './lib/scanHelper';
+import { parseScanArgs } from './lib/scanArgs';
 import type { Logging } from 'homebridge';
 
 // ─── CLI args ─────────────────────────────────────────────────────────────────
 
-const argv = process.argv.slice(2);
-const positional = argv.filter(a => !a.startsWith('--'));
-
-const host     = positional[0] ?? '';
-const port     = parseInt(positional[1] ?? '20000', 10);
-const password = positional[2] ?? '';
-
-const maxAddrIdx = argv.indexOf('--max-addr');
-const maxAddrRaw = maxAddrIdx !== -1 ? parseInt(argv[maxAddrIdx + 1] ?? '', 10) : NaN;
-const maxAddrValid = !isNaN(maxAddrRaw) && maxAddrRaw >= 1 && maxAddrRaw <= 999;
-const maxAddr    = maxAddrValid ? maxAddrRaw : 20;
-const verbose    = argv.includes('--verbose');
+const { host, port, password, maxAddr, verbose, invalidMaxAddr } = parseScanArgs(process.argv.slice(2));
 
 if (!host) {
     console.error('Usage: node dist/scan.js <host> [port] [password] [--max-addr N] [--verbose]');
     process.exit(1);
 }
 
-if (maxAddrIdx !== -1 && !maxAddrValid) {
+if (invalidMaxAddr) {
     console.error(`[warn] --max-addr requires an integer in 1..999; falling back to default ${maxAddr}`);
 }
 
@@ -93,12 +83,8 @@ function configScan(): Promise<ConfigDevice[]> {
 
 // ─── Phase 2 : STATUS scan ────────────────────────────────────────────────────
 // Queries each address individually in COMMAND mode.
-// Detection rules per WHO type:
-//   WHO=1,4,9,18 — device exists when the gateway sends at least one data packet
-//                  before ACK (stopped blind sends just ACK on some firmware).
-//   WHO=2        — device exists when gateway responds ACK (data or not); NACK
-//                  means the address is not configured. A stopped blind typically
-//                  replies ACK without a data packet on F454/F455 firmware.
+// Discovery requires an ACK and a matching state/dimension response. An ACK alone
+// confirms gateway acceptance, not the existence of an actuator at the address.
 
 // ─── config generation ────────────────────────────────────────────────────────
 
@@ -106,7 +92,7 @@ interface DraftConfig {
     lights:      Array<{ id: number; name: string }>;
     blinds:      Array<{ id: number; name: string; time: number }>;
     thermostats: Array<{ id: number; zone: number; name: string }>;
-    contacts:    Array<{ id: number; name: string }>;
+    contacts:    Array<{ id: number; name: string; protocol?: 'dry-contact'; where?: string }>;
     energies:    Array<{ id: number; name: string }>;
 }
 
@@ -125,6 +111,7 @@ function buildConfig(found: ScanFound[]): DraftConfig {
             case 4:  draft.thermostats.push({ id, zone: id, name: `Thermostat ${id}` }); break;
             case 9:  draft.contacts.push({ id, name: `Contact ${id}` }); break;
             case 18: draft.energies.push({ id, name: `Energy ${id}` }); break;
+            case 25: draft.contacts.push({ id, name: `Contact ${id}`, protocol: 'dry-contact', where }); break;
         }
     }
     return draft;
@@ -160,7 +147,7 @@ async function main() {
         console.log(`  • Try a larger range: --max-addr 99`);
         console.log('  • Run with --verbose for connection details');
     } else {
-        const whoLabel: Record<number, string> = { 1: 'light', 2: 'blind', 4: 'thermostat', 9: 'contact', 18: 'energy' };
+        const whoLabel: Record<number, string> = { 1: 'light', 2: 'blind', 4: 'thermostat', 9: 'auxiliary', 18: 'energy', 25: 'contact/IR' };
         console.log('Discovered devices:');
         const sorted = [...found].sort((a, b) => a.who - b.who || parseInt(a.where, 10) - parseInt(b.where, 10));
         for (const { who, where } of sorted) {
@@ -182,7 +169,7 @@ async function main() {
     console.log('  • Venetian blinds: add "timeSlat" and "slatPercent"');
     console.log('  • Thermostats: verify "zone" matches your installation');
     console.log('  • Dimmer lights: add "dimmer": true');
-    console.log('  • Scenarios: add manually (id = scenario number on the gateway)');
+    console.log('  • Scenarios: add manually (scenario number and module WHERE address)');
     console.log();
 
     process.exit(0);
