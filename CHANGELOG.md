@@ -2,7 +2,7 @@
 
 All notable changes to this project are documented here.
 
-## [Unreleased]
+## [0.5.0] — 2026-11-18
 
 ### Added
 - SHA-1/SHA-256 mutual authentication negotiated by the gateway, alongside legacy authentication.

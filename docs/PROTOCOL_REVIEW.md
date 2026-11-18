@@ -1,6 +1,6 @@
 # Revue OpenWebNet et Homebridge
 
-Revue du 18 novembre 2026, pour les modifications de la section `Unreleased`.
+Revue du 18 novembre 2026, pour la version **0.5.0**.
 
 ## Références officielles
 
