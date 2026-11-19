@@ -37,7 +37,10 @@ export interface BlindReport {
     direction: 'opening' | 'closing' | 'stopped';
     /** Present only on DIM 10; 255 is explicitly unknown. */
     position?: number | null;
-    blocked?: boolean;
+    /** Persistent actuator configuration (shutterInfo 12/13). */
+    disabled?: boolean;
+    /** The last command was not executed (shutterInfo 14), not a disable flag. */
+    rejected?: boolean;
 }
 
 export class OwnProtcol {
@@ -105,7 +108,7 @@ export class OwnProtcol {
             if (status < 10 || status > 14 || (position > 100 && position !== 255)
                 || Number(dimension[4]) > 7 || ![0, 12, 13, 14, 15].includes(info)) return null;
             return { where: dimension[1], direction: status === 10 ? 'stopped' : status === 11 || status === 13 ? 'opening' : 'closing',
-                position: position === 255 ? null : position, blocked: [12, 13, 14].includes(info) };
+                position: position === 255 ? null : position, disabled: [12, 13].includes(info), rejected: info === 14 };
         }
         const standard = packet.match(/^\*2\*(?:1000#)?(0|1|2|10|11|12)(?:#[\d#]+)?\*([\d#]+)##$/);
         if (!standard) return null;

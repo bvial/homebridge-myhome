@@ -37,9 +37,10 @@ describe('OpenWebNet official wire examples', () => {
         assert.deepEqual(OwnProtcol.extractPacketInfo('*#4*#1##'), { who: 4, where: '#1' });
     });
     it('decodes advanced shutter position, unknown position and actuator refusal', () => {
-        assert.deepEqual(OwnProtcol.decodeBlindReport('*#2*11*10*12*43*0*0##'), { where: '11', direction: 'closing', position: 43, blocked: false });
+        assert.deepEqual(OwnProtcol.decodeBlindReport('*#2*11*10*12*43*0*0##'), { where: '11', direction: 'closing', position: 43, disabled: false, rejected: false });
         assert.equal(OwnProtcol.decodeBlindReport('*#2*11*10*10*255*0*0##')?.position, null);
-        assert.equal(OwnProtcol.decodeBlindReport('*#2*11*10*10*43*0*14##')?.blocked, true);
+        assert.deepEqual(OwnProtcol.decodeBlindReport('*#2*11*10*10*43*0*14##'), { where: '11', direction: 'stopped', position: 43, disabled: false, rejected: true });
+        for (const info of [12, 13]) assert.equal(OwnProtcol.decodeBlindReport(`*#2*11*10*10*43*0*${info}##`)?.disabled, true);
         assert.equal(OwnProtcol.decodeBlindReport('*2*1000#11#0#0*11##')?.direction, 'opening');
     });
     it('addresses a WHO 0 scenario module rather than the unsupported general address', async () => {

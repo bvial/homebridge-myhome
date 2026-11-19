@@ -562,6 +562,7 @@ export class OwnBlindAccessory extends OwnAccessory {
         if (!result) return super.executeDeviceCommand(command);
         return result.catch(err => {
             const code = err instanceof BlindError ? err.code : 'communication';
+            this.log.warn('[%s] Blind %s failed (%s): %s', this.id, command.type, code, errorMessage(err));
             throw new this.HapStatusError(code === 'busy' ? this.HAPStatus.RESOURCE_BUSY
                 : code === 'timeout' ? this.HAPStatus.OPERATION_TIMED_OUT
                     : code === 'invalid' || code === 'cancelled' ? this.HAPStatus.NOT_ALLOWED_IN_CURRENT_STATE

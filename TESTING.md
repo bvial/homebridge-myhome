@@ -74,6 +74,16 @@ npm test
 - `OwnBlindHap.test.ts` et `OwnMatterReal.test.ts` : erreurs, position inconnue,
   contrôle de calibration et synchronisation des protocoles avec les véritables services.
 
+La régression des commandes de volet 0.5.0 est couverte par une ouverture HomeKit
+depuis 0 %, avec le cache historique, puis après un refus d'actionneur et des
+manœuvres murales. Le refus ponctuel WHO 2 `shutterInfo=14` doit autoriser une
+nouvelle demande ; les états désactivés 12/13 doivent toujours la refuser.
+
+`OwnBlindRemoteHap.test.ts` traverse aussi le routeur HAP distant : permissions,
+validation des valeurs et adressage AID/IID après sérialisation/restauration du
+cache Homebridge. Les pourcentages des volets temporisés doivent rester utilisables
+avec une référence incertaine, notamment après calibration sur un volet déjà fermé.
+
 L'horloge de l'estimateur est injectable. Les tests avancent le temps réel simulé,
 plutôt que d'appeler une fonction « +1 % » pour chaque tick. Les anciennes assertions
 sur les indicateurs internes ont été remplacées par ces scénarios observables.
@@ -87,7 +97,8 @@ commande déjà écrite reste suivie jusqu'à son résultat réel.
 Sur l'installation, mesurer séparément les courses de montée et descente. Vérifier
 une cible intermédiaire, un STOP mural pendant le mouvement, puis une inversion
 rapide. Le journal debug indique les délais de file et d'ACK. Avec une position
-inconnue, tester une course complète ou le contrôle Calibration avant une cible partielle.
+inconnue, vérifier aussi une cible partielle fondée sur la dernière estimation,
+puis une course complète ou le contrôle Calibration pour retrouver une référence.
 
 ### Validation Matter sur une installation réelle
 

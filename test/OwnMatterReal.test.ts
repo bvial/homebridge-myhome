@@ -156,6 +156,7 @@ describe('OwnMatterBridge with real Homebridge Matter endpoints', { timeout: 300
         const device = new OwnBlindAccessory(platform as unknown as OwnPlatformLike, accessory as unknown as PlatformAccessory, config);
         t.after(() => device.destroy());
         device.setOnline(true);
+        device.onData('*#2*2*10*10*255*0*0##');
         const entry = { ...f.entry('blind', config), device, context: accessory.context };
         await f.bridge.sync([entry]); await f.settle();
         assert.equal(f.state(entry, 'windowCovering').currentPositionLiftPercent100ths, null);

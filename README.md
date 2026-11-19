@@ -193,8 +193,11 @@ alongside the legacy `blindPosition`. STOPs and motion starts trigger persistenc
 intermediate 10% checkpoints are batched for HomeKit. Confidence is `estimated`,
 `calibrated`, `measured` (hardware DIM 10 feedback), or `unknown`. A disconnect, interrupted movement or cache older than
 24 hours at startup makes it unknown. HomeKit then reports StatusFault and retains
-the last estimate; Matter reports a null current position. Partial-position writes
-are rejected until a full opening/closing or calibration establishes a reference.
+the last estimate; Matter reports a null current position. Timed actuators still
+accept partial-position writes using that estimate, as before 0.5.0. Their accuracy
+depends on the travel times and last known position. A full opening/closing or
+calibration can establish a new reference. Only an explicit hardware report of
+unknown position (DIM 10 level 255) prevents partial-position writes until corrected.
 
 Calibration times a complete closing run from actual command dispatch, including
 slat time. A natural STOP after the full duration completes calibration; otherwise
@@ -203,10 +206,16 @@ the timed reference unknown. A manual STOP near an endpoint does not by itself
 prove an exact 0% or 100% position.
 
 Advanced actuators' DIM 10 reports correct the estimate and supply measured positions.
-Level 255 remains unknown, and disabled/rejected actuator states are respected.
+Level 255 remains unknown, and disabled actuator states prevent new movements.
+A "command not executed" report fails that movement but allows a later user request;
+it does not permanently disable the shutter in the plugin.
 A timed calibration never overrides an explicit unknown hardware report. Commands
 continue to use basic UP/DOWN/STOP for compatibility. The slat options describe a
 combined virtual travel range; independent tilt control is not exposed.
+
+For HomeKit/Siri troubleshooting, look for `Blind target requested` in the
+Homebridge log. It records the requested target and the plugin's current state.
+`Blind position failed` includes the reason a command was refused or failed.
 
 #### `thermostats`
 

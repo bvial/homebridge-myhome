@@ -8,6 +8,40 @@ import { makeMockClient, makeMockPlatform } from './helpers';
 import { PKT } from '../lib/OwnNet';
 
 describe('Blind HAP adapter', () => {
+    for (const refused of [false, true]) {
+        it(`opens a closed blind from a HomeKit target write${refused ? ' after a previous actuator refusal and wall control' : ' with the legacy cache'}`, async t => {
+            t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+            t.mock.method(performance, 'now', () => Date.now());
+            const mock = makeMockPlatform();
+            const network = makeMockClient(mock.log);
+            const platform = { ...mock, Service, Characteristic, HapStatusError, controller: network.client };
+            const accessory = Object.assign(new Accessory('Blind', uuid.generate(t.name)), { context: { blindPosition: 0 } });
+            const handler = new OwnBlindAccessory(platform as unknown as OwnPlatformLike, accessory as unknown as PlatformAccessory,
+                { id: 2, time: 20, calibrateOnStart: false });
+            t.after(() => { handler.destroy(); network.client.destroy(); });
+            handler.setOnline(true);
+            if (refused) {
+                handler.onData('*#2*2*10*10*0*0*14##');
+                handler.onData('*2*1*2##');
+                t.mock.timers.tick(1000);
+                handler.onData('*2*2*2##');
+                t.mock.timers.tick(1000);
+                handler.onData('*2*0*2##');
+            }
+            const covering = accessory.getService(Service.WindowCovering)!;
+            assert.equal(await covering.getCharacteristic(Characteristic.CurrentPosition).handleGetRequest(), 0);
+            assert.equal(await covering.getCharacteristic(Characteristic.TargetPosition).handleGetRequest(), 0);
+            const open = covering.getCharacteristic(Characteristic.TargetPosition).handleSetRequest(100);
+            void open.catch(() => {});
+            assert.deepEqual(network.sent, ['*2*1*2##']);
+            network.connections[0].onData(PKT.ACK); await open;
+            t.mock.timers.tick(1000);
+            assert.equal(await covering.getCharacteristic(Characteristic.CurrentPosition).handleGetRequest(), 5);
+            assert.equal(await covering.getCharacteristic(Characteristic.TargetPosition).handleGetRequest(), 100);
+            assert.equal(covering.getCharacteristic(Characteristic.PositionState).value, Characteristic.PositionState.INCREASING);
+        });
+    }
+
     it('returns gateway errors and persists fractional position and confidence on a wall STOP', async t => {
         t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
         t.mock.method(performance, 'now', () => Date.now());

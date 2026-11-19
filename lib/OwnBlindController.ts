@@ -92,7 +92,7 @@ export class OwnBlindController {
     private lastBucket = -1;
     private queryPending = false;
     readonly where: string;
-    private hardwareFault = false;
+    private actuatorDisabled = false;
     private reportedPosition?: number | null;
 
     constructor(
@@ -207,9 +207,11 @@ export class OwnBlindController {
     }
 
     moveTo(target: number): Promise<void> {
+        this.log.info('[%s] Blind target requested: %s%% (position=%s%%, confidence=%s, phase=%s)',
+            this.config.id, target, Math.round(this.estimator.position(this.now())), this.confidence, this.phase);
         if (!Number.isFinite(target) || target < 0 || target > 100) return Promise.reject(new BlindError('invalid', 'Position must be in 0..100'));
-        if (this.confidence === 'unknown' && target !== 0 && target !== 100) {
-            return Promise.reject(new BlindError('invalid', 'Position unknown: fully open or close the blind before choosing a partial position'));
+        if (this.reportedPosition === null && target !== 0 && target !== 100) {
+            return Promise.reject(new BlindError('invalid', 'Actuator reports unknown position (255): fully open or close the blind before choosing a partial position'));
         }
         if (this.confidence !== 'unknown' && Math.abs(target - this.estimator.position(this.now())) < 0.01
             && (this.estimator.direction !== 'stopped' || this.transmissions.some(t => !t.completed))) return this.stop();
@@ -221,7 +223,7 @@ export class OwnBlindController {
 
     private begin(target: number, calibration: boolean, jog = false): Promise<void> {
         if (!this.online || this.disposed) return Promise.reject(new BlindError('offline', 'Gateway is offline'));
-        if (this.hardwareFault) return Promise.reject(new BlindError('invalid', 'The actuator reports a disabled or rejected-command state'));
+        if (this.actuatorDisabled) return Promise.reject(new BlindError('invalid', 'The actuator reports a disabled state (WHO 2 shutterInfo 12/13)'));
         this.cancel(new BlindError('cancelled', 'Replaced by a newer blind command'));
         if (calibration) this.confidence = 'unknown';
         this.target = target;
@@ -229,7 +231,10 @@ export class OwnBlindController {
         let reject!: (error: Error) => void;
         const result = new Promise<void>((ok, fail) => { resolve = ok; reject = fail; });
         const op: Operation = { id: this.generation, target, calibration,
-            reference: !jog && (calibration || this.confidence === 'unknown'), jog, resolve, reject };
+            // Legacy timed actuators remain controllable from their last estimate
+            // even after cache expiry, reconnect or an interrupted calibration.
+            // Only an endpoint request may run a complete reference course.
+            reference: !jog && (calibration || (this.confidence === 'unknown' && (target === 0 || target === 100))), jog, resolve, reject };
         this.operation = op;
         this.phase = calibration ? 'calibrating' : 'starting';
         this.notify();
@@ -373,6 +378,7 @@ export class OwnBlindController {
         const report = OwnProtcol.decodeBlindReport(packet);
         if (!report || report.where !== this.where) return;
         const direction = report.direction;
+        const actuatorFault = report.disabled || report.rejected;
         const now = this.now();
         this.transmissions = this.transmissions.filter(t => t.expires >= now);
         const echo = source === 'monitor' ? this.transmissions.find(t => t.sentAt !== undefined && !t.echoed && t.direction === direction) : undefined;
@@ -387,19 +393,21 @@ export class OwnBlindController {
             // nor invalidate the ACK fallback of the current command.
             if (echo.sequence < this.sentSequence || echo.manualRevision !== this.manualRevision) return;
         } else if (report.position === undefined || direction === 'stopped'
-            || direction !== this.estimator.direction || report.blocked) {
+            || direction !== this.estimator.direction || actuatorFault) {
             this.manualRevision++;
         }
         this.busRevision++;
         if (report.position !== undefined) {
             this.reportedPosition = report.position;
-            this.hardwareFault = !!report.blocked;
+            // A refusal describes one command. Only the explicit disabled states
+            // may prevent subsequent user requests from reaching the gateway.
+            this.actuatorDisabled = !!report.disabled;
         }
         const op = this.operation;
         const measuredTarget = typeof report.position === 'number' && op && report.position === op.target;
         const fullRun = report.position === undefined && this.reportedPosition === undefined && op?.reference && op.acknowledged && op.deadline !== undefined
             && now >= op.deadline - 1000 && this.estimator.direction !== 'stopped';
-        if (direction === 'stopped' && op && !report.blocked && (measuredTarget || fullRun)) {
+        if (direction === 'stopped' && op && !actuatorFault && (measuredTarget || fullRun)) {
             // WHO 2 §3.0.1 sends STOP at the natural end-stop. The one-second
             // safety margin must not turn a completed full run into a failed calibration.
             this.estimator.reference(op.target, now);
@@ -413,7 +421,7 @@ export class OwnBlindController {
             this.observe('stopped', now);
             return;
         }
-        if (source === 'monitor' && !echo && (this.operation || this.transmissions.some(t => !t.completed))
+        if (source === 'monitor' && !echo && !actuatorFault && (this.operation || this.transmissions.some(t => !t.completed))
             && (direction === 'stopped' || direction !== this.estimator.direction)) {
             if (this.operation?.calibration) this.confidence = 'unknown';
             this.cancel(new BlindError('cancelled', 'Wall control overrides the automatic movement'));
@@ -429,7 +437,9 @@ export class OwnBlindController {
             }
         }
         this.observe(direction, now);
-        if (this.hardwareFault) {
+        if (this.actuatorDisabled || report.rejected) {
+            this.log.warn('[%s] Blind actuator %s: %s', this.config.id,
+                this.actuatorDisabled ? 'disabled' : 'did not execute the command', packet);
             this.cancel(new BlindError('communication', 'Actuator command rejected or disabled'));
             this.markFault();
         }

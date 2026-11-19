@@ -2,6 +2,22 @@
 
 All notable changes to this project are documented here.
 
+## [0.5.1] — 2026-11-19
+
+### Fixed
+- Restore percentage control for timed blinds when their position reference is
+  uncertain after restart, disconnection or an early calibration STOP. Partial
+  targets use the last estimate instead of being rejected or running a full course.
+- Exercise remote HomeKit writes through the actual AID/IID router and cached
+  accessory restoration, including intermediate targets with an uncertain reference.
+- A WHO 2 "command not executed" report (shutterInfo 14) no longer permanently
+  blocks subsequent blind commands. Explicit disabled states 12/13 remain respected,
+  and a rejected movement still fails without being revived by a late ACK.
+
+### Changed
+- Log requested blind targets and the reason for rejected commands, including
+  failures before a frame is sent, to diagnose silent HomeKit/Siri requests.
+
 ## [0.5.0] — 2026-11-18
 
 ### Added

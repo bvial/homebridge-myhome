@@ -332,15 +332,42 @@ describe('OwnBlindController', () => {
         assert.equal(f.blind.snapshot().positionConfidence, 'measured');
     });
 
-    it('respects an actuator disabled/rejected state and recovers on a normal report', async t => {
-        const f = fixture(t);
-        f.blind.onData('*#2*2*10*10*50*0*14##');
+    for (const info of [12, 13]) {
+        it(`respects disabled actuator state ${info} and recovers on a normal report`, async t => {
+            const f = fixture(t);
+            f.blind.onData(`*#2*2*10*10*50*0*${info}##`);
+            assert.equal(f.blind.snapshot().blindPhase, 'fault');
+            await assert.rejects(f.move(100));
+            assert.equal(f.sent.length, 0);
+            f.blind.onData('*#2*2*10*10*50*0*0##');
+            const move = f.move(80); await f.ack(0); await move;
+            assert.deepEqual(f.sent, ['*2*1*2##']);
+        });
+    }
+
+    it('allows an explicit opening after an earlier command-not-executed report', async t => {
+        const f = fixture(t, {}, { blindPosition: 0 });
+        f.blind.onData('*#2*2*10*10*0*0*14##');
         assert.equal(f.blind.snapshot().blindPhase, 'fault');
-        await assert.rejects(f.move(100));
-        assert.equal(f.sent.length, 0);
-        f.blind.onData('*#2*2*10*10*50*0*0##');
-        const move = f.move(80); await f.ack(0); await move;
-        assert.deepEqual(f.sent, ['*2*1*2##']);
+        assert.equal(f.sent.length, 0, 'a refusal must not trigger an automatic retry');
+        const open = f.move(100);
+        assert.deepEqual(f.sent, ['*2*1*2##'], 'a new user request must reach the gateway');
+        await f.ack(0); await open;
+        assert.equal(f.blind.snapshot().moving, 'opening');
+        assert.equal(f.blind.snapshot().targetPosition, 100);
+    });
+
+    it('fails a rejected movement without latching the refusal onto a later opening', async t => {
+        const f = fixture(t, {}, { blindPosition: 0 });
+        const first = f.move(100);
+        f.blind.onData('*#2*2*10*10*0*0*14##');
+        await assert.rejects(first, (err: unknown) => err instanceof BlindError && err.code === 'communication');
+        await f.ack(0);
+        assert.equal(f.blind.snapshot().moving, 'stopped', 'late ACK must not erase the rejection');
+        const retry = f.move(100);
+        assert.deepEqual(f.sent, ['*2*1*2##', '*2*1*2##']);
+        await f.ack(1); await retry;
+        assert.equal(f.blind.snapshot().moving, 'opening');
     });
 
     it('supports a shutter on a local bus using its exact WHERE address', async t => {
@@ -351,9 +378,51 @@ describe('OwnBlindController', () => {
         assert.equal(f.blind.snapshot().position, 80);
     });
 
-    it('rejects unknown partial positions but allows a full run to establish a reference', async t => {
+    it('allows a timed percentage from the last estimate after starting without a reference', async t => {
         const f = fixture(t, {}, {});
+        const partial = f.move(40);
+        assert.deepEqual(f.sent, ['*2*1*2##']);
+        await f.ack(0); await partial;
+        await f.tick(8000);
+        assert.deepEqual(f.sent, ['*2*1*2##', '*2*0*2##'], 'partial movement must not use a full calibration duration');
+        await f.ack(1);
+        assert.equal(f.blind.snapshot().position, 40);
+        assert.equal(f.blind.snapshot().positionConfidence, 'unknown', 'a timed move is not a measured reference');
+    });
+
+    it('allows a timed percentage after startup calibration stops on an already closed blind', async t => {
+        const f = fixture(t, { calibration: 'always' }, { blindPosition: 0 });
+        f.blind.updateStatus();
+        await f.ack(0);
+        f.blind.onData('*2*0*2##'); // already at its closed end-stop
+        assert.equal(f.blind.snapshot().positionConfidence, 'unknown');
+        const partial = f.move(50);
+        assert.equal(f.sent[1], '*2*1*2##');
+        await f.ack(1); await partial;
+        await f.tick(10000);
+        assert.equal(f.sent[2], '*2*0*2##'); await f.ack(2);
+        approximately(f.blind.snapshot().position, 50);
+    });
+
+    it('keeps a stale cached estimate usable for percentage targets after reconnecting', async t => {
+        const f = fixture(t, {}, { blindState: { position: 20, confidence: 'estimated', updatedAt: 100000 - 86400001, wasMoving: false } });
+        f.blind.setOnline(false); f.blind.setOnline(true);
+        assert.equal(f.blind.snapshot().positionConfidence, 'unknown');
+        const partial = f.move(50);
+        assert.deepEqual(f.sent, ['*2*1*2##']); await f.ack(0); await partial;
+        await f.tick(6000); assert.equal(f.sent[1], '*2*0*2##'); await f.ack(1);
+        approximately(f.blind.snapshot().position, 50);
+    });
+
+    it('still rejects a percentage when an advanced actuator explicitly reports unknown position', async t => {
+        const f = fixture(t);
+        f.blind.onData('*#2*2*10*10*255*0*0##');
         await assert.rejects(f.move(40), (e: unknown) => e instanceof BlindError && e.code === 'invalid');
+        assert.equal(f.sent.length, 0);
+    });
+
+    it('allows a full run to establish a timed reference', async t => {
+        const f = fixture(t, {}, {});
         const full = f.move(100); await f.ack(0); await full;
         await f.tick(21000); await f.ack(1);
         assert.equal(f.blind.snapshot().position, 100);
